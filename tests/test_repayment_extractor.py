@@ -417,3 +417,49 @@ def test_commercial_bank_to_only_transfer_successful():
     assert r.payee.account == "1001096962"
     assert r.payee.bank == "Commercial Bank PLC"
     assert r.references.txn_ref == "416444/154352389"
+
+
+def test_lb_finance_fund_transfer_acknowledgement():
+    """LB Finance「Cash In Mobile」转账确认回执：From/To 两栏，付款方账号用 X 掩码，
+    付款方姓名为独立的 "From" 标签，参考号为 "Reference No."。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 14, x1, y + 14)
+    lines = [
+        L("FUND TRANSFER", 62, 355, 532),
+        L("ACKNOWLEDGEMENT", 62, 438, 577),
+        L("From", 100, 190, 1018),
+        L("D M P Madushanka", 510, 835, 1018),
+        L("From Bank", 102, 275, 1058),
+        L("LB Finance PLC", 510, 788, 1060),
+        L("From Account", 103, 320, 1099),
+        L("XXXX XXXX 2851", 510, 810, 1099),
+        L("To Bank", 99, 238, 1138),
+        L("Commercial Bank", 510, 805, 1139),
+        L("To Account", 100, 283, 1176),
+        L("1001096962", 510, 727, 1178),
+        L("Beneficiary Name", 97, 375, 1217),
+        L("Lak Artha Pvt", 510, 742, 1217),
+        L("Amount", 100, 232, 1259),
+        L("5,555.00 LKR", 510, 745, 1258),
+        L("Remarks", 103, 245, 1298),
+        L("Pradeep", 507, 665, 1298),
+        L("Transaction Date & Time : 09/10/2026 09.42 AM", 103, 862, 1336),
+        L("Reference No.", 100, 325, 1375),
+        L("0056146132", 510, 727, 1376),
+        L("Status", 99, 208, 1415),
+        L("Successful", 510, 703, 1414),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "lb_finance"
+    assert r.doc_type == "fund_transfer_receipt"
+    assert r.status == "success"
+    assert r.amount == 5555.0
+    assert r.datetime == "2026-10-09T09:42:00"
+    assert r.payer.name == "D M P Madushanka"
+    assert r.payer.account == "XXXXXXXX2851"
+    assert r.payer.bank == "LB Finance PLC"
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank"
+    assert r.references.bank_reference_number == "0056146132"
+    assert r.references.remarks == "Pradeep"

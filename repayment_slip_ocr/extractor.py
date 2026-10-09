@@ -28,7 +28,7 @@ _PAYEE_SECTION = ["pay to", "payee", "credit to", "credited to"]
 # ---- 姓名 ----
 _PAYER_NAME_LABELS = [
     "sender's name", "sender name", "account holder name", "card holder name",
-    "payer name", "from name", "account name",
+    "payer name", "from name", "account name", "from",
 ]
 _PAYEE_NAME_LABELS = [
     "beneficiary name", "beneficiary's name", "receiver name", "payee name",
@@ -67,6 +67,8 @@ _REF_KEYS = [
     ("txn_ref", "transaction reference"),
     ("retrieval_ref", "retrieval ref"),
     ("bank_reference_number", "bank reference number"),
+    ("bank_reference_number", "reference no"),
+    ("bank_reference_number", "reference number"),
     ("e_receipt_reference", "e-receipt reference"),
     ("my_ref", "my ref"),
     ("receiver_ref", "receiver ref"),
@@ -83,9 +85,17 @@ _MONTH_SHORT = {
 }
 
 _MONEY_RE = re.compile(r"[\d,]+\.\d{1,2}")
-_ACCOUNT_RE = re.compile(r"[\d*]{6,}")
+_ACCOUNT_RE = re.compile(r"[0-9*Xx]{6,}")
 
 _COMMON_DENOMS = {100, 200, 500, 1000, 2000, 5000, 10000}
+
+
+def _account_token(s: Optional[str]) -> Optional[str]:
+    """从文本提取账号/掩码值（数字、*、X），容忍 "XXXX XXXX 2851" 这类带空格的掩码。"""
+    if not s:
+        return None
+    m = _ACCOUNT_RE.search(re.sub(r"\s+", "", s))
+    return m.group(0) if m else None
 
 
 def _line_center_y(box) -> float:
@@ -337,9 +347,9 @@ def _extract_account(zone_lines, labels) -> Optional[str]:
         for lbl in labels:
             value = _value_after_label(ln.text, lbl)
             if value:
-                m = _ACCOUNT_RE.search(value)
-                if m:
-                    return m.group(0)
+                tok = _account_token(value)
+                if tok:
+                    return tok
     # 标签独占一行 -> 右侧两栏 / 正下方取值
     for i, ln in enumerate(ordered):
         t = ln.text.strip().strip(":：. ").lower()
@@ -347,14 +357,14 @@ def _extract_account(zone_lines, labels) -> Optional[str]:
             if t == lbl.lower():
                 side = _value_to_right(i, ordered, ln)
                 if side:
-                    m = _ACCOUNT_RE.search(side)
-                    if m:
-                        return m.group(0)
+                    tok = _account_token(side)
+                    if tok:
+                        return tok
                 below = _value_below(i, ordered, ln)
                 if below:
-                    m = _ACCOUNT_RE.search(below)
-                    if m:
-                        return m.group(0)
+                    tok = _account_token(below)
+                    if tok:
+                        return tok
     return None
 
 
@@ -429,9 +439,9 @@ def _account_from_line(text: str) -> Optional[str]:
     for lbl in ("account number", "account no", "account"):
         value = _value_after_label(text, lbl)
         if value:
-            m = _ACCOUNT_RE.search(value)
-            if m:
-                return m.group(0)
+            tok = _account_token(value)
+            if tok:
+                return tok
     return None
 
 
@@ -455,8 +465,7 @@ def _account_near(lines, anchor_line) -> Optional[str]:
         if not value:
             side = _value_to_right(idx, lines, ln)
             if side:
-                m = _ACCOUNT_RE.search(side)
-                value = m.group(0) if m else None
+                value = _account_token(side)
         if not value:
             continue
         gap = abs(_line_center_y(ln.box) - ay)
@@ -892,6 +901,7 @@ _BANK_MARKERS = [
     ("hnb", ("hatton national",)),
     ("dfcc", ("dfcc bank", "dfcc")),
     ("ntb", ("nations trust",)),
+    ("lb_finance", ("cash in mobile", "lb finance", "lbcim")),
     ("ipay", ("ipay",)),
     ("pay_master", ("paymaster", "pay master")),
     ("qpayment", ("q payment", "qpayment")),

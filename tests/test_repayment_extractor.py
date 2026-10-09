@@ -327,3 +327,59 @@ def test_peoples_pay_two_column():
     assert r.fields["Fee Amount (LKR)"] == "25.00"
     assert r.fields["Total debit amount (LKR)"] == "7,925.00"
     assert r.fields["Trace No"] == "2026100800600901"
+
+
+def test_boc_app_transaction_successful():
+    """真实 BOC 手机银行 Transaction Successful 回执：Account Information 卡片两栏版式。
+
+    收款账户在卡片内（Account Number / Transfer bank / Reference/Remarks），付款来源
+    在底部 "My bank account" -> "People's Bank"；"Other Charges" 的值标签在左、值在
+    下一行右列；参考号 UFT... 无标签；日期 "10.08.2026" 为 DD.MM.YYYY。
+    """
+    lines = [
+        _lr("Transaction Successful", 519, 440, 780, 468),
+        _lr("Lak chash", 620, 510, 700, 540),
+        _lr("UFT7304438337322", 574, 580, 760, 605),
+        _lr("10.08.2026 , 06:45 PM", 557, 650, 720, 675),
+        _lr("Account Information", 92, 836, 250, 865),
+        _lr("Transaction Type", 86, 900, 230, 930),
+        _lr("CASA Transfer", 860, 902, 980, 930),
+        _lr("Account Number", 89, 970, 230, 1000),
+        _lr("1001096962", 900, 971, 980, 1000),
+        _lr("Transfer bank", 92, 1040, 210, 1070),
+        _lr("Commercial Bank Of Ceylon", 640, 1040, 860, 1070),
+        _lr("PLC", 1033, 1095, 1070, 1120),
+        _lr("Reference/Remarks", 86, 1160, 250, 1190),
+        _lr("Nikesh ayeshan", 839, 1162, 940, 1192),
+        _lr("Amount", 80, 1340, 145, 1370),
+        _lr("LKR 6,000.00", 871, 1340, 980, 1370),
+        _lr("Other Charges", 89, 1422, 220, 1452),
+        _lr("LKR 40.00", 929, 1476, 980, 1506),
+        _lr("Fund Transfer/Card", 89, 1490, 260, 1520),
+        _lr("Settlement Service Charge", 86, 1545, 330, 1575),
+        _lr("Total Amount", 89, 1612, 210, 1642),
+        _lr("LKR 6,040.00", 877, 1612, 980, 1642),
+        _lr("My bank account 1", 606, 1835, 760, 1865),
+        _lr("PEOPLES", 95, 1876, 170, 1906),
+        _lr("People's Bank", 606, 1890, 720, 1920),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "boc"
+    assert r.doc_type == "fund_transfer_receipt"
+    assert r.status == "success"
+    assert r.amount == 6000.0
+    assert r.fee == 40.0
+    assert r.total_debit == 6040.0
+    assert r.datetime == "2026-08-10T18:45:00"
+    assert r.payer.bank == "People's Bank"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank Of Ceylon"
+    assert r.references.transaction_id == "UFT7304438337322"
+    assert r.references.remarks == "Nikesh ayeshan"
+    assert r.trace_no == "UFT7304438337322"
+    assert r.fields["Account Number"] == "1001096962"
+    assert r.fields["Transfer bank"] == "Commercial Bank Of Ceylon"
+    assert r.fields["Reference/Remarks"] == "Nikesh ayeshan"
+    assert r.fields["Other Charges"] == "LKR 40.00"
+    assert r.fields["Total Amount"] == "LKR 6,040.00"

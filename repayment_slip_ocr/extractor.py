@@ -162,6 +162,42 @@ def _value_to_right(idx: int, lines, label_line) -> Optional[str]:
     return _clean(best[1]) if best else None
 
 
+def _right_column_value(idx: int, lines, label_line, max_vy: float = 170.0) -> Optional[str]:
+    """左标右值两栏版式：取标签行右侧（可略偏下）最近的一条右列值行文本。
+
+    部分电子回单的值比标签略低（如 BOC "Other Charges" 的值在标签下一行），严格按
+    垂直重叠会取空，这里用「在标签右侧 + 垂直方向不高于 max_vy」的宽松窗口兜底。
+    """
+    ly = _line_center_y(label_line.box)
+    rx = max(p[0] for p in label_line.box)
+    best = None
+    for j, other in enumerate(lines):
+        if j == idx:
+            continue
+        ox = min(p[0] for p in other.box)
+        oy = _line_center_y(other.box)
+        if ox < rx - 15:
+            continue
+        if oy < ly - 5 or oy - ly > max_vy:
+            continue
+        if best is None or oy < best[0]:
+            best = (oy, other.text)
+    return _clean(best[1]) if best else None
+
+
+def _right_column_for(ordered, label_texts) -> Optional[str]:
+    """在有序行里找标签独占一行（精确匹配）后取右列值。"""
+    wanted = {t.lower().strip(":：. ") for t in label_texts}
+    for i, ln in enumerate(ordered):
+        t = ln.text.strip().strip(":：. ").lower()
+        if t not in wanted:
+            continue
+        v = _right_column_value(i, ordered, ln)
+        if v and not _looks_like_label_text(v):
+            return v
+    return None
+
+
 def _match_label_value(lines, labels) -> Optional[str]:
     """按标签（同名多词）定位取值，支持行内值、右侧两栏值与下一行取值。"""
     ordered = _sorted_by_y(lines)
@@ -377,6 +413,8 @@ def _account_near(lines, anchor_line) -> Optional[str]:
 def _extract_parties(lines, bank: Optional[str] = None) -> tuple[PartyOut, PartyOut]:
     if bank == "peoples_bank":
         return _extract_peoples_bank_parties(lines)
+    if _is_boc_app(lines):
+        return _extract_boc_app_parties(lines)
 
     payer, payee = PartyOut(), PartyOut()
     payer_zone, payee_zone, has_anchor = _split_zones(lines)
@@ -440,6 +478,8 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
             fee = _parse_money(ln.text)
             if fee is None:
                 side = _value_to_right(i, ordered0, ln)
+                if not side:
+                    side = _right_column_value(i, ordered0, ln)
                 if side:
                     fee = _parse_money(side)
         if total is None and "total" in low:
@@ -507,6 +547,13 @@ def _parse_datetime(s: str) -> Optional[str]:
         return None
     s = re.sub(r"\s+", " ", s.strip())
     s = re.sub(r"(?i)\b(am|pm)\b", lambda m: m.group(1).upper(), s)
+    # 归一化：日期分隔符 "." 统一为 "/"，去掉日期与时间之间的逗号，补偿
+    # "10.08.2026 , 06:45 PM" / "10.08.202606:45PM" 这类带逗号或无空格写法。
+    s = s.replace(".", "/")
+    s = re.sub(r"\s*,\s*", " ", s)
+    s = re.sub(r"(?i)(\d{2,4})(\d{1,2}:\d{2})", r"\1 \2", s)
+    s = re.sub(r"(?i)(\d{1,2}:\d{2})(am|pm)", r"\1 \2", s)
+    s = re.sub(r"\s+", " ", s).strip()
     formats = [
         "%Y/%m/%d %H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
@@ -544,6 +591,7 @@ def _find_datetime(lines) -> Optional[str]:
 
     # 全卡扫描带时间的完整日期时间（优先于纯日期，避免误取 Payment Date 的无时间值）
     datetime_pats = [
+        r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s*[,\s]?\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
         r"\d{4}[/-]\d{1,2}[/-]\d{1,2}[ T]\s*\d{1,2}:\d{2}(?::\d{2})?",
         r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
         r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
@@ -574,7 +622,10 @@ def _find_datetime(lines) -> Optional[str]:
     return None
 
 
-_REMARKS_LABELS = ["beneficiary's account narration", "account narration", "remarks", "narration", "description"]
+_REMARKS_LABELS = [
+    "beneficiary's account narration", "account narration", "remarks",
+    "narration", "description", "reference/remarks",
+]
 _REMARKS_LABEL_SET = set(_REMARKS_LABELS)
 
 
@@ -625,6 +676,14 @@ def _extract_references(lines) -> ReferencesOut:
     refs.my_ref = values.get("my_ref")
     refs.receiver_ref = values.get("receiver_ref")
     refs.remarks = _extract_remarks(lines)
+
+    # 无标签的独立参考号（如 BOC "UFT7304438337322"）：字母前缀 + 长数字的单行
+    if not refs.transaction_id:
+        for ln in _sorted_by_y(lines):
+            t = ln.text.strip()
+            if re.fullmatch(r"[A-Za-z]{2,5}\d{9,}", t):
+                refs.transaction_id = t
+                break
     return refs
 
 
@@ -654,25 +713,45 @@ def _find_deposit_breakdown(lines) -> List[DenominationOut]:
 # "Commercial Bank PLC" 误判（还款场景收款方恒为 Lak Artha / Commercial Bank）。
 _BANK_MARKERS = [
     ("vishwa", ("vishwa",)),
-    ("peoples_bank", ("peoplespay", "people's pay")),
-    ("boc", ("bank of ceylon", "boc flex")),
-    ("commercial_bank", ("combank", "transfer within", "e-receipt")),
+    ("peoples_bank", ("peoplespay", "people's pay", "people's bank")),
+    ("commercial_bank", ("combank", "transfer within", "e-receipt", "bank reference number", "sender's account number")),
+    ("boc", ("bank of ceylon", "boc flex", "boc")),
     ("hnb", ("hatton national",)),
-    ("dfcc", ("dfcc bank",)),
+    ("dfcc", ("dfcc bank", "dfcc")),
     ("ntb", ("nations trust",)),
     ("ipay", ("ipay",)),
     ("pay_master", ("paymaster", "pay master")),
     ("qpayment", ("q payment", "qpayment")),
     ("flash", ("flash",)),
-    ("peoples_bank", ("people's bank", "people's pay")),
-    ("commercial_bank", ("commercial bank",)),
 ]
+
+
+_BOC_APP_MARKERS = (
+    "casa transfer",
+    "my bank account",
+    "fund transfer/card",
+    "settlement service charge",
+)
+
+
+def _is_boc_app(lines) -> bool:
+    """BOC 手机银行 "Transaction Successful" 版式（Account Information 卡片）。"""
+    full = " ".join(ln.text for ln in lines).lower()
+    return any(m in full for m in _BOC_APP_MARKERS)
 
 
 def _detect_bank(lines) -> Optional[str]:
     full = " ".join(ln.text for ln in lines).lower()
+    # 抢在 "people's bank" 之前：该版式底部会显示付款来源银行（如 People's Bank）。
+    if _is_boc_app(lines):
+        return "boc"
     for bank, markers in _BANK_MARKERS:
         for m in markers:
+            if m == "bank of ceylon":
+                # 仅命中非 "commercial bank of ceylon" 的独立 "bank of ceylon"（区分 BOC 与 ComBank）
+                if re.search(r"(?<!commercial )bank of ceylon", full):
+                    return bank
+                continue
             if m in full:
                 return bank
     return None
@@ -753,6 +832,29 @@ def _extract_peoples_bank_parties(lines) -> tuple[PartyOut, PartyOut]:
     return payer, payee
 
 
+def _extract_boc_app_parties(lines) -> tuple[PartyOut, PartyOut]:
+    """BOC 手机银行 "Transaction Successful" 版式：Account Information 卡片，
+    左标右值两栏，无 Pay from / Pay to 分区，收款账户在卡片内、付款来源在底部。"""
+    payer, payee = PartyOut(), PartyOut()
+    ordered = _sorted_by_y(lines)
+
+    payee.account = _right_column_for(ordered, {"account number"})
+    payee.bank = _right_column_for(ordered, {"transfer bank", "beneficiary bank", "bank name"})
+    payee.name = _right_column_for(ordered, {"beneficiary name"})
+
+    # 付款来源：底部 "My bank account X" 下方显示的银行名
+    for i, ln in enumerate(ordered):
+        if ln.text.strip().lower().startswith("my bank account"):
+            v = _value_below(i, ordered, ln)
+            if v and not _looks_like_label_text(v):
+                payer.bank = v
+            break
+
+    payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+    return payer, payee
+
+
 _PEOPLES_BANK_LABELS = (
     "Bank",
     "Account No",
@@ -780,6 +882,16 @@ _E_RECEIPT_LABELS = (
     "Status",
 )
 
+_BOC_APP_LABELS = (
+    "Transaction Type",
+    "Account Number",
+    "Transfer bank",
+    "Reference/Remarks",
+    "Amount",
+    "Other Charges",
+    "Total Amount",
+)
+
 
 def _norm_label(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
@@ -802,6 +914,8 @@ def _build_label_fields(lines, labels) -> dict:
         if key is None or key in fields:
             continue
         side = _value_to_right(i, ordered, ln)
+        if not side:
+            side = _right_column_value(i, ordered, ln)
         if side:
             fields[key] = side
         else:
@@ -834,6 +948,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     amount, fee, total = _extract_amounts(lines)
     dt = _find_datetime(lines)
     references = _extract_references(lines)
+    if trace_no is None and references.transaction_id:
+        trace_no = references.transaction_id
 
     deposit_breakdown = _find_deposit_breakdown(lines) if doc_type == "cash_deposit_slip" else []
 
@@ -860,6 +976,13 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
 
     success = bool(amount is not None or payee.account is not None or payee.name is not None)
 
+    if _is_boc_app(lines):
+        field_labels = _BOC_APP_LABELS
+    elif bank == "peoples_bank":
+        field_labels = _PEOPLES_BANK_LABELS
+    else:
+        field_labels = _E_RECEIPT_LABELS
+
     return RepaymentResult(
         success=success,
         doc_type=doc_type,
@@ -873,7 +996,7 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         currency="LKR",
         datetime=dt,
         references=references,
-        fields=_build_label_fields(lines, _PEOPLES_BANK_LABELS if bank == "peoples_bank" else _E_RECEIPT_LABELS),
+        fields=_build_label_fields(lines, field_labels),
         deposit_breakdown=deposit_breakdown,
         trace_no=trace_no,
         warnings=warnings,

@@ -92,8 +92,33 @@ def _line_center_y(box) -> float:
     return sum(ys) / len(ys)
 
 
+def _line_center_x(box) -> float:
+    xs = [p[0] for p in box]
+    return sum(xs) / len(xs)
+
+
 def _sorted_by_y(lines) -> List:
     return sorted(lines, key=lambda l: _line_center_y(l.box))
+
+
+def dedup_lines(lines) -> List:
+    """按「文本 + 位置」去重 OCR 行。
+
+    多个预处理变体会对同一图像产生近似重复的行（同文本、近似同坐标），需要合并；
+    但现金存款凭条的表格里，同文本可能出现在不同单元格 / 不同行（如 NOTES 列多个
+    "1"、VALUE 与 AMOUNT 列的 "100.00"），纯文本去重会把它们错误合并成一列。这里用
+    (小写文本, y 桶, x 桶) 作为键，既合并变体重复行，又保留不同位置的同文本行。
+    """
+    dedup: dict = {}
+    for ln in lines:
+        key = ln.text.strip().lower()
+        if not key:
+            continue
+        pos = (int(_line_center_y(ln.box) // 8), int(_line_center_x(ln.box) // 8))
+        k = (key, pos)
+        if k not in dedup or ln.confidence > dedup[k].confidence:
+            dedup[k] = ln
+    return sorted(dedup.values(), key=lambda l: l.confidence, reverse=True)
 
 
 def _clean(value: str) -> str:
@@ -185,6 +210,33 @@ def _right_column_value(idx: int, lines, label_line, max_vy: float = 170.0) -> O
     return _clean(best[1]) if best else None
 
 
+def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optional[float]:
+    """取标签右侧（含上下偏移）最近的一条含金额的行，跳过纯货币词 "LKR"。
+
+    用于 "DEPOSIT AMOUNT:" 这类标签与值不在同一水平带的凭条：值可能出现在标签
+    右上方（如 Commercial Bank CDM），中间还夹杂 "LKR" 币种词。
+    """
+    ly = _line_center_y(label_line.box)
+    rx = max(p[0] for p in label_line.box) - 15
+    best = None
+    for other in lines:
+        if other is label_line:
+            continue
+        ox = min(p[0] for p in other.box)
+        oy = _line_center_y(other.box)
+        if ox < rx:
+            continue
+        dy = abs(oy - ly)
+        if dy > max_dy:
+            continue
+        val = _parse_money(other.text)
+        if val is None:
+            continue
+        if best is None or dy < best[0]:
+            best = (dy, val)
+    return best[1] if best else None
+
+
 def _right_column_for(ordered, label_texts) -> Optional[str]:
     """在有序行里找标签独占一行（精确匹配）后取右列值。"""
     wanted = {t.lower().strip(":：. ") for t in label_texts}
@@ -225,6 +277,8 @@ def _match_label_value(lines, labels) -> Optional[str]:
 _FIELD_WORDS = {
     "no", "no.", "name", "number", "bank", "ref", "reference", "amount",
     "date", "time", "currency", "narration", "status", "account", "code",
+    "terminal", "id", "trace", "branch", "mobile", "source", "funds",
+    "notes", "value", "customer", "transaction",
 }
 
 
@@ -415,6 +469,8 @@ def _extract_parties(lines, bank: Optional[str] = None) -> tuple[PartyOut, Party
         return _extract_peoples_bank_parties(lines)
     if _is_boc_app(lines):
         return _extract_boc_app_parties(lines)
+    if _is_cash_deposit(lines):
+        return _extract_cdm_parties(lines)
 
     payer, payee = PartyOut(), PartyOut()
     payer_zone, payee_zone, has_anchor = _split_zones(lines)
@@ -497,10 +553,11 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
         if "amount" in low or "deposit" in low:
             amount = _parse_money(ln.text)
             if amount is None:
-                # 两栏版式：标签在左、金额在右
                 side = _value_to_right(i, ordered, ln)
                 if side:
                     amount = _parse_money(side)
+            if amount is None and "deposit amount" in low:
+                amount = _money_near_label_right(ordered, ln)
             if amount is not None:
                 break
 
@@ -649,10 +706,10 @@ def _extract_remarks(lines) -> Optional[str]:
         if not (t.startswith("remark") or t in _REMARKS_LABEL_SET):
             continue
         side = _value_to_right(i, ordered, ln)
-        if side and not _looks_like_remarks_hint(side):
+        if side and not _looks_like_remarks_hint(side) and not _looks_like_label_text(side):
             return side
         below = _value_below(i, ordered, ln)
-        if below and not _looks_like_remarks_hint(below):
+        if below and not _looks_like_remarks_hint(below) and not _looks_like_label_text(below):
             return below
     return None
 
@@ -687,8 +744,116 @@ def _extract_references(lines) -> ReferencesOut:
     return refs
 
 
-def _find_deposit_breakdown(lines) -> List[DenominationOut]:
-    """现金存款凭条：识别「面值 张数 金额」三元组。OCR 行格式不稳定，尽力匹配。"""
+def _find_deposit_breakdown(lines, total_amount: Optional[float] = None) -> List[DenominationOut]:
+    """现金存款凭条：识别纸币明细。
+
+    兼容两种版式：
+    * 三栏式（Commercial Bank CDM）：NOTES(张数) / VALUE(面额) / AMOUNT(金额) 三列，
+      每列独立成 OCR 行，按列 x 归属 + 逐行 y 对齐；
+    * 单行式（旧版 "面值 张数 金额" 同行）作为兜底。
+    """
+    cols = _breakdown_from_columns(lines, total_amount)
+    if cols:
+        return cols
+    return _breakdown_single_line(lines)
+
+
+def _parse_denomination(s: str) -> Optional[float]:
+    """解析纸币面额（VALUE 列），容忍 OCR 千分位分隔符的混合写法。
+
+    收据面额恒为整数元（100/1000/5000 等），末尾两位 ".00" 为分。把数字按分隔符
+    切成分组、末组 "00" 视为分，其余拼接成整数，从而正确还原
+    "LKR 5, 000. 00" / "LKR5.000.00" -> 5000、"LKR 1,000.00" -> 1000。
+    """
+    s = re.sub(r"(?i)lkr", "", s).strip()
+    groups = re.findall(r"\d+", s)
+    if not groups:
+        return None
+    if len(groups) >= 2 and groups[-1] == "00":
+        integer = "".join(groups[:-1])
+    else:
+        integer = "".join(groups)
+    if not integer:
+        return None
+    return float(int(integer))
+
+
+def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[DenominationOut]:
+    """三栏式 NOTES/VALUE/AMOUNT 布局：按表头 x 分列，各列按 y 排序后逐行配对。"""
+    ordered = _sorted_by_y(lines)
+    headers: dict = {}
+    for ln in ordered:
+        t = ln.text.strip().lower().rstrip(":.")
+        if t in ("notes", "value", "amount") and t not in headers:
+            headers[t] = (ln, _line_center_x(ln.box), _line_center_y(ln.box))
+    if not ("notes" in headers and "value" in headers and "amount" in headers):
+        return []
+    notes_cx = headers["notes"][1]
+    value_cx = headers["value"][1]
+    amount_cx = headers["amount"][1]
+    if not (notes_cx < value_cx < amount_cx):
+        return []
+    b1 = (notes_cx + value_cx) / 2
+    b2 = (value_cx + amount_cx) / 2
+    header_y = min(headers[k][2] for k in headers)
+
+    qty_rows: List[tuple] = []
+    denom_rows: List[tuple] = []
+    amount_rows: List[tuple] = []
+    for ln in ordered:
+        y = _line_center_y(ln.box)
+        if y <= header_y + 2:
+            continue
+        t = ln.text.strip().lower().rstrip(":.")
+        if t in ("notes", "value", "amount") or "deposit amount" in t:
+            continue
+        cx = _line_center_x(ln.box)
+        text = ln.text.strip()
+        if cx < b1:
+            m = re.fullmatch(r"\d{1,3}", text)
+            if m:
+                qty_rows.append((y, int(m.group(0))))
+        elif cx < b2:
+            val = _parse_denomination(text)
+            if val is not None and val in _COMMON_DENOMS:
+                denom_rows.append((y, val))
+        else:
+            val = _parse_denomination(text)
+            if val is not None:
+                amount_rows.append((y, val))
+
+    if not denom_rows:
+        return []
+    qty_rows.sort()
+    denom_rows.sort()
+    amount_rows.sort()
+    if total_amount is not None:
+        amount_rows = [(y, m) for y, m in amount_rows if abs(m - total_amount) > 0.01]
+
+    # 面额去重：OCR 常把同一面额识别成 "100.00" / "100. 00" 等多个变体行
+    seen_denoms = set()
+    unique_denoms = []
+    for y, denom in denom_rows:
+        if denom in seen_denoms:
+            continue
+        seen_denoms.add(denom)
+        unique_denoms.append((y, denom))
+    denom_rows = unique_denoms
+
+    breakdown: List[DenominationOut] = []
+    for i, (_, denom) in enumerate(denom_rows):
+        qty = qty_rows[i][1] if i < len(qty_rows) else 1
+        amount = denom * qty
+        for _, amt in amount_rows:
+            if abs(amt - denom * qty) < 0.05:
+                amount = amt
+                break
+        breakdown.append(DenominationOut(denomination=denom, quantity=qty, amount=amount))
+    return breakdown
+
+
+def _breakdown_single_line(lines) -> List[DenominationOut]:
+    """单行式「面值 张数 金额」三元组（旧版兜底）。"""
     breakdown: List[DenominationOut] = []
     seen = set()
     for ln in lines:
@@ -714,7 +879,7 @@ def _find_deposit_breakdown(lines) -> List[DenominationOut]:
 _BANK_MARKERS = [
     ("vishwa", ("vishwa",)),
     ("peoples_bank", ("peoplespay", "people's pay", "people's bank")),
-    ("commercial_bank", ("combank", "transfer within", "e-receipt", "bank reference number", "sender's account number")),
+    ("commercial_bank", ("cardless deposit", "combank", "transfer within", "e-receipt", "bank reference number", "sender's account number")),
     ("boc", ("bank of ceylon", "boc flex", "boc")),
     ("hnb", ("hatton national",)),
     ("dfcc", ("dfcc bank", "dfcc")),
@@ -738,6 +903,15 @@ def _is_boc_app(lines) -> bool:
     """BOC 手机银行 "Transaction Successful" 版式（Account Information 卡片）。"""
     full = " ".join(ln.text for ln in lines).lower()
     return any(m in full for m in _BOC_APP_MARKERS)
+
+
+_CDM_MARKERS = ("cardless deposit",)
+
+
+def _is_cash_deposit(lines) -> bool:
+    """Commercial Bank CDM 无卡存款凭条（CARDLESS DEPOSIT）。"""
+    full = " ".join(ln.text for ln in lines).lower()
+    return any(m in full for m in _CDM_MARKERS)
 
 
 def _detect_bank(lines) -> Optional[str]:
@@ -827,6 +1001,23 @@ def _extract_peoples_bank_parties(lines) -> tuple[PartyOut, PartyOut]:
     if not payee.account:
         payee.account = _first_account_line(payee_zone)
 
+    payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+    return payer, payee
+
+
+def _extract_cdm_parties(lines) -> tuple[PartyOut, PartyOut]:
+    """Commercial Bank CDM 无卡存款凭条：现金存款，无付款方。
+
+    收款方（户名/账号）来自 "CUSTOMER NAME" / "ACC0UNT NUMBER" 同行标签，
+    OCR 常把 "ACCOUNT" 误识为 "ACC0UNT"（0 替 O），故标签加容错变体。
+    """
+    payer, payee = PartyOut(), PartyOut()
+    payee.name = _match_label_value(lines, ["customer name", "beneficiary name", "account name"])
+    payee.account = _extract_account(
+        lines,
+        ["account number", "acc0unt number", "account no", "acc0unt no"],
+    )
     payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
     payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
     return payer, payee
@@ -934,6 +1125,18 @@ def _build_label_fields(lines, labels) -> dict:
     return fields
 
 
+_BRANCH_RE = re.compile(r"(?i)^[a-z0-9][a-z0-9\-./ ]*\bbr\b$")
+
+
+def _extract_branch(lines) -> Optional[str]:
+    """存款凭条网点：通常以 "BR"（branch）结尾，如 "BANDARAG-CRM2 BR"。"""
+    for ln in _sorted_by_y(lines):
+        t = ln.text.strip()
+        if _BRANCH_RE.fullmatch(t):
+            return t
+    return _match_label_value(lines, ["branch", "branch name"])
+
+
 def extract(lines, include_lines: bool = False) -> RepaymentResult:
     warnings: List[str] = []
 
@@ -944,14 +1147,16 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     bank = _detect_bank(lines)
 
     payer, payee = _extract_parties(lines, bank)
-    trace_no = _match_label_value(lines, ["trace no", "trace number", "tranceno"])
+    trace_no = _match_label_value(lines, ["trace no", "trace number", "tranceno", "trace"])
+    terminal_id = _match_label_value(lines, ["terminal id"])
+    branch = _extract_branch(lines)
     amount, fee, total = _extract_amounts(lines)
     dt = _find_datetime(lines)
     references = _extract_references(lines)
     if trace_no is None and references.transaction_id:
         trace_no = references.transaction_id
 
-    deposit_breakdown = _find_deposit_breakdown(lines) if doc_type == "cash_deposit_slip" else []
+    deposit_breakdown = _find_deposit_breakdown(lines, total_amount=amount) if doc_type == "cash_deposit_slip" else []
 
     # 金额一致性校验
     if amount is not None and fee is not None and total is not None:
@@ -998,6 +1203,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         references=references,
         fields=_build_label_fields(lines, field_labels),
         deposit_breakdown=deposit_breakdown,
+        branch=branch,
+        terminal_id=terminal_id,
         trace_no=trace_no,
         warnings=warnings,
         lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],

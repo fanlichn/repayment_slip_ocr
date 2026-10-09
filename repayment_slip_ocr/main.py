@@ -19,7 +19,7 @@ from app.ocr_engine import create_engine
 from app.preprocessing import build_variants, load_image
 from app.url_fetch import UrlFetchError, fetch_image_bytes
 
-from .extractor import extract
+from .extractor import dedup_lines, extract
 from .schemas import RepaymentResult
 
 _engine = None
@@ -60,14 +60,7 @@ def _recognize(buf: bytes) -> RepaymentResult:
     for variant in build_variants(img):
         lines.extend(_engine.recognize(variant["img"]))
 
-    dedup = {}
-    for ln in lines:
-        key = ln.text.strip().lower()
-        if not key:
-            continue
-        if key not in dedup or ln.confidence > dedup[key].confidence:
-            dedup[key] = ln
-    unique = sorted(dedup.values(), key=lambda l: l.confidence, reverse=True)
+    unique = dedup_lines(lines)
 
     result = extract(unique)
     result.elapsed_ms = (time.perf_counter() - t0) * 1000

@@ -12,7 +12,7 @@ from app.config import get_settings
 from app.ocr_engine import create_engine
 from app.preprocessing import build_variants, load_image
 
-from .extractor import extract
+from .extractor import dedup_lines, extract
 
 
 def main() -> int:
@@ -31,14 +31,7 @@ def main() -> int:
     for variant in build_variants(img):
         lines.extend(engine.recognize(variant["img"]))
 
-    dedup = {}
-    for ln in lines:
-        key = ln.text.strip().lower()
-        if not key:
-            continue
-        if key not in dedup or ln.confidence > dedup[key].confidence:
-            dedup[key] = ln
-    unique = sorted(dedup.values(), key=lambda l: l.confidence, reverse=True)
+    unique = dedup_lines(lines)
 
     result = extract(unique)
     print(json.dumps(result.model_dump(exclude_none=True), ensure_ascii=False, indent=2, default=str))

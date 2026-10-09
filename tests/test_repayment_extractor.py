@@ -383,3 +383,37 @@ def test_boc_app_transaction_successful():
     assert r.fields["Reference/Remarks"] == "Nikesh ayeshan"
     assert r.fields["Other Charges"] == "LKR 40.00"
     assert r.fields["Total Amount"] == "LKR 6,040.00"
+
+
+def test_commercial_bank_to_only_transfer_successful():
+    """Commercial Bank 手机 App「转账成功」回执：仅收款方（To）、无付款方区。
+
+    收款方结构化堆叠：姓名 -> 账号 -> 银行；时间 "1.43PM" 点号分隔；
+    参考号 "Transaction reference-416444/154352389" 用 "-" 而非冒号衔接。
+    """
+    lines = [
+        _lr("13:44", 63, 43, 378, 43),
+        _lr("Transfer Successful!", 254, 867, 946, 867),
+        _lr("LKR 6,400.00", 340, 971, 819, 971),
+        _lr("To", 560, 1097, 609, 1097),
+        _lr("Lak Artha Services.", 378, 1223, 816, 1223),
+        _lr("1001096962", 459, 1293, 744, 1293),
+        _lr("Commercial Bank PLC.", 381, 1514, 819, 1514),
+        _lr("Transaction reference-416444/154352389", 193, 1666, 992, 1666),
+        _lr("Date/Time-09/10/2026:1.43PM", 303, 1752, 929, 1752),
+        _lr("Beneficiary Notified", 415, 1886, 788, 1886),
+        _lr("Make Another Payment", 176, 2161, 638, 2161),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "commercial_bank"
+    assert r.doc_type == "fund_transfer_receipt"
+    assert r.status == "success"
+    assert r.amount == 6400.0
+    assert r.datetime == "2026-10-09T13:43:00"
+    assert r.payer.name is None
+    assert r.payer.bank is None
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank PLC"
+    assert r.references.txn_ref == "416444/154352389"

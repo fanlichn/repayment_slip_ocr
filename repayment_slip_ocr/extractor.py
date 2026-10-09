@@ -55,7 +55,7 @@ _PAYEE_BANK_LABELS = [
 # ---- 日期时间 ----
 _DATETIME_LABELS = [
     "date & time", "transaction date & time", "transaction date/time",
-    "transaction date", "generated at", "printed on",
+    "date/time", "date &time", "transaction date", "generated at", "printed on",
 ]
 _DATE_LABELS = ["payment date", "date"]
 _TIME_LABELS = ["time"]
@@ -64,6 +64,7 @@ _TIME_LABELS = ["time"]
 _REF_KEYS = [
     ("transaction_id", "transaction id"),
     ("txn_ref", "txn ref"),
+    ("txn_ref", "transaction reference"),
     ("retrieval_ref", "retrieval ref"),
     ("bank_reference_number", "bank reference number"),
     ("e_receipt_reference", "e-receipt reference"),
@@ -471,6 +472,8 @@ def _extract_parties(lines, bank: Optional[str] = None) -> tuple[PartyOut, Party
         return _extract_boc_app_parties(lines)
     if _is_cash_deposit(lines):
         return _extract_cdm_parties(lines)
+    if _is_to_only_receipt(lines):
+        return _extract_to_only_parties(lines)
 
     payer, payee = PartyOut(), PartyOut()
     payer_zone, payee_zone, has_anchor = _split_zones(lines)
@@ -604,11 +607,16 @@ def _parse_datetime(s: str) -> Optional[str]:
         return None
     s = re.sub(r"\s+", " ", s.strip())
     s = re.sub(r"(?i)\b(am|pm)\b", lambda m: m.group(1).upper(), s)
+    # 时间点号： "1.43 PM" / "1.43PM" -> "1:43 PM"
+    s = re.sub(r"(?i)(\d{1,2})\.(\d{2})\s*(am|pm)", r"\1:\2 \3", s)
     # 归一化：日期分隔符 "." 统一为 "/"，去掉日期与时间之间的逗号，补偿
     # "10.08.2026 , 06:45 PM" / "10.08.202606:45PM" 这类带逗号或无空格写法。
     s = s.replace(".", "/")
     s = re.sub(r"\s*,\s*", " ", s)
     s = re.sub(r"(?i)(\d{2,4})(\d{1,2}:\d{2})", r"\1 \2", s)
+    # 日期与时间以冒号粘连且为 12 小时制（如 "2026:1:43 PM"）拆开；
+    # 仅限 AM/PM 后缀，避免误拆 24 小时制 "08:08:32"。
+    s = re.sub(r"(?i)(\d{2,4})\s*:\s*(\d{1,2}:\d{2}\s*(?:am|pm))", r"\1 \2", s)
     s = re.sub(r"(?i)(\d{1,2}:\d{2})(am|pm)", r"\1 \2", s)
     s = re.sub(r"\s+", " ", s).strip()
     formats = [
@@ -879,7 +887,7 @@ def _breakdown_single_line(lines) -> List[DenominationOut]:
 _BANK_MARKERS = [
     ("vishwa", ("vishwa",)),
     ("peoples_bank", ("peoplespay", "people's pay", "people's bank")),
-    ("commercial_bank", ("cardless deposit", "combank", "transfer within", "e-receipt", "bank reference number", "sender's account number")),
+    ("commercial_bank", ("cardless deposit", "combank", "transfer within", "e-receipt", "bank reference number", "sender's account number", "beneficiary notified")),
     ("boc", ("bank of ceylon", "boc flex", "boc")),
     ("hnb", ("hatton national",)),
     ("dfcc", ("dfcc bank", "dfcc")),
@@ -912,6 +920,20 @@ def _is_cash_deposit(lines) -> bool:
     """Commercial Bank CDM 无卡存款凭条（CARDLESS DEPOSIT）。"""
     full = " ".join(ln.text for ln in lines).lower()
     return any(m in full for m in _CDM_MARKERS)
+
+
+def _is_to_only_receipt(lines) -> bool:
+    """Commercial Bank 手机 App「转账成功」版式：只显示收款方（To），无付款方区。
+
+    强特征 "Beneficiary Notified"；或用 "Transfer Successful!" + 独立的 "To" 行兜底，
+    避免与其它银行的同名标题混淆。
+    """
+    full = " ".join(ln.text for ln in lines).lower()
+    if "beneficiary notified" in full:
+        return True
+    if "transfer successful" not in full:
+        return False
+    return any(ln.text.strip().strip(":：. ").lower() == "to" for ln in lines)
 
 
 def _detect_bank(lines) -> Optional[str]:
@@ -1018,6 +1040,54 @@ def _extract_cdm_parties(lines) -> tuple[PartyOut, PartyOut]:
         lines,
         ["account number", "acc0unt number", "account no", "acc0unt no"],
     )
+    payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+    return payer, payee
+
+
+def _extract_to_only_parties(lines) -> tuple[PartyOut, PartyOut]:
+    """Commercial Bank「转账成功」收款方-only 回执：只提取收款方，付款方留空。
+
+    要点：泛型 "bank" 标签会把收款方银行 "Commercial Bank PLC" 误取成 "PLC"，
+    这里按 "To" 锚点下方区块的结构化位置（姓名→账号→银行）逐项提取。
+    """
+    payer, payee = PartyOut(), PartyOut()
+    ordered = _sorted_by_y(lines)
+    anchor_y = None
+    for ln in ordered:
+        if ln.text.strip().strip(":：. ").lower() == "to":
+            anchor_y = _line_center_y(ln.box)
+            break
+    if anchor_y is None:
+        return payer, payee
+
+    below = [ln for ln in ordered if _line_center_y(ln.box) > anchor_y + 2]
+
+    # 银行：第一个含 "bank" 的整行原文（"Commercial Bank PLC." -> "Commercial Bank PLC"）
+    for ln in below:
+        if "bank" in ln.text.lower():
+            payee.bank = _clean(ln.text)
+            break
+    # 账号：第一个纯数字/星号（>=6 位）行
+    for ln in below:
+        t = ln.text.strip()
+        if re.fullmatch(r"[\d*]{6,}", t):
+            payee.account = t
+            break
+    # 姓名：第一个「非纯数字、非银行、非标签/页脚」的字母行
+    for ln in below:
+        t = ln.text.strip()
+        if re.fullmatch(r"[\d\s,\.*/\-:]+", t):
+            continue
+        low = t.lower()
+        if any(k in low for k in ("bank", "reference", "date", "time", "notified",
+                                   "transfer", "another", "download", "ok")):
+            continue
+        v = _clean(t)
+        if v and len(v) >= 2:
+            payee.name = v
+            break
+
     payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
     payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
     return payer, payee

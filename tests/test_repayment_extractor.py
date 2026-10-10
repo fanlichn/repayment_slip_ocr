@@ -463,3 +463,37 @@ def test_lb_finance_fund_transfer_acknowledgement():
     assert r.payee.bank == "Commercial Bank"
     assert r.references.bank_reference_number == "0056146132"
     assert r.references.remarks == "Pradeep"
+
+
+def test_hnb_fund_transfer_receipt():
+    """HNB 手机 App「Fund Transfer Receipt」：From/To 居中标签、值堆叠在下方，
+    收款方「姓名-账号」合并一行，底部 "Receiver reference" 与 "This is an auto generated receipt"。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 14, x1, y + 14)
+    lines = [
+        L("HNB", 438, 684, 482),
+        L("Fund Transfer Receipt", 274, 929, 625),
+        L("LKR 5,050.00", 395, 805, 805),
+        L("From", 553, 653, 1153),
+        L("DIASWUC", 453, 750, 1251),
+        L("To", 569, 631, 1343),
+        L("Lak Artha Pvt Ltd-1001096962", 219, 972, 1439),
+        L("COMMERCIAL BANK", 519, 675, 1570),
+        L("Commercial Bank PLC", 398, 799, 1685),
+        L("Receiver reference-Champika Dias 751251866V", 176, 1021, 1790),
+        L("Transaction Reference-189359/154299101", 225, 972, 1864),
+        L("Date/Time-09/10/2026:9.30AM", 312, 891, 1944),
+        L("This is an auto generated receipt", 311, 889, 2114),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "hnb"
+    assert r.doc_type == "fund_transfer_receipt"
+    assert r.amount == 5050.0
+    assert r.datetime == "2026-10-09T09:30:00"
+    assert r.payer.name == "DIASWUC"
+    assert r.payer.bank == "HNB"
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank PLC"
+    assert r.references.txn_ref == "189359/154299101"
+    assert r.references.receiver_ref == "Champika Dias 751251866V"

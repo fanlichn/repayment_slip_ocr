@@ -72,6 +72,7 @@ _REF_KEYS = [
     ("e_receipt_reference", "e-receipt reference"),
     ("my_ref", "my ref"),
     ("receiver_ref", "receiver ref"),
+    ("receiver_ref", "receiver reference"),
     ("remarks", "beneficiary's account narration"),
     ("remarks", "account narration"),
     ("remarks", "remarks"),
@@ -481,6 +482,8 @@ def _extract_parties(lines, bank: Optional[str] = None) -> tuple[PartyOut, Party
         return _extract_boc_app_parties(lines)
     if _is_cash_deposit(lines):
         return _extract_cdm_parties(lines)
+    if _is_hnb_app_receipt(lines):
+        return _extract_hnb_app_parties(lines)
     if _is_to_only_receipt(lines):
         return _extract_to_only_parties(lines)
 
@@ -898,7 +901,7 @@ _BANK_MARKERS = [
     ("peoples_bank", ("peoplespay", "people's pay", "people's bank")),
     ("commercial_bank", ("cardless deposit", "combank", "transfer within", "e-receipt", "bank reference number", "sender's account number", "beneficiary notified")),
     ("boc", ("bank of ceylon", "boc flex", "boc")),
-    ("hnb", ("hatton national",)),
+    ("hnb", ("hatton national", "hnb", "this is an auto generated receipt")),
     ("dfcc", ("dfcc bank", "dfcc")),
     ("ntb", ("nations trust",)),
     ("lb_finance", ("cash in mobile", "lb finance", "lbcim")),
@@ -944,6 +947,15 @@ def _is_to_only_receipt(lines) -> bool:
     if "transfer successful" not in full:
         return False
     return any(ln.text.strip().strip(":：. ").lower() == "to" for ln in lines)
+
+
+def _is_hnb_app_receipt(lines) -> bool:
+    """HNB 手机 App「Fund Transfer Receipt」：居中 From/To，收款方姓名+账号合并一行，
+    底部 "This is an auto generated receipt" / "Receiver reference"。"""
+    full = " ".join(ln.text for ln in lines).lower()
+    if "this is an auto generated receipt" in full or "hatton national" in full:
+        return True
+    return "fund transfer receipt" in full and "receiver reference" in full
 
 
 def _detect_bank(lines) -> Optional[str]:
@@ -1098,6 +1110,60 @@ def _extract_to_only_parties(lines) -> tuple[PartyOut, PartyOut]:
             payee.name = v
             break
 
+    payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+    return payer, payee
+
+
+def _extract_hnb_app_parties(lines) -> tuple[PartyOut, PartyOut]:
+    """HNB「Fund Transfer Receipt」：From/To 居中标签，值堆叠在下方。
+
+    收款方「姓名+账号」常合并在同一行（"Lak Artha Pvt Ltd-1001096962"），
+    银行 "Commercial Bank PLC" 需取整行而不是泛型 "bank" 截出的 "PLC"。
+    """
+    payer, payee = PartyOut(), PartyOut()
+    ordered = _sorted_by_y(lines)
+    from_idx = to_idx = None
+    for i, ln in enumerate(ordered):
+        t = ln.text.strip().strip(":：. ").lower()
+        if t == "from" and from_idx is None:
+            from_idx = i
+        elif t == "to" and to_idx is None:
+            to_idx = i
+
+    if from_idx is not None:
+        for j in range(from_idx + 1, len(ordered)):
+            t = ordered[j].text.strip()
+            if re.fullmatch(r"[\d\s,.\-:/]+", t):
+                continue
+            v = _clean(t)
+            if v and not _looks_like_label_text(v):
+                payer.name = v
+                break
+
+    if to_idx is not None:
+        got_account = False
+        for ln in ordered[to_idx + 1:]:
+            t = ln.text.strip()
+            low = t.lower()
+            if any(k in low for k in ("reference", "date/time", "date & time",
+                                        "auto generated", "this is")):
+                break
+            if "bank" in low:
+                cand = _clean(t)
+                if payee.bank is None or len(cand) > len(payee.bank):
+                    payee.bank = cand
+                continue
+            if not got_account:
+                m = re.search(r"(\d{6,})$", t)
+                if m:
+                    payee.account = m.group(1)
+                    name = t[:m.start()].strip(" -–:：.")
+                    if name:
+                        payee.name = _clean(name)
+                    got_account = True
+
+    payer.bank = "HNB"
     payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
     payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
     return payer, payee

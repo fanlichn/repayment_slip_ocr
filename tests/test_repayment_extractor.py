@@ -465,6 +465,93 @@ def test_lb_finance_fund_transfer_acknowledgement():
     assert r.references.remarks == "Pradeep"
 
 
+def test_commercial_bank_cash_credit_slip():
+    """Commercial Bank 纸质现金存款凭条（CASH CREDIT SLIP）。
+
+    版式特征：左上 Logo、右上标题、ACCOUNT NUMBER 右栏、中部存款人字段、
+    右侧 NOTES/RS./CTS 面额表、底部机打户名/账号/金额。
+    """
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 14, x1, y + 14)
+    lines = [
+        # 顶部
+        L("COMMERCIAL BANK", 40, 280, 60),
+        L("Name of Account Holder", 300, 620, 80),
+        L("Lak Artha Pvt Ltd", 300, 560, 115),
+        L("CASH CREDIT SLIP", 680, 940, 60),
+        # 账号与日期（右栏）
+        L("ACCOUNT NUMBER", 640, 820, 150),
+        L("1001096962", 830, 1010, 150),
+        L("DATE", 640, 700, 190),
+        L("09-10-2026", 710, 870, 190),
+        # 中部表单字段
+        L("DEPOSIT BY - ACCOUNT HOLDER", 40, 360, 240),
+        L("NAME AND ADDRESS OF THE DEPOSITOR", 40, 460, 290),
+        L("John Doe Perera", 40, 260, 325),
+        L("PURPOSE AND SOURCE OF FUNDS", 40, 420, 400),
+        # 右侧面额表 NOTES | RS. | CTS
+        L("NOTES", 640, 720, 260),
+        L("RS.", 760, 820, 260),
+        L("CTS", 870, 930, 260),
+        L("5000 X", 640, 730, 300),
+        L("1", 760, 800, 300),
+        L("5,000.00", 870, 980, 300),
+        L("2000 X", 640, 730, 335),
+        L("0", 760, 800, 335),
+        L("0.00", 870, 940, 335),
+        L("1000 X", 640, 730, 370),
+        L("0", 760, 800, 370),
+        L("0.00", 870, 940, 370),
+        L("500 X", 640, 720, 405),
+        L("0", 760, 800, 405),
+        L("0.00", 870, 940, 405),
+        L("100 X", 640, 720, 440),
+        L("3", 760, 800, 440),
+        L("300.00", 870, 950, 440),
+        L("50 X", 640, 710, 475),
+        L("0", 760, 800, 475),
+        L("0.00", 870, 940, 475),
+        L("20 X", 640, 710, 510),
+        L("0", 760, 800, 510),
+        L("0.00", 870, 940, 510),
+        L("COINS", 640, 720, 545),
+        L("TOTAL", 640, 720, 580),
+        L("5,300.00", 870, 980, 580),
+        # 底部机打区
+        L("THANK YOU FOR BANKING WITH US", 40, 420, 620),
+        L("29-10-26 09:24:16", 40, 260, 660),
+        L("LAK ARTHA SERVICES", 420, 680, 660),
+        L("09-10-26 E/D", 40, 200, 695),
+        L("1001096962", 420, 580, 695),
+        L("LKR", 40, 80, 730),
+        L("5,300.00", 90, 210, 730),
+        L("CDBS NC001", 280, 420, 730),
+        L("0111 CURRENT ACCOUNT - CASH DEPOSIT", 40, 420, 770),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "commercial_bank"
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.status == "success"
+    # 收款方：账户持有人（含 Lak Artha 归一化）
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank"
+    # 付款方：存款人
+    assert r.payer.name == "John Doe Perera"
+    # 金额：TOTAL 行或 LKR 行
+    assert r.amount == 5300.0
+    assert r.total_debit == 5300.0
+    # 日期时间
+    assert r.datetime == "2026-10-29T09:24:16"
+    # 纸币明细
+    denoms = {(d.denomination, d.quantity) for d in r.deposit_breakdown}
+    assert (5000.0, 1) in denoms
+    assert (100.0, 3) in denoms
+    total = sum(d.amount for d in r.deposit_breakdown)
+    assert abs(total - 5300.0) < 0.05
+    assert r.success is True
+
+
 def test_hnb_fund_transfer_receipt():
     """HNB 手机 App「Fund Transfer Receipt」：From/To 居中标签、值堆叠在下方，
     收款方「姓名-账号」合并一行，底部 "Receiver reference" 与 "This is an auto generated receipt"。"""

@@ -88,7 +88,7 @@ _MONTH_SHORT = {
 _MONEY_RE = re.compile(r"[\d,]+\.\d{1,2}")
 _ACCOUNT_RE = re.compile(r"[0-9*Xx]{6,}")
 
-_COMMON_DENOMS = {100, 200, 500, 1000, 2000, 5000, 10000}
+_COMMON_DENOMS = {20, 50, 100, 200, 500, 1000, 2000, 5000, 10000}
 
 
 def _account_token(s: Optional[str]) -> Optional[str]:
@@ -482,6 +482,8 @@ def _extract_parties(lines, bank: Optional[str] = None) -> tuple[PartyOut, Party
         return _extract_boc_app_parties(lines)
     if _is_cash_deposit(lines):
         return _extract_cdm_parties(lines)
+    if _is_cash_credit_slip(lines):
+        return _extract_cash_credit_slip_parties(lines)
     if _is_hnb_app_receipt(lines):
         return _extract_hnb_app_parties(lines)
     if _is_to_only_receipt(lines):
@@ -533,11 +535,30 @@ def _is_address_like(value: Optional[str]) -> bool:
     return False
 
 
+_DENOM_LABEL_RE = re.compile(r"^\s*\d{2,5}\s*[xX]\b")
+
+
+def _is_denomination_label_line(text: str) -> bool:
+    """判断是否为现金存款凭条的面额标签行（如 "5000 X"、"2000 X"）。
+
+    这类行含数字但不是交易金额，提取主金额时需跳过，避免把 5000 当成存款金额。
+    """
+    return bool(_DENOM_LABEL_RE.match(text.strip()))
+
+
+def _parse_money_skip_denom(text: str) -> Optional[float]:
+    """解析金额，但如果整行是面额标签行则返回 None。"""
+    if _is_denomination_label_line(text):
+        return None
+    return _parse_money(text)
+
+
 def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[float]]:
     """返回 (amount, fee, total_debit)。
 
     金额行通常只有一个数字，按行内子串特征（fee/charge、total、amount/deposit）
     分类提取，避免 "total debit amount" 里的 "amount" 把总额误判为主金额。
+    现金存款凭条的面额标签行（"5000 X" 等）会被跳过，防止把面额当成交易金额。
     """
     fee = None
     total = None
@@ -557,6 +578,8 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
             total = _parse_money(ln.text)
             if total is None:
                 side = _value_to_right(i, ordered0, ln)
+                if not side:
+                    side = _right_column_value(i, ordered0, ln)
                 if side:
                     total = _parse_money(side)
 
@@ -566,10 +589,14 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
         if "total" in low or "fee" in low or "charge" in low:
             continue
         if "amount" in low or "deposit" in low:
-            amount = _parse_money(ln.text)
+            amount = _parse_money_skip_denom(ln.text)
             if amount is None:
                 side = _value_to_right(i, ordered, ln)
-                if side:
+                if side and not _is_denomination_label_line(side):
+                    amount = _parse_money(side)
+            if amount is None:
+                side = _right_column_value(i, ordered, ln)
+                if side and not _is_denomination_label_line(side):
                     amount = _parse_money(side)
             if amount is None and "deposit amount" in low:
                 amount = _money_near_label_right(ordered, ln)
@@ -581,10 +608,11 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
         for ln in _sorted_by_y(lines):
             low = ln.text.lower()
             if ("lkr" in low or "rs." in low or low.startswith("rs")) and "total" not in low and "fee" not in low:
-                amount = _parse_money(ln.text)
+                amount = _parse_money_skip_denom(ln.text)
                 if amount is not None:
                     break
 
+    # 现金存款：TOTAL 行即存款总额，优先采用（面额表的 TOTAL 比散点金额更可靠）
     if amount is None and total is not None:
         amount = total
     return amount, fee, total
@@ -767,14 +795,17 @@ def _extract_references(lines) -> ReferencesOut:
 def _find_deposit_breakdown(lines, total_amount: Optional[float] = None) -> List[DenominationOut]:
     """现金存款凭条：识别纸币明细。
 
-    兼容两种版式：
-    * 三栏式（Commercial Bank CDM）：NOTES(张数) / VALUE(面额) / AMOUNT(金额) 三列，
-      每列独立成 OCR 行，按列 x 归属 + 逐行 y 对齐；
+    兼容三种版式：
+    * CDM 三栏式（Commercial Bank CDM）：NOTES(张数) / VALUE(面额) / AMOUNT(金额)；
+    * 纸质凭条三栏式（Commercial Bank CASH CREDIT SLIP）：NOTES(面额标签) / RS.(张数) / CTS(金额)；
     * 单行式（旧版 "面值 张数 金额" 同行）作为兜底。
     """
     cols = _breakdown_from_columns(lines, total_amount)
     if cols:
         return cols
+    credit = _breakdown_from_credit_slip_columns(lines, total_amount)
+    if credit:
+        return credit
     return _breakdown_single_line(lines)
 
 
@@ -872,6 +903,95 @@ def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[Denomi
     return breakdown
 
 
+def _breakdown_from_credit_slip_columns(lines, total_amount: Optional[float]) -> List[DenominationOut]:
+    """Commercial Bank 纸质现金存款凭条面额表：NOTES(面额标签) / RS.(张数) / CTS(金额)。
+
+    与 CDM 版式不同：本版式 NOTES 列是面额标签行（如 "5000 X"、"2000 X"），
+    中间列（RS.）是张数，末列（CTS）是该面额小计金额。
+    按表头 x 分列，面额列解析标签中的数字，数量列取纯数字，金额列取解析值。
+    """
+    ordered = _sorted_by_y(lines)
+    headers: dict = {}
+    for ln in ordered:
+        t = ln.text.strip().lower().rstrip(":.")
+        if t in ("notes", "rs.", "rs", "cts", "ct") and t not in headers:
+            headers[t] = (ln, _line_center_x(ln.box), _line_center_y(ln.box))
+    if "notes" not in headers:
+        return []
+    notes_cx = headers["notes"][1]
+    # NOTES 右侧的列按 x 排序：第一列为数量列，第二列为金额列
+    right_cols = sorted(
+        [(cx, name) for name, (_, cx, _) in headers.items() if name != "notes" and cx > notes_cx],
+        key=lambda x: x[0],
+    )
+    if not right_cols:
+        return []
+    qty_cx = right_cols[0][0]
+    amt_cx = right_cols[1][0] if len(right_cols) >= 2 else None
+    b_notes_qty = (notes_cx + qty_cx) / 2
+    b_qty_amt = (qty_cx + amt_cx) / 2 if amt_cx else None
+    header_y = min(v[2] for v in headers.values())
+
+    denom_rows: List[tuple] = []
+    qty_rows: List[tuple] = []
+    amount_rows: List[tuple] = []
+    for ln in ordered:
+        y = _line_center_y(ln.box)
+        if y <= header_y + 2:
+            continue
+        t = ln.text.strip()
+        low = t.lower().rstrip(":.")
+        if low in ("notes", "rs.", "rs", "cts", "ct", "coins", "total") or "deposit amount" in low:
+            continue
+        cx = _line_center_x(ln.box)
+        if cx < b_notes_qty:
+            # 面额标签列："5000 X" / "2000 X" -> 取前导数字作为面额
+            m = re.match(r"(\d{2,5})", t)
+            if m:
+                denom = int(m.group(1))
+                if denom in _COMMON_DENOMS:
+                    denom_rows.append((y, float(denom)))
+        elif b_qty_amt is None or cx < b_qty_amt:
+            # 数量列：纯数字（1~3 位）
+            m = re.fullmatch(r"\d{1,3}", t)
+            if m:
+                qty_rows.append((y, int(m.group(0))))
+        else:
+            # 金额列
+            val = _parse_denomination(t)
+            if val is not None:
+                amount_rows.append((y, val))
+
+    if not denom_rows:
+        return []
+    qty_rows.sort()
+    denom_rows.sort()
+    amount_rows.sort()
+    if total_amount is not None:
+        amount_rows = [(y, m) for y, m in amount_rows if abs(m - total_amount) > 0.01]
+
+    # 面额去重
+    seen_denoms = set()
+    unique_denoms = []
+    for y, denom in denom_rows:
+        if denom in seen_denoms:
+            continue
+        seen_denoms.add(denom)
+        unique_denoms.append((y, denom))
+    denom_rows = unique_denoms
+
+    breakdown: List[DenominationOut] = []
+    for i, (_, denom) in enumerate(denom_rows):
+        qty = qty_rows[i][1] if i < len(qty_rows) else 1
+        amount = denom * qty
+        for _, amt in amount_rows:
+            if abs(amt - denom * qty) < 0.05:
+                amount = amt
+                break
+        breakdown.append(DenominationOut(denomination=denom, quantity=qty, amount=amount))
+    return breakdown
+
+
 def _breakdown_single_line(lines) -> List[DenominationOut]:
     """单行式「面值 张数 金额」三元组（旧版兜底）。"""
     breakdown: List[DenominationOut] = []
@@ -899,7 +1019,7 @@ def _breakdown_single_line(lines) -> List[DenominationOut]:
 _BANK_MARKERS = [
     ("vishwa", ("vishwa",)),
     ("peoples_bank", ("peoplespay", "people's pay", "people's bank")),
-    ("commercial_bank", ("cardless deposit", "combank", "transfer within", "e-receipt", "bank reference number", "sender's account number", "beneficiary notified")),
+    ("commercial_bank", ("cardless deposit", "combank", "transfer within", "e-receipt", "bank reference number", "sender's account number", "beneficiary notified", "cash credit slip")),
     ("boc", ("bank of ceylon", "boc flex", "boc")),
     ("hnb", ("hatton national", "hnb", "this is an auto generated receipt")),
     ("dfcc", ("dfcc bank", "dfcc")),
@@ -933,6 +1053,19 @@ def _is_cash_deposit(lines) -> bool:
     """Commercial Bank CDM 无卡存款凭条（CARDLESS DEPOSIT）。"""
     full = " ".join(ln.text for ln in lines).lower()
     return any(m in full for m in _CDM_MARKERS)
+
+
+_CASH_CREDIT_SLIP_MARKERS = ("cash credit slip", "current account - cash deposit")
+
+
+def _is_cash_credit_slip(lines) -> bool:
+    """Commercial Bank 纸质现金存款凭条（CASH CREDIT SLIP）。
+
+    强特征：标题 "CASH CREDIT SLIP"，或底部机打 "CURRENT ACCOUNT - CASH DEPOSIT"。
+    与 CDM（无卡存款）区分：CDM 有 "CARDLESS DEPOSIT"，本版式为手写填表 + 机打底部。
+    """
+    full = " ".join(ln.text for ln in lines).lower()
+    return any(m in full for m in _CASH_CREDIT_SLIP_MARKERS)
 
 
 def _is_to_only_receipt(lines) -> bool:
@@ -1065,6 +1198,91 @@ def _extract_cdm_parties(lines) -> tuple[PartyOut, PartyOut]:
     payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
     payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
     return payer, payee
+
+
+_ACCOUNT_HOLDER_NAME_LABELS = ["name of account holder"]
+_DEPOSITOR_NAME_LABELS = ["name and address of the depositor", "name & address of the depositor"]
+
+
+def _extract_cash_credit_slip_parties(lines) -> tuple[PartyOut, PartyOut]:
+    """Commercial Bank 纸质现金存款凭条（CASH CREDIT SLIP）。
+
+    版式：上方「Name of Account Holder」（收款方/账户持有人，手写）、
+    「ACCOUNT NUMBER」（右栏），中部「NAME AND ADDRESS OF THE DEPOSITOR」（付款方/存款人），
+    右侧面额表格，底部机打交易信息（户名、账号、金额）。
+
+    收款方优先取「Name of Account Holder」字段值，缺失时回退到底部机打户名；
+    账号优先取「ACCOUNT NUMBER」右栏值，缺失时回退到底部纯数字账号行。
+    """
+    payer, payee = PartyOut(), PartyOut()
+    ordered = _sorted_by_y(lines)
+
+    # 收款方姓名：账户持有人字段，回退底部机打户名
+    payee.name = _match_label_value(ordered, _ACCOUNT_HOLDER_NAME_LABELS)
+    if not payee.name:
+        payee.name = _find_bottom_account_holder_name(ordered)
+
+    # 付款方姓名：存款人字段
+    payer.name = _match_label_value(ordered, _DEPOSITOR_NAME_LABELS)
+
+    # 收款方账号：ACCOUNT NUMBER 右栏值，回退底部纯数字账号行
+    payee.account = _right_column_for(ordered, {"account number"})
+    if payee.account:
+        tok = _account_token(payee.account)
+        if tok:
+            payee.account = tok
+    if not payee.account:
+        payee.account = _find_bottom_account_number(ordered)
+
+    payee.bank = "Commercial Bank"
+
+    payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+    return payer, payee
+
+
+def _find_bottom_account_holder_name(lines) -> Optional[str]:
+    """现金存款凭条底部机打区：取第一个非标签、非纯数字的字母行作为户名。
+
+    底部通常有 "LAK ARTHA SERVICES" 等户名，夹在日期、账号、金额之间。
+    跳过含标签词（date/time/reference/account/bank/deposit/thank/you）和纯数字行。
+    """
+    skip_words = (
+        "date", "time", "reference", "account", "bank", "deposit", "thank", "you",
+        "current", "savings", "lkr", "rs", "teller", "officer", "copy", "auth",
+        "cdbs", "notes", "coins", "total", "name", "address", "purpose", "funds",
+        "nic", "pdl", "tel",
+    )
+    # 只考虑下半部分的行（底部机打区通常在表单下半部）
+    ys = [_line_center_y(l.box) for l in lines]
+    if not ys:
+        return None
+    mid = (min(ys) + max(ys)) / 2
+    for ln in _sorted_by_y(lines):
+        if _line_center_y(ln.box) < mid:
+            continue
+        t = ln.text.strip()
+        if not t or len(t) < 3:
+            continue
+        if re.fullmatch(r"[\d\s,\.*/\-:]+", t):
+            continue  # 纯数字/符号行（日期、账号、金额）
+        low = t.lower()
+        if any(w in low for w in skip_words):
+            continue
+        # 跳过面额标签行（如 "5000 X"）
+        if re.fullmatch(r"\d+\s*[xX]\s*.*", t):
+            continue
+        return _clean(t)
+    return None
+
+
+def _find_bottom_account_number(lines) -> Optional[str]:
+    """现金存款凭条底部机打区：取第一个纯数字（>=8 位）的账号行。"""
+    for ln in _sorted_by_y(lines):
+        t = ln.text.strip()
+        if re.fullmatch(r"\d{8,}", t):
+            return t
+    return None
 
 
 def _extract_to_only_parties(lines) -> tuple[PartyOut, PartyOut]:

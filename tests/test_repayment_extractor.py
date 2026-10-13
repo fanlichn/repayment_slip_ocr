@@ -636,6 +636,44 @@ def test_cash_credit_slip_uses_real_machine_print_coordinates():
     assert r.datetime == "2026-10-09T09:24:16"
 
 
+def test_cash_credit_slip_title_corrupted_uses_denomination_table():
+    """OCR 把 'CASH CREDIT SLIP' 标题读坏，但面额表能识别。
+    应仍命中 cash_credit_slip 分支，正确提取户名/账号/金额。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 14, x1, y + 14)
+    lines = [
+        L("COMMERCIAL BANK", 50, 290, 250),
+        L(" /  /CASH CREDIT SLIP", 1005, 1620, 210),  # 标题被读坏
+        L("ACCOUNT NUMBER", 1003, 1184, 300),
+        L("1001096962", 1003, 1184, 340),
+        L("NAME AND ADDRESS OF THE DEPOSITOR", 52, 375, 480),
+        # 面额表（结构化印刷体，识别率高）
+        L("5000 X", 1016, 1113, 460),
+        L("2000 X", 1016, 1113, 510),
+        L("1000 X", 1017, 1115, 555),
+        L("500 X", 1032, 1115, 600),
+        L("100 X", 1036, 1113, 645),
+        L("50 X", 1045, 1113, 686),
+        L("20 X", 1046, 1113, 732),
+        L("TOTAL", 1023, 1090, 884),
+        # 底部机打区
+        L("LAK ARTHA SERVICES", 446, 761, 830),
+        L("1001096962", 582, 761, 860),
+        L("LKR", 382, 440, 880),
+        L("5,000.00", 616, 762, 890),
+        L("02-10-26 11:11:04", 80, 340, 810),
+        L("CURRENT ACCOUNT", 157, 395, 940),
+        L("CASH DEPOSIT", 433, 639, 960),
+    ]
+    r = extract(lines)
+    assert r.bank == "commercial_bank"
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank"
+    assert r.amount == 5000.0
+    assert r.total_debit == 5000.0
+
+
 def test_hnb_fund_transfer_receipt():
     """HNB 手机 App「Fund Transfer Receipt」：From/To 居中标签、值堆叠在下方，
     收款方「姓名-账号」合并一行，底部 "Receiver reference" 与 "This is an auto generated receipt"。"""

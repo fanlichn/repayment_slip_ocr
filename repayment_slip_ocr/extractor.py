@@ -1162,14 +1162,33 @@ def _is_cash_deposit(lines) -> bool:
 _CASH_CREDIT_SLIP_MARKERS = ("cash credit slip", "current account - cash deposit")
 
 
+def _has_denomination_table(lines) -> bool:
+    """检测现金存款凭条右侧的面额表（5000 X / 2000 X / 1000 X ...）。
+
+    OCR 常把 "CASH CREDIT SLIP" 标题读坏，但面额表是结构化印刷体，
+    只要识别出 3 个以上面额标签行即可判定为现金存款凭条。
+    """
+    count = sum(1 for ln in lines if _is_denomination_label_line(ln.text))
+    return count >= 3
+
+
 def _is_cash_credit_slip(lines) -> bool:
     """Commercial Bank 纸质现金存款凭条（CASH CREDIT SLIP）。
 
-    强特征：标题 "CASH CREDIT SLIP"，或底部机打 "CURRENT ACCOUNT - CASH DEPOSIT"。
+    强特征（任一满足）：
+    1. 标题 "CASH CREDIT SLIP" 或底部机打 "CURRENT ACCOUNT - CASH DEPOSIT"；
+    2. 面额表（3+ 个 "XXXX X" 标签行）+ "commercial bank" 或 "cash deposit"。
     与 CDM（无卡存款）区分：CDM 有 "CARDLESS DEPOSIT"，本版式为手写填表 + 机打底部。
     """
     full = " ".join(ln.text for ln in lines).lower()
-    return any(m in full for m in _CASH_CREDIT_SLIP_MARKERS)
+    if any(m in full for m in _CASH_CREDIT_SLIP_MARKERS):
+        return True
+    # 兜底：面额表 + 银行/存款关键词（OCR 把标题读坏时仍能命中）
+    if _has_denomination_table(lines) and (
+        "commercial bank" in full or "cash deposit" in full or "deposit by" in full
+    ):
+        return True
+    return False
 
 
 def _is_to_only_receipt(lines) -> bool:
@@ -1304,8 +1323,18 @@ def _extract_cdm_parties(lines) -> tuple[PartyOut, PartyOut]:
     return payer, payee
 
 
-_ACCOUNT_HOLDER_NAME_LABELS = ["name of account holder"]
-_DEPOSITOR_NAME_LABELS = ["name and address of the depositor", "name & address of the depositor"]
+_ACCOUNT_HOLDER_NAME_LABELS = [
+    "name of account holder",
+    "name of account holdur",  # OCR 常见误读
+    "ot account holder",       # "Name of" 被截断
+]
+_DEPOSITOR_NAME_LABELS = [
+    "name and address of the depositor",
+    "name & address of the depositor",
+    "address of the depositor",
+    "address ofthe depositor",  # OCR 把 "of the" 连成 "ofthe"
+    "ano address ofthe depositor",  # "NAME AND" 被误读为 "ANO"
+]
 
 
 def _extract_cash_credit_slip_parties(lines) -> tuple[PartyOut, PartyOut]:
@@ -1686,6 +1715,10 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     doc_type = _detect_doc_type(full_text)
     status = _detect_status(full_text)
     bank = _detect_bank(lines)
+    # 现金存款凭条版式固定为 Commercial Bank，即使 OCR 把 "cash credit slip" 读坏，
+    # 只要面额表检测命中就设为 commercial_bank。
+    if _is_cash_credit_slip(lines) and not bank:
+        bank = "commercial_bank"
 
     payer, payee = _extract_parties(lines, bank)
     trace_no = _match_label_value(lines, ["trace no", "trace number", "tranceno", "trace"])

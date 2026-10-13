@@ -16,8 +16,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY repayment_slip_ocr ./repayment_slip_ocr
 
-EXPOSE 8000
+EXPOSE 8000 8001
 
 # 进程数量由环境变量 NIC_OCR_WORKERS 控制（默认 2）
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${NIC_OCR_WORKERS:-2}"]

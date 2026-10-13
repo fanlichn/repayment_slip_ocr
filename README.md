@@ -1,6 +1,13 @@
-# 斯里兰卡身份证 OCR 识别服务
+# 斯里兰卡 OCR 识别服务
 
-面向生产环境的斯里兰卡（Sri Lanka）国民身份证（National Identity Card，简称 NIC）识别服务。输入一张身份证照片，自动抽取结构化字段并以 JSON 返回。
+面向生产环境的斯里兰卡（Sri Lanka）OCR 识别服务，包含两个相互独立的子服务：
+
+| 服务 | 模块 | 默认端口 | 说明 |
+| --- | --- | --- | --- |
+| **NIC OCR** | `app/` | `8000` | 国民身份证（NIC）识别，抽取姓名、身份证号、出生日期、性别、地址等 |
+| **Repayment Slip OCR** | `repayment_slip_ocr/` | `8001` | 银行还款/转账凭证识别，抽取付款方、收款方、金额、日期、参考号、纸币明细等 |
+
+两个服务共用同一套 OCR 引擎、图像预处理与远程图片下载（含 SSRF 防护），可单独部署、互不影响。
 
 识别字段：
 
@@ -24,18 +31,26 @@
 
 ```
 sri_lanka_nic_ocr/
-├── app/
+├── app/                        # NIC OCR 服务
 │   ├── __init__.py
-│   ├── config.py         # 配置（环境变量 .env）
-│   ├── nic_parser.py     # NIC 号码解析（出生日期/性别/校验）
-│   ├── preprocessing.py  # OpenCV 图像预处理（缩放/去噪/纠偏/二值化）
-│   ├── ocr_engine.py     # OCR 引擎封装（PaddleOCR / Tesseract）
-│   ├── extractor.py      # 字段抽取（标签匹配 + 正则）
-│   ├── schemas.py        # 响应模型
-│   ├── main.py           # FastAPI 服务
-│   └── cli.py            # 命令行单图测试
+│   ├── config.py               # 配置（环境变量 .env，两个服务共用）
+│   ├── nic_parser.py           # NIC 号码解析（出生日期/性别/校验）
+│   ├── preprocessing.py        # OpenCV 图像预处理（缩放/去噪/纠偏/二值化）
+│   ├── ocr_engine.py           # OCR 引擎封装（PaddleOCR / Tesseract）
+│   ├── url_fetch.py            # 远程图片下载（含 SSRF 防护）
+│   ├── extractor.py            # NIC 字段抽取
+│   ├── schemas.py              # NIC 响应模型
+│   ├── main.py                 # NIC FastAPI 服务（端口 8000）
+│   └── cli.py                  # NIC 命令行单图测试
+├── repayment_slip_ocr/         # 还款/转账凭证 OCR 服务
+│   ├── __init__.py
+│   ├── extractor.py            # 凭证字段抽取（多银行/多版式）
+│   ├── schemas.py              # 凭证响应模型
+│   ├── main.py                 # 凭证 FastAPI 服务（端口 8001）
+│   └── cli.py                  # 凭证命令行单图测试
 ├── tests/
-│   └── test_nic_parser.py
+│   ├── test_nic_parser.py
+│   └── test_repayment_extractor.py
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -70,17 +85,22 @@ pip install -r requirements.txt
 copy .env.example .env        # Windows
 cp .env.example .env          # Linux/macOS
 
-# 4. 启动服务
+# 4. 启动 NIC OCR 服务（端口 8000）
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-# 5. 单图命令行测试（无需启动服务）
-python -m app.cli path/to/id_card.jpg
+# 5. 启动 Repayment Slip OCR 服务（端口 8001，另开终端）
+uvicorn repayment_slip_ocr.main:app --host 0.0.0.0 --port 8001
+
+# 6. 单图命令行测试（无需启动服务）
+python -m app.cli path/to/id_card.jpg                      # NIC
+python -m repayment_slip_ocr.cli path/to/slip.jpg           # 凭证
 ```
 
 启动成功后访问：
 
-- 接口文档（Swagger UI）：<http://localhost:8000/docs>
-- 健康检查：<http://localhost:8000/health>
+- NIC OCR 接口文档：<http://localhost:8000/docs>
+- Repayment Slip OCR 接口文档：<http://localhost:8001/docs>
+- 健康检查：<http://localhost:8000/health>（NIC）/ <http://localhost:8001/health>（凭证）
 
 ---
 
@@ -173,16 +193,115 @@ print(resp.json())
 
 ---
 
+## Repayment Slip OCR（还款/转账凭证识别）
+
+独立于 NIC OCR 的第二个服务，识别斯里兰卡各银行的还款/转账/现金存款凭证，抽取付款方、收款方、金额、日期、参考号、纸币明细等字段。
+
+### 支持的文档类型与银行
+
+| `doc_type` | 说明 | 已适配银行/渠道 |
+| --- | --- | --- |
+| `payment_confirmation` | 付款确认回执 | People's Bank、BOC、Pan Asia 等 |
+| `fund_transfer_receipt` | 转账回执 | Commercial Bank、HNB、BOC 等 |
+| `cash_deposit_slip` | 现金存款凭条 | Commercial Bank（含 CDM 无卡存款、纸质 Cash Credit Slip） |
+| `e_receipt` | 电子收据 | Commercial Bank 等 |
+
+### 识别字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `doc_type` | 文档类型（见上表） |
+| `status` | 交易状态：`success` / `pending` / `failed` |
+| `bank` | 银行/渠道（`peoples_bank` / `commercial_bank` / `boc` / `hnb` / ...） |
+| `payer` | 付款方：`name` / `account` / `account_prefix` / `account_last4` / `bank` |
+| `payee` | 收款方：同上结构 |
+| `amount` | 交易金额（LKR） |
+| `fee` | 手续费 |
+| `total_debit` | 借方合计 |
+| `currency` | 币种（默认 `LKR`） |
+| `datetime` | 交易时间（ISO 8601） |
+| `references` | 各类参考号：`transaction_id` / `txn_ref` / `retrieval_ref` / `bank_reference_number` / `e_receipt_reference` / `my_ref` / `receiver_ref` / `remarks` |
+| `deposit_breakdown` | 现金存款纸币明细：`[{denomination, quantity, amount}]` |
+| `branch` / `terminal_id` / `trace_no` | 存款凭条的网点/终端/追踪号 |
+| `warnings` | 识别过程中的提示（如明细加总与总额不符、未可靠识别等） |
+
+### 接口
+
+三个接口与 NIC OCR 一致，均支持 `include_lines=true` 查询参数（返回原始 OCR 行，便于调试）：
+
+```bash
+# 上传图片
+curl -X POST "http://localhost:8001/ocr?include_lines=true" -F "file=@slip.jpg"
+
+# Base64
+curl -X POST "http://localhost:8001/ocr_base64?include_lines=true" \
+  -H "Content-Type: application/json" \
+  -d '{"image_base64": "<BASE64>"}'
+
+# 图片 URL（OSS / S3 / CDN 公开链接）
+curl -X POST "http://localhost:8001/ocr_url?include_lines=true" \
+  -H "Content-Type: application/json" \
+  -d '{"image_url": "https://lak-pic.oss-ap-southeast-1.aliyuncs.com/attachment/REPAY_PHOTO/xxx.jpg"}'
+```
+
+### 返回示例（Commercial Bank Cash Credit Slip）
+
+```json
+{
+  "success": true,
+  "doc_type": "cash_deposit_slip",
+  "bank": "commercial_bank",
+  "payer": {},
+  "payee": {
+    "name": "Lak Artha (Pvt) Ltd",
+    "account": "1001096962",
+    "account_prefix": "1001",
+    "account_last4": "6962",
+    "bank": "Commercial Bank"
+  },
+  "amount": 5300.0,
+  "total_debit": 5300.0,
+  "currency": "LKR",
+  "datetime": "2026-10-09T09:24:16",
+  "references": {},
+  "fields": {},
+  "deposit_breakdown": [],
+  "warnings": ["未可靠识别手写纸币明细，未默认补填张数"],
+  "lines": [],
+  "elapsed_ms": 6491.17
+}
+```
+
+### 调试技巧
+
+当识别结果不符合预期时，用 `include_lines=true` 获取原始 OCR 文本，检查关键字段是否被正确识别：
+
+- **金额识别异常**：OCR 可能把千分位逗号识别成点（如 `5.300.00`），已内置兼容解析。
+- **姓名/账号错位**：现金存款凭条优先取表单字段值，缺失时回退底部机打户名；账号用带校验的 `_extract_account` 提取。
+- **纸币明细为空**：手写张数 OCR 识别率低，代码不会默认补填（避免误填 quantity=1），而是留空并发出警告。
+- **日期错误**：优先取机打完整日期时间，表单日期作为兜底。
+
+---
+
 ## 生产部署
+
+两个服务共用同一镜像，通过不同的启动命令区分。
 
 ### 方案一：Docker Compose（推荐）
 
+`docker-compose.yml` 已配置两个服务：`nic-ocr`（8000）和 `repayment-ocr`（8001）。
+
 ```bash
-# 构建并后台启动（restart: unless-stopped 会自动拉起）
+# 构建并后台启动两个服务（restart: unless-stopped 会自动拉起）
 docker compose up -d --build
 
+# 只启动其中一个
+docker compose up -d nic-ocr
+docker compose up -d repayment-ocr
+
 # 查看日志
-docker compose logs -f
+docker compose logs -f nic-ocr
+docker compose logs -f repayment-ocr
 
 # 查看状态
 docker compose ps
@@ -193,18 +312,30 @@ docker compose ps
 ```bash
 docker build -t sri-lanka-nic-ocr:latest .
 
+# NIC OCR（端口 8000）
 docker run -d --name nic-ocr \
   --restart unless-stopped \
   -p 8000:8000 \
   -e NIC_OCR_OCR_ENGINE=paddle \
   -e NIC_OCR_PADDLE_USE_GPU=false \
   sri-lanka-nic-ocr:latest
+
+# Repayment Slip OCR（端口 8001，覆盖启动命令）
+docker run -d --name repayment-ocr \
+  --restart unless-stopped \
+  -p 8001:8000 \
+  -e NIC_OCR_OCR_ENGINE=paddle \
+  -e NIC_OCR_PADDLE_USE_GPU=false \
+  sri-lanka-nic-ocr:latest \
+  uvicorn repayment_slip_ocr.main:app --host 0.0.0.0 --port 8000 --workers 2
 ```
 
 ### 方案三：Linux 裸机 + systemd
 
 1. 按「快速开始」安装依赖到某个虚拟环境，例如 `/opt/nic-ocr/.venv`。
-2. 创建服务文件 `/etc/systemd/system/nic-ocr.service`：
+2. 分别创建两个服务文件。
+
+NIC OCR（`/etc/systemd/system/nic-ocr.service`）：
 
 ```ini
 [Unit]
@@ -226,12 +357,34 @@ StandardError=append:/var/log/nic-ocr/err.log
 WantedBy=multi-user.target
 ```
 
+Repayment Slip OCR（`/etc/systemd/system/repayment-ocr.service`）：
+
+```ini
+[Unit]
+Description=Sri Lanka Repayment Slip OCR Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nic-ocr
+EnvironmentFile=/opt/nic-ocr/.env
+ExecStart=/opt/nic-ocr/.venv/bin/uvicorn repayment_slip_ocr.main:app --host 0.0.0.0 --port 8001 --workers 2
+Restart=always
+RestartSec=5
+User=nic-ocr
+StandardOutput=append:/var/log/repayment-ocr/out.log
+StandardError=append:/var/log/repayment-ocr/err.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
 3. 启动并设为开机自启：
 
 ```bash
-sudo mkdir -p /var/log/nic-ocr
+sudo mkdir -p /var/log/nic-ocr /var/log/repayment-ocr
 sudo systemctl daemon-reload
-sudo systemctl enable --now nic-ocr
+sudo systemctl enable --now nic-ocr repayment-ocr
 ```
 
 ### 方案四：Windows 裸机
@@ -239,13 +392,23 @@ sudo systemctl enable --now nic-ocr
 使用 [NSSM](https://nssm.cc/) 将服务注册为 Windows 服务：
 
 ```powershell
+# NIC OCR
 nssm install NicOcr "C:\path\to\.venv\Scripts\uvicorn.exe"
 nssm set NicOcr AppParameters "app.main:app --host 0.0.0.0 --port 8000 --workers 2"
 nssm set NicOcr AppDirectory "C:\path\to\sri_lanka_nic_ocr"
-nssm set NicOcr AppStdout "C:\path\to\logs\out.log"
-nssm set NicOcr AppStderr "C:\path\to\logs\err.log"
+nssm set NicOcr AppStdout "C:\path\to\logs\nic-out.log"
+nssm set NicOcr AppStderr "C:\path\to\logs\nic-err.log"
 nssm set NicOcr Start SERVICE_AUTO_START
 nssm start NicOcr
+
+# Repayment Slip OCR
+nssm install RepaymentOcr "C:\path\to\.venv\Scripts\uvicorn.exe"
+nssm set RepaymentOcr AppParameters "repayment_slip_ocr.main:app --host 0.0.0.0 --port 8001 --workers 2"
+nssm set RepaymentOcr AppDirectory "C:\path\to\sri_lanka_nic_ocr"
+nssm set RepaymentOcr AppStdout "C:\path\to\logs\repayment-out.log"
+nssm set RepaymentOcr AppStderr "C:\path\to\logs\repayment-err.log"
+nssm set RepaymentOcr Start SERVICE_AUTO_START
+nssm start RepaymentOcr
 ```
 
 也可用「任务计划程序」在开机时运行 `uvicorn app.main:app ...`（选择「无论用户是否登录都运行」）。
@@ -257,8 +420,12 @@ nssm start NicOcr
 ### Docker Compose
 
 ```bash
-# 重启（不重建）
+# 重启全部服务（不重建）
 docker compose restart
+
+# 只重启某一个
+docker compose restart nic-ocr
+docker compose restart repayment-ocr
 
 # 更新代码后：重建并滚动更新
 git pull
@@ -272,33 +439,34 @@ docker run -d --name nic-ocr -p 8000:8000 sri-lanka-nic-ocr:v1.0.0
 ### Docker 单容器
 
 ```bash
-docker restart nic-ocr          # 重启
+docker restart nic-ocr repayment-ocr          # 重启
 docker stop nic-ocr && docker rm nic-ocr && docker run -d ...   # 重建
 ```
 
 ### systemd（Linux）
 
 ```bash
-sudo systemctl restart nic-ocr      # 重启
-sudo systemctl stop nic-ocr         # 停止
-sudo systemctl status nic-ocr       # 查看状态与最近日志
-sudo journalctl -u nic-ocr -f       # 跟踪日志
+sudo systemctl restart nic-ocr repayment-ocr   # 重启
+sudo systemctl stop nic-ocr                    # 停止单个
+sudo systemctl status repayment-ocr            # 查看状态与最近日志
+sudo journalctl -u repayment-ocr -f            # 跟踪日志
 ```
 
 ### Windows 服务（NSSM）
 
 ```powershell
-nssm restart NicOcr      # 重启
-nssm stop NicOcr         # 停止
-nssm start NicOcr        # 启动
-nssm status NicOcr       # 查看状态
+nssm restart NicOcr          # 重启 NIC OCR
+nssm restart RepaymentOcr    # 重启 Repayment OCR
+nssm stop NicOcr             # 停止
+nssm start RepaymentOcr      # 启动
+nssm status NicOcr           # 查看状态
 ```
 
 ---
 
 ## 配置项（环境变量 / `.env`）
 
-前缀 `NIC_OCR_`，也可直接写入 `.env` 文件。
+前缀 `NIC_OCR_`，也可直接写入 `.env` 文件。**NIC OCR 与 Repayment Slip OCR 两个服务共用同一套配置。**
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -350,8 +518,10 @@ nssm status NicOcr       # 查看状态
 ## 健康检查与日志
 
 - 健康检查：`GET /health`，返回 `{"status":"ok"}`。
-- Docker Compose 已内置 healthcheck（每 30s 探测一次）。
-- 日志：Docker 用 `docker compose logs -f`；systemd 用 `journalctl -u nic-ocr -f`。
+  - NIC OCR：`http://localhost:8000/health`
+  - Repayment Slip OCR：`http://localhost:8001/health`
+- Docker Compose 已为两个服务内置 healthcheck（每 30s 探测一次）。
+- 日志：Docker 用 `docker compose logs -f nic-ocr` / `docker compose logs -f repayment-ocr`；systemd 用 `journalctl -u nic-ocr -f` / `journalctl -u repayment-ocr -f`。
 
 ---
 
@@ -394,19 +564,45 @@ Tesseract 对印刷体僧伽罗语/泰米尔语的精度一般，长姓名偶有
 
 ---
 
+## 测试
+
+```bash
+# 运行全部测试（NIC + 还款凭条）
+pytest -q
+
+# 只跑还款凭条抽取测试
+pytest -q tests/test_repayment_extractor.py
+
+# 只跑 NIC 号码解析测试
+pytest -q tests/test_nic_parser.py
+```
+
+还款凭条测试覆盖多银行/多版式的字段抽取规则（People's Bank、BOC、Commercial Bank CDM、Cash Credit Slip、HNB 等），新增版式时建议同步补充测试用例。
+
+---
+
 ## 常见问题（FAQ）
 
-**Q：识别不出姓名/地址？**
+**Q：（NIC）识别不出姓名/地址？**
 A：这些字段依赖卡片上「Name / Address」等标签。若识别为空，先检查图片是否清晰、方向是否端正；可在 `extractor.py` 的标签列表里补充实际卡片使用的措辞（含僧伽罗语/泰米尔语标签）。长姓名跨行时，`_find_full_name` 会自动合并 `Name:` 标签正下方（水平落在取值列内、垂直距离不超过 2 倍行高）的至多 2 行字母续行；若卡片版式特殊导致合并遗漏，可调整 `_NAME_CONT_RE` / `_NON_NAME_KEYWORDS` 过滤规则。
 
-**Q：NIC 号码里混入了字母（如 0 识别成 O）？**
+**Q：（NIC）NIC 号码里混入了字母（如 0 识别成 O）？**
 A：`_find_nic` 已内置常见混淆纠正（O→0、I→1、S→5 等）。若仍失败，说明图片过糊，建议提高图片分辨率或改善光照。
 
-**Q：出生日期比真实早/晚一天？**
+**Q：（NIC）出生日期比真实早/晚一天？**
 A：多为 366 天日历偏移所致，见上文「已知偏移」，切换 `NIC_OCR_NIC_DAY_MODE=nic366` 后重启即可。
 
-**Q：校验位（最后一位）为何不做校验？**
+**Q：（NIC）校验位（最后一位）为何不做校验？**
 A：斯里兰卡 NIC 校验位算法未公开，无法可靠校验，故仅透传不校验。
 
-**Q：name_sinhala / name_tamil 一直返回 null？**
+**Q：（NIC）name_sinhala / name_tamil 一直返回 null？**
 A：见上文「多语言姓名」。Linux 裸机部署需先 `apt install tesseract-ocr tesseract-ocr-sin tesseract-ocr-tam`；Windows 需安装 Tesseract 并设置 `NIC_OCR_TESSERACT_CMD`。第二引擎不可用时服务会记录启动日志（「多语言姓名第二引擎未启用」），主流程不受影响。
+
+**Q：（凭证）金额识别不对或返回 null？**
+A：先用 `include_lines=true` 查看 OCR 原始文本，确认金额行是否被识别。OCR 常把千分位逗号识别成点（如 `5.300.00`），已内置兼容解析。若金额行完全未识别，需改善图片清晰度或在 `extractor.py` 中补充该行附近的标签匹配规则。
+
+**Q：（凭证）现金存款凭条的纸币明细（deposit_breakdown）为空？**
+A：手写张数 OCR 识别率低，代码不会默认补填 quantity=1（避免误导），而是留空并发出警告。若需精确明细，建议改善图片质量或在业务侧结合 amount 总额自行拆分。
+
+**Q：（凭证）户名/账号识别错位？**
+A：现金存款凭条优先取表单字段值，缺失时回退底部机打户名；账号用带校验的 `_extract_account` 提取（排除 OCR 噪声）。若仍错位，用 `include_lines=true` 检查标签与值的对应关系。

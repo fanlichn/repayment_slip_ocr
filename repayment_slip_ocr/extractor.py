@@ -699,6 +699,26 @@ def _parse_datetime(s: str) -> Optional[str]:
 
 def _find_datetime(lines) -> Optional[str]:
     if _is_cash_credit_slip(lines):
+        # Machine print can lose all date separators and the separator before
+        # seconds: "2026100909:2416" means 2026-10-09 09:24:16.
+        compact_pattern = re.compile(
+            r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])([0-2]\d|3[01])"
+            r"([01]\d|2[0-3]):([0-5]\d)([0-5]\d)(?!\d)"
+        )
+        for ln in lines:
+            match = compact_pattern.search(ln.text)
+            if match:
+                try:
+                    return datetime(
+                        int(match.group(1)),
+                        int(match.group(2)),
+                        int(match.group(3)),
+                        int(match.group(4)),
+                        int(match.group(5)),
+                        int(match.group(6)),
+                    ).isoformat()
+                except ValueError:
+                    pass
         printed = [
             ln for ln in lines
             if re.search(r"\d{1,2}:\d{2}", ln.text)
@@ -1412,9 +1432,11 @@ def _find_bottom_account_holder_name(lines) -> Optional[str]:
         if not _valid_credit_slip_name(t):
             continue
         height = max(p[1] for p in ln.box) - min(p[1] for p in ln.box)
+        name_x0, name_x1 = min(p[0] for p in ln.box), max(p[0] for p in ln.box)
         if not any(
             0 < _line_center_y(acc.box) - _line_center_y(ln.box) <= 3 * height
-            and abs(min(p[0] for p in acc.box) - min(p[0] for p in ln.box)) <= 2 * height
+            and max(name_x0, min(p[0] for p in acc.box))
+            < min(name_x1, max(p[0] for p in acc.box))
             for acc in accounts
         ):
             continue

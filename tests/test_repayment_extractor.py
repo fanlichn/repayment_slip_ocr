@@ -615,6 +615,27 @@ def test_cash_credit_slip_ocr_dot_instead_of_comma():
     assert r.total_debit == 5300.0
 
 
+def test_cash_credit_slip_uses_real_machine_print_coordinates():
+    """Real OCR layout: printed holder overlaps the account below it."""
+    lines = [
+        _lr("C / /CASH CREDIT SLIP", 1005, 198, 1622, 239),
+        _lr("CESSHC:OOL", 85, 883, 254, 922),
+        _lr("LAK ARTHA SERVICES", 445, 818, 761, 859),
+        _lr("1001096962", 581, 850, 761, 884),
+        _lr("LKR", 382, 870, 440, 904),
+        _lr("5,300.00", 616, 879, 762, 911),
+        _lr("2026100909:24167", 157, 958, 451, 1010),
+        _lr("2026100909:2416", 157, 981, 432, 1033),
+        _lr("CURRENT ACCOUNT", 157, 937, 395, 977),
+        _lr("CASH DEPOSIT", 433, 951, 639, 990),
+    ]
+    r = extract(lines)
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.amount == 5300.0
+    assert r.datetime == "2026-10-09T09:24:16"
+
+
 def test_hnb_fund_transfer_receipt():
     """HNB 手机 App「Fund Transfer Receipt」：From/To 居中标签、值堆叠在下方，
     收款方「姓名-账号」合并一行，底部 "Receiver reference" 与 "This is an auto generated receipt"。"""

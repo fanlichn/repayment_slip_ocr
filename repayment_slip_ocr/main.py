@@ -50,7 +50,7 @@ class UrlRequest(BaseModel):
     image_url: str
 
 
-def _recognize(buf: bytes) -> RepaymentResult:
+def _recognize(buf: bytes, include_lines: bool = False) -> RepaymentResult:
     settings = get_settings()
     if len(buf) > settings.max_upload_bytes:
         raise HTTPException(status_code=413, detail="文件过大")
@@ -62,7 +62,7 @@ def _recognize(buf: bytes) -> RepaymentResult:
 
     unique = dedup_lines(lines)
 
-    result = extract(unique)
+    result = extract(unique, include_lines=include_lines)
     result.elapsed_ms = (time.perf_counter() - t0) * 1000
     return result
 
@@ -73,24 +73,24 @@ def health():
 
 
 @app.post("/ocr", response_model=RepaymentResult, response_model_exclude_none=True)
-async def ocr(file: UploadFile = File(...)):
+async def ocr(file: UploadFile = File(...), include_lines: bool = False):
     buf = await file.read()
-    return _recognize(buf)
+    return _recognize(buf, include_lines=include_lines)
 
 
 @app.post("/ocr_base64", response_model=RepaymentResult, response_model_exclude_none=True)
-async def ocr_base64(req: Base64Request):
+async def ocr_base64(req: Base64Request, include_lines: bool = False):
     try:
         buf = base64.b64decode(req.image_base64, validate=True)
     except (binascii.Error, ValueError):
         raise HTTPException(status_code=400, detail="无效的 base64 图片数据")
-    return _recognize(buf)
+    return _recognize(buf, include_lines=include_lines)
 
 
 @app.post("/ocr_url", response_model=RepaymentResult, response_model_exclude_none=True)
-def ocr_url(req: UrlRequest):
+def ocr_url(req: UrlRequest, include_lines: bool = False):
     try:
         buf = fetch_image_bytes(req.image_url, get_settings())
     except UrlFetchError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return _recognize(buf)
+    return _recognize(buf, include_lines=include_lines)

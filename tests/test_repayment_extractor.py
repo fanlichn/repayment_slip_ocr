@@ -493,29 +493,30 @@ def test_commercial_bank_cash_credit_slip():
         L("RS.", 760, 820, 260),
         L("CTS", 870, 930, 260),
         L("5000 X", 640, 730, 300),
-        L("1", 760, 800, 300),
-        L("5,000.00", 870, 980, 300),
+        L("5,000", 760, 820, 300),
+        L("00", 870, 930, 300),
         L("2000 X", 640, 730, 335),
         L("0", 760, 800, 335),
-        L("0.00", 870, 940, 335),
+        L("00", 870, 930, 335),
         L("1000 X", 640, 730, 370),
         L("0", 760, 800, 370),
-        L("0.00", 870, 940, 370),
+        L("00", 870, 930, 370),
         L("500 X", 640, 720, 405),
         L("0", 760, 800, 405),
-        L("0.00", 870, 940, 405),
+        L("00", 870, 930, 405),
         L("100 X", 640, 720, 440),
-        L("3", 760, 800, 440),
-        L("300.00", 870, 950, 440),
+        L("300", 760, 820, 440),
+        L("00", 870, 930, 440),
         L("50 X", 640, 710, 475),
         L("0", 760, 800, 475),
-        L("0.00", 870, 940, 475),
+        L("00", 870, 930, 475),
         L("20 X", 640, 710, 510),
         L("0", 760, 800, 510),
-        L("0.00", 870, 940, 510),
+        L("00", 870, 930, 510),
         L("COINS", 640, 720, 545),
         L("TOTAL", 640, 720, 580),
-        L("5,300.00", 870, 980, 580),
+        L("5,300", 760, 820, 580),
+        L("00", 870, 930, 580),
         # 底部机打区
         L("THANK YOU FOR BANKING WITH US", 40, 420, 620),
         L("29-10-26 09:24:16", 40, 260, 660),
@@ -531,7 +532,7 @@ def test_commercial_bank_cash_credit_slip():
 
     assert r.bank == "commercial_bank"
     assert r.doc_type == "cash_deposit_slip"
-    assert r.status == "success"
+    assert r.status is None  # The paper form has no explicit transaction status.
     # 收款方：账户持有人（含 Lak Artha 归一化）
     assert r.payee.name == "Lak Artha (Pvt) Ltd"
     assert r.payee.account == "1001096962"
@@ -550,6 +551,54 @@ def test_commercial_bank_cash_credit_slip():
     total = sum(d.amount for d in r.deposit_breakdown)
     assert abs(total - 5300.0) < 0.05
     assert r.success is True
+
+
+def test_cash_credit_slip_missing_handwriting_does_not_invent_values():
+    lines = [
+        _lr("CASH CREDIT SLIP", 740, 40, 1100, 70),
+        _lr("ACCOUNT NUMBER 1001096962", 740, 100, 1100, 130),
+        _lr("NAME AND ADORESS CFTHE DEPOSITOR", 40, 250, 600, 275),
+        _lr("5.REFNUMSER", 40, 490, 260, 515),
+        _lr("NOTES", 740, 260, 820, 280),
+        _lr("RS.", 940, 260, 980, 280),
+        _lr("CTS", 1100, 260, 1150, 280),
+        _lr("TOTAL", 740, 620, 820, 650),
+        _lr("65", 950, 675, 990, 700),  # Below TOTAL, not its currency cell.
+    ]
+    for i, denom in enumerate((5000, 2000, 1000, 500, 100, 50, 20)):
+        lines.append(_lr(f"{denom} X", 740, 310 + i * 40, 825, 335 + i * 40))
+    r = extract(lines, include_lines=True)
+    assert r.payee.account == "1001096962"
+    assert r.payee.name is None
+    assert r.payer.name is None
+    assert r.amount is None
+    assert r.total_debit is None
+    assert r.deposit_breakdown == []
+    assert len(r.warnings) >= 3
+    assert len(r.lines) == len(lines)
+
+
+def test_cash_credit_slip_printed_fields_override_form_noise():
+    lines = [
+        _lr("CASH CREDIT SLIP", 740, 40, 1100, 70),
+        _lr("DATE 09-10-20", 740, 140, 1100, 170),
+        _lr("5.REFNUMSER", 40, 490, 260, 515),
+        _lr("LAK ARTHA SERVICES", 320, 600, 580, 620),
+        _lr("1001096962", 320, 635, 520, 655),
+        _lr("09-10-26 09:24:16", 40, 600, 270, 620),
+        _lr("LKR", 280, 665, 330, 685),
+        _lr("5, 300. 00", 450, 665, 580, 685),
+        _lr("TOTAL", 740, 620, 820, 650),
+        _lr("65", 950, 675, 990, 700),
+        _lr("CURRENT ACCOUNT - CASH DEPOSIT", 40, 720, 600, 745),
+    ]
+    r = extract(lines)
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.amount == 5300
+    assert r.total_debit == 5300
+    assert r.datetime == "2026-10-09T09:24:16"
+    assert r.deposit_breakdown == []
 
 
 def test_hnb_fund_transfer_receipt():

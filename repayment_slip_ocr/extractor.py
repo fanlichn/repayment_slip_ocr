@@ -560,6 +560,14 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
     分类提取，避免 "total debit amount" 里的 "amount" 把总额误判为主金额。
     现金存款凭条的面额标签行（"5000 X" 等）会被跳过，防止把面额当成交易金额。
     """
+    if _is_cash_credit_slip(lines):
+        # Paper forms contain numbered labels and handwritten currency cells,
+        # not the label/value layout used by electronic receipts.
+        amount = _find_credit_slip_printed_amount(lines)
+        if amount is None:
+            amount = _find_deposit_total_from_table(lines)
+        return amount, None, amount
+
     fee = None
     total = None
     amount = None
@@ -602,15 +610,6 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
                 amount = _money_near_label_right(ordered, ln)
             if amount is not None:
                 break
-
-    # 现金存款：优先从面额表 TOTAL 行取存款总额（印刷体，最可靠）。
-    # 仅当存在面额标签行（如 "5000 X"）时才启用，避免影响转账回执等其他版式。
-    has_denom_labels = any(_is_denomination_label_line(ln.text) for ln in lines)
-    if has_denom_labels:
-        table_total = _find_deposit_total_from_table(lines)
-        if table_total is not None:
-            amount = table_total
-            total = table_total
 
     # 头部无标签金额行（如 "LKR 37,800.00"）
     if amount is None:
@@ -685,6 +684,8 @@ def _parse_datetime(s: str) -> Optional[str]:
         "%d-%m-%y",
         "%d/%m/%y %H:%M",
         "%d-%m-%y %H:%M",
+        "%d/%m/%y %H:%M:%S",
+        "%d-%m-%y %H:%M:%S",
         "%Y/%m/%d",
         "%Y-%m-%d",
     ]
@@ -697,6 +698,21 @@ def _parse_datetime(s: str) -> Optional[str]:
 
 
 def _find_datetime(lines) -> Optional[str]:
+    if _is_cash_credit_slip(lines):
+        printed = [
+            ln for ln in lines
+            if re.search(r"\d{1,2}:\d{2}", ln.text)
+            and re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", ln.text)
+        ]
+        for ln in _sorted_by_y(printed):
+            match = re.search(
+                r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?",
+                ln.text,
+            )
+            if match:
+                parsed = _parse_datetime(match.group(0))
+                if parsed:
+                    return parsed
     dt_text = _match_label_value(lines, _DATETIME_LABELS)
     if dt_text:
         parsed = _parse_datetime(dt_text)
@@ -809,6 +825,8 @@ def _find_deposit_breakdown(lines, total_amount: Optional[float] = None) -> List
     * 纸质凭条三栏式（Commercial Bank CASH CREDIT SLIP）：NOTES(面额标签) / RS.(张数) / CTS(金额)；
     * 单行式（旧版 "面值 张数 金额" 同行）作为兜底。
     """
+    if _is_cash_credit_slip(lines):
+        return _breakdown_from_credit_slip_columns(lines, total_amount)
     cols = _breakdown_from_columns(lines, total_amount)
     if cols:
         return cols
@@ -913,166 +931,99 @@ def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[Denomi
 
 
 def _breakdown_from_credit_slip_columns(lines, total_amount: Optional[float]) -> List[DenominationOut]:
-    """Commercial Bank 纸质现金存款凭条面额表：NOTES(面额标签) / RS.(张数) / CTS(金额)。
-
-    与 CDM 版式不同：本版式 NOTES 列是面额标签行（如 "5000 X"、"2000 X"），
-    中间列（RS.）是张数，末列（CTS）是该面额小计金额。
-
-    张数优先从 CTS 金额反推（qty = round(amount / denomination)），因为 CTS 是印刷体、
-    识别率远高于 RS. 列的手写数字；RS. 列仅作回退。金额为 0 的面额行跳过。
-    """
+    """Paper form: NOTES is denomination; RS./CTS are rupees/cents."""
     ordered = _sorted_by_y(lines)
-    headers: dict = {}
-    for ln in ordered:
-        t = ln.text.strip().lower().rstrip(":.")
-        if t in ("notes", "rs.", "rs", "cts", "ct") and t not in headers:
-            headers[t] = (ln, _line_center_x(ln.box), _line_center_y(ln.box))
-    if "notes" not in headers:
-        return []
-    notes_cx = headers["notes"][1]
-    right_cols = sorted(
-        [(cx, name) for name, (_, cx, _) in headers.items() if name != "notes" and cx > notes_cx],
-        key=lambda x: x[0],
-    )
-    if not right_cols:
-        return []
-    qty_cx = right_cols[0][0]
-    amt_cx = right_cols[1][0] if len(right_cols) >= 2 else None
-    b_notes_qty = (notes_cx + qty_cx) / 2
-    b_qty_amt = (qty_cx + amt_cx) / 2 if amt_cx else None
-    header_y = min(v[2] for v in headers.values())
-
-    denom_rows: List[tuple] = []
-    qty_rows: List[tuple] = []
-    amount_rows: List[tuple] = []
-    for ln in ordered:
-        y = _line_center_y(ln.box)
-        if y <= header_y + 2:
-            continue
-        t = ln.text.strip()
-        low = t.lower().rstrip(":.")
-        if low in ("notes", "rs.", "rs", "cts", "ct", "coins", "total") or "deposit amount" in low:
-            continue
-        cx = _line_center_x(ln.box)
-        if cx < b_notes_qty:
-            m = re.match(r"(\d{2,5})", t)
-            if m:
-                denom = int(m.group(1))
-                if denom in _COMMON_DENOMS:
-                    denom_rows.append((y, float(denom)))
-        elif b_qty_amt is None or cx < b_qty_amt:
-            m = re.fullmatch(r"\d{1,3}", t)
-            if m:
-                qty_rows.append((y, int(m.group(0))))
-        else:
-            val = _parse_denomination(t)
-            if val is not None:
-                amount_rows.append((y, val))
-
-    if not denom_rows:
-        return []
-    qty_rows.sort()
-    denom_rows.sort()
-    amount_rows.sort()
-    # 不过滤 total_amount：total_amount 可能识别错误（如把日期数字当成金额），
-    # 这里保留所有金额行，后续按面额匹配。
-
-    # 面额去重
-    seen_denoms = set()
-    unique_denoms = []
-    for y, denom in denom_rows:
-        if denom in seen_denoms:
-            continue
-        seen_denoms.add(denom)
-        unique_denoms.append((y, denom))
-    denom_rows = unique_denoms
-
-    # 按 y 就近匹配面额行与金额行，从金额反推张数
     breakdown: List[DenominationOut] = []
-    used_amount_idxs = set()
-    for i, (dy, denom) in enumerate(denom_rows):
-        # 优先 RS. 列 OCR 张数
-        ocr_qty = qty_rows[i][1] if i < len(qty_rows) else None
-        # 找最近的 CTS 金额行
-        best_amt = None
-        best_dy = None
-        best_j = -1
-        for j, (ay, amt) in enumerate(amount_rows):
-            if j in used_amount_idxs:
-                continue
-            d = abs(ay - dy)
-            if best_dy is None or d < best_dy:
-                best_dy = d
-                best_amt = amt
-                best_j = j
-        # 从金额反推张数
-        derived_qty = None
-        if best_amt is not None and denom > 0:
-            derived_qty = round(best_amt / denom)
-            # 反推结果合理性校验：张数应为非负整数且金额应接近 denom*qty
-            if derived_qty < 0 or abs(best_amt - denom * derived_qty) > 0.5:
-                derived_qty = None
-        qty = derived_qty if derived_qty is not None else (ocr_qty if ocr_qty is not None else 1)
-        amount = denom * qty
-        if best_amt is not None and abs(best_amt - amount) < 0.5:
-            amount = best_amt
-        if best_j >= 0:
-            used_amount_idxs.add(best_j)
-        # 跳过张数为 0 的面额
-        if qty == 0:
+    seen = set()
+    for ln in ordered:
+        match = re.fullmatch(r"\s*(\d{2,5})\s*[xX]\s*", ln.text)
+        if not match:
             continue
+        denom = float(match.group(1))
+        if denom not in _COMMON_DENOMS or denom in seen:
+            continue
+        amount = _credit_slip_row_amount(ordered, ln)
+        if amount is None or amount <= 0:
+            continue
+        qty = round(amount / denom)
+        if qty <= 0 or abs(amount - denom * qty) > 0.02:
+            continue
+        seen.add(denom)
         breakdown.append(DenominationOut(denomination=denom, quantity=qty, amount=amount))
     return breakdown
 
 
-def _find_deposit_total_from_table(lines) -> Optional[float]:
-    """现金存款凭条：从面额表 TOTAL 行取存款总额。
-
-    TOTAL 行通常在面额表底部，其右侧（CTS 列）为总金额。
-    优先取与 TOTAL 同水平带、最靠右的带小数点金额（如 "5,300.00"），
-    避免把日期/参考号中的纯数字误当金额。
-    """
-    ordered = _sorted_by_y(lines)
-    for i, ln in enumerate(ordered):
-        t = ln.text.strip().lower().rstrip(":.")
-        if t != "total":
+def _credit_slip_row_amount(lines, label_line) -> Optional[float]:
+    """Read only overlapping currency cells, never a nearby row or signature."""
+    rs = [ln for ln in lines if ln.text.strip().lower().rstrip(".:") == "rs"]
+    if not rs:
+        return None
+    rs_x = _line_center_x(rs[0].box)
+    cts = [ln for ln in lines if ln.text.strip().lower().rstrip(".:") in ("cts", "ct")]
+    boundary = (rs_x + _line_center_x(cts[0].box)) / 2 if cts else None
+    ly0 = min(p[1] for p in label_line.box)
+    ly1 = max(p[1] for p in label_line.box)
+    cells = []
+    for ln in lines:
+        if ln is label_line:
             continue
-        total_y = _line_center_y(ln.box)
-        # 收集 TOTAL 行右侧、y 接近的候选金额
-        candidates: List[tuple] = []
-        for j, other in enumerate(ordered):
-            if j == i:
-                continue
-            ox = min(p[0] for p in other.box)
-            oy = _line_center_y(other.box)
-            if ox < max(p[0] for p in ln.box) - 10:
-                continue  # 不在 TOTAL 右侧
-            if abs(oy - total_y) > 40:
-                continue  # y 偏差过大
-            # 优先带小数点的金额格式（如 5,300.00）
-            money_match = _MONEY_RE.search(other.text)
-            if money_match:
-                try:
-                    val = float(money_match.group(0).replace(",", ""))
-                    if val > 0:
-                        candidates.append((ox, val))  # 越靠右越优先
-                except ValueError:
-                    pass
-        if candidates:
-            # 取最靠右的（CTS 列是最右列）
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            return candidates[0][1]
-        # 回退：用 _value_to_right / _right_column_value
+        x = min(p[0] for p in ln.box)
+        y0, y1 = min(p[1] for p in ln.box), max(p[1] for p in ln.box)
+        if x < max(p[0] for p in label_line.box) or max(y0, ly0) >= min(y1, ly1):
+            continue
+        # Reject OCR letters, dates and annotation numbers as currency values.
+        text = ln.text.strip()
+        if not re.fullmatch(r"\d[\d ,]*(?:\.\s*\d{2})?", text):
+            continue
+        cells.append((x, _line_center_x(ln.box), text))
+    rupees = sorted(cell for cell in cells if boundary is None or cell[1] < boundary)
+    if not rupees:
+        return None
+    # Separately detected handwritten digits are not reliable enough to join.
+    if len(rupees) != 1:
+        return None
+    text = re.sub(r"\s+", "", rupees[0][2])
+    value = float(text.replace(",", ""))
+    if "." not in text and boundary is not None:
+        cents = [cell for cell in cells if cell[1] >= boundary]
+        if len(cents) == 1 and re.fullmatch(r"\d{1,2}", cents[0][2]):
+            value += int(cents[0][2]) / 100
+        elif cents:
+            return None
+    return value
+
+
+def _find_credit_slip_printed_amount(lines) -> Optional[float]:
+    """Require a formatted amount in the currency-labelled machine print area."""
+    ordered = _sorted_by_y(lines)
+    candidates = []
+    for i, ln in enumerate(ordered):
+        if not re.search(r"\blkr\b", ln.text, re.IGNORECASE):
+            continue
+        texts = [ln.text]
         side = _value_to_right(i, ordered, ln)
         if side:
-            val = _parse_money(side)
-            if val is not None and val > 0:
-                return val
-        side = _right_column_value(i, ordered, ln)
-        if side:
-            val = _parse_money(side)
-            if val is not None and val > 0:
-                return val
+            texts.append(side)
+        for text in texts:
+            normalized = re.sub(r"\s+", "", text)
+            match = re.search(r"(?<![\d.])(\d{1,3}(?:,\d{3})+|\d+)\.\d{2}(?![\d.])", normalized)
+            if match:
+                value = float(match.group(0).replace(",", ""))
+                if value > 0:
+                    candidates.append(value)
+    values = set(candidates)
+    return values.pop() if len(values) == 1 else None
+
+
+def _find_deposit_total_from_table(lines) -> Optional[float]:
+    """Read the handwritten TOTAL currency row without loose right-column fallback."""
+    ordered = _sorted_by_y(lines)
+    for ln in ordered:
+        t = ln.text.strip().lower().rstrip(":.")
+        if t == "total":
+            value = _credit_slip_row_amount(ordered, ln)
+            if value is not None and value > 0:
+                return value
     return None
 
 
@@ -1303,12 +1254,12 @@ def _extract_cash_credit_slip_parties(lines) -> tuple[PartyOut, PartyOut]:
     ordered = _sorted_by_y(lines)
 
     # 收款方姓名：账户持有人字段，回退底部机打户名
-    payee.name = _match_label_value(ordered, _ACCOUNT_HOLDER_NAME_LABELS)
+    payee.name = _credit_slip_name_value(ordered, _ACCOUNT_HOLDER_NAME_LABELS)
     if not payee.name:
         payee.name = _find_bottom_account_holder_name(ordered)
 
     # 付款方姓名：存款人字段
-    payer.name = _match_label_value(ordered, _DEPOSITOR_NAME_LABELS)
+    payer.name = _credit_slip_name_value(ordered, _DEPOSITOR_NAME_LABELS)
 
     # 收款方账号：ACCOUNT NUMBER，带 token 校验，回退底部纯数字账号行
     payee.account = _extract_account(
@@ -1341,6 +1292,47 @@ def _looks_like_account_or_ref(text: str) -> bool:
     return False
 
 
+def _valid_credit_slip_name(text: Optional[str]) -> bool:
+    if not text or _looks_like_account_or_ref(text):
+        return False
+    # Compact OCR-corrupted labels (e.g. "5.REFNUMSER") are not names.
+    compact = re.sub(r"[^a-z]", "", text.lower())
+    if any(word in compact for word in (
+        "refnum", "reference", "name", "address", "adoress", "depositor",
+        "account", "purpose", "source", "funds", "signature", "thank",
+        "bank", "total", "teller", "officer", "customer", "cdbs", "lkr",
+    )):
+        return False
+    words = re.findall(r"[A-Za-z]{2,}", text)
+    return len(words) >= 2 and not re.search(r"\d", text)
+
+
+def _credit_slip_name_value(lines, labels) -> Optional[str]:
+    """Use the form's field boundaries, not the nearest right-column label."""
+    for ln in lines:
+        for label in labels:
+            if label not in ln.text.lower():
+                continue
+            inline = _value_after_label(ln.text, label)
+            if _valid_credit_slip_name(inline):
+                return inline
+            y = _line_center_y(ln.box)
+            height = max(p[1] for p in ln.box) - min(p[1] for p in ln.box)
+            x0, x1 = min(p[0] for p in ln.box), max(p[0] for p in ln.box)
+            below = [
+                other for other in lines
+                if y + 2 < _line_center_y(other.box) <= y + 2.5 * height
+                and x0 - 0.5 * height <= min(p[0] for p in other.box) < x1
+            ]
+            # Never search past the next printed label in the field.
+            for other in _sorted_by_y(below):
+                if _valid_credit_slip_name(other.text):
+                    return _clean(other.text)
+                if re.search(r"[A-Za-z]{3,}", other.text):
+                    break
+    return None
+
+
 def _find_bottom_account_holder_name(lines) -> Optional[str]:
     """现金存款凭条底部机打区：取第一个非标签、非账号的字母行作为户名。
 
@@ -1356,12 +1348,26 @@ def _find_bottom_account_holder_name(lines) -> Optional[str]:
     ys = [_line_center_y(l.box) for l in lines]
     if not ys:
         return None
-    mid = (min(ys) + max(ys)) / 2
+    mid = min(ys) + 0.6 * (max(ys) - min(ys))
+    # A nearby printed account line is stronger evidence than a random alpha line.
+    accounts = [ln for ln in lines if re.fullmatch(r"\d{8,}", ln.text.strip())
+                and _line_center_y(ln.box) >= mid]
+    if not accounts:
+        return None
     for ln in _sorted_by_y(lines):
         if _line_center_y(ln.box) < mid:
             continue
         t = ln.text.strip()
         if not t or len(t) < 3:
+            continue
+        if not _valid_credit_slip_name(t):
+            continue
+        height = max(p[1] for p in ln.box) - min(p[1] for p in ln.box)
+        if not any(
+            0 < _line_center_y(acc.box) - _line_center_y(ln.box) <= 3 * height
+            and abs(min(p[0] for p in acc.box) - min(p[0] for p in ln.box)) <= 2 * height
+            for acc in accounts
+        ):
             continue
         if re.fullmatch(r"[\d\s,\.*/\-:]+", t):
             continue  # 纯数字/符号行（日期、账号、金额）
@@ -1621,6 +1627,13 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         trace_no = references.transaction_id
 
     deposit_breakdown = _find_deposit_breakdown(lines, total_amount=amount) if doc_type == "cash_deposit_slip" else []
+    if _is_cash_credit_slip(lines):
+        if amount is None:
+            warnings.append("未可靠识别存款金额，请检查 OCR 原文")
+        if payee.name is None:
+            warnings.append("未可靠识别账户持有人姓名")
+        if not deposit_breakdown:
+            warnings.append("未可靠识别手写纸币明细，未默认补填张数")
 
     # 金额一致性校验
     if amount is not None and fee is not None and total is not None:

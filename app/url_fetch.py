@@ -41,6 +41,8 @@ def validate_url(url: str, *, allow_private: bool = False) -> str:
 
     Returns the validated URL; raises :class:`UrlFetchError` otherwise.
     """
+    # 去除常见的包裹字符（反引号、引号、尖括号等），避免复制粘贴带来的问题
+    url = url.strip().strip("`'\"<>")
     try:
         parsed = urllib.parse.urlparse(url)
     except ValueError as exc:  # malformed url

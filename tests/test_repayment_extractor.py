@@ -601,6 +601,20 @@ def test_cash_credit_slip_printed_fields_override_form_noise():
     assert r.deposit_breakdown == []
 
 
+def test_cash_credit_slip_ocr_dot_instead_of_comma():
+    """OCR 把千分位逗号识别成点：5.300.00 应解析为 5300。"""
+    lines = [
+        _lr("CASH CREDIT SLIP", 740, 40, 1100, 70),
+        _lr("LKR", 40, 640, 100, 660),
+        _lr("5.300.00", 110, 640, 260, 660),
+        _lr("TOTAL", 740, 600, 820, 630),
+        _lr("CURRENT ACCOUNT - CASH DEPOSIT", 40, 700, 400, 720),
+    ]
+    r = extract(lines)
+    assert r.amount == 5300.0
+    assert r.total_debit == 5300.0
+
+
 def test_hnb_fund_transfer_receipt():
     """HNB 手机 App「Fund Transfer Receipt」：From/To 居中标签、值堆叠在下方，
     收款方「姓名-账号」合并一行，底部 "Receiver reference" 与 "This is an auto generated receipt"。"""

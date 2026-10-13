@@ -971,48 +971,97 @@ def _credit_slip_row_amount(lines, label_line) -> Optional[float]:
         y0, y1 = min(p[1] for p in ln.box), max(p[1] for p in ln.box)
         if x < max(p[0] for p in label_line.box) or max(y0, ly0) >= min(y1, ly1):
             continue
-        # Reject OCR letters, dates and annotation numbers as currency values.
         text = ln.text.strip()
-        if not re.fullmatch(r"\d[\d ,]*(?:\.\s*\d{2})?", text):
-            continue
-        cells.append((x, _line_center_x(ln.box), text))
+        val = _parse_flexible_money(text)
+        if val is not None and val >= 0:
+            cells.append((x, _line_center_x(ln.box), val))
     rupees = sorted(cell for cell in cells if boundary is None or cell[1] < boundary)
     if not rupees:
         return None
-    # Separately detected handwritten digits are not reliable enough to join.
     if len(rupees) != 1:
         return None
-    text = re.sub(r"\s+", "", rupees[0][2])
-    value = float(text.replace(",", ""))
-    if "." not in text and boundary is not None:
+    value = rupees[0][2]
+    if value == 0 and boundary is not None:
         cents = [cell for cell in cells if cell[1] >= boundary]
-        if len(cents) == 1 and re.fullmatch(r"\d{1,2}", cents[0][2]):
-            value += int(cents[0][2]) / 100
+        if len(cents) == 1 and 0 <= cents[0][2] < 100:
+            value += cents[0][2] / 100
         elif cents:
             return None
     return value
 
 
+def _parse_flexible_money(text: str) -> Optional[float]:
+    """解析 OCR 输出的金额，兼容逗号/点混淆（如 5.300.00、5,300.00、5300）。
+
+    OCR 常把千分位逗号识别成点，导致 "5,300.00" 变成 "5.300.00"。
+    规则：
+    - 同时有逗号和点：最后的分隔符是小数点，其余是千分位
+    - 只有多个点：最后一个点是小数点（5.300.00 → 5300.00）
+    - 只有多个逗号：最后一个逗号是小数点（5.300,00 → 5300.00）
+    - 单个逗号无点：千分位（5,300 → 5300）
+    - 单个点且后接 2 位数字：小数点（5300.00）；否则千分位（5.300 → 5300）
+    """
+    m = re.search(r"[\d.,]+", text.replace(" ", ""))
+    if not m:
+        return None
+    s = m.group(0)
+    if not any(c.isdigit() for c in s):
+        return None
+
+    if "," in s and "." in s:
+        last_comma = s.rfind(",")
+        last_dot = s.rfind(".")
+        if last_dot > last_comma:
+            s = s.replace(",", "")
+        else:
+            s = s.replace(".", "").replace(",", ".")
+    elif s.count(".") > 1:
+        parts = s.split(".")
+        s = "".join(parts[:-1]) + "." + parts[-1]
+    elif s.count(",") > 1:
+        parts = s.split(",")
+        s = "".join(parts[:-1]) + "." + parts[-1]
+    elif "," in s and "." not in s:
+        s = s.replace(",", "")
+    elif "." in s and "," not in s:
+        parts = s.split(".")
+        if len(parts) == 2 and len(parts[1]) == 2:
+            pass
+        else:
+            s = s.replace(".", "")
+
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def _find_credit_slip_printed_amount(lines) -> Optional[float]:
-    """Require a formatted amount in the currency-labelled machine print area."""
+    """从机打区 LKR 标签附近取存款金额，兼容 OCR 格式错误。"""
     ordered = _sorted_by_y(lines)
+    lkr_lines = [ln for ln in ordered if re.search(r"\blkr\b", ln.text, re.IGNORECASE)]
+    if not lkr_lines:
+        return None
+
     candidates = []
-    for i, ln in enumerate(ordered):
-        if not re.search(r"\blkr\b", ln.text, re.IGNORECASE):
-            continue
-        texts = [ln.text]
-        side = _value_to_right(i, ordered, ln)
-        if side:
-            texts.append(side)
-        for text in texts:
-            normalized = re.sub(r"\s+", "", text)
-            match = re.search(r"(?<![\d.])(\d{1,3}(?:,\d{3})+|\d+)\.\d{2}(?![\d.])", normalized)
-            if match:
-                value = float(match.group(0).replace(",", ""))
-                if value > 0:
-                    candidates.append(value)
-    values = set(candidates)
-    return values.pop() if len(values) == 1 else None
+    for lkr in lkr_lines:
+        lkr_y = _line_center_y(lkr.box)
+        lkr_x = _line_center_x(lkr.box)
+        for ln in ordered:
+            ly = _line_center_y(ln.box)
+            lx = _line_center_x(ln.box)
+            if abs(ly - lkr_y) > 50:
+                continue
+            if lx < lkr_x - 30 and ln is not lkr:
+                continue
+            val = _parse_flexible_money(ln.text)
+            if val is not None and val > 0:
+                candidates.append((abs(ly - lkr_y), abs(lx - lkr_x), val))
+
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][2]
 
 
 def _find_deposit_total_from_table(lines) -> Optional[float]:

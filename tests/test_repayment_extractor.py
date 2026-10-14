@@ -236,6 +236,25 @@ def test_cdm_deposit_amount_comma_read_as_dot():
     assert r.total_debit == 5000.0
 
 
+def test_app_loan_page_is_rejected():
+    """还款 App 的「发起还款」页面不是银行凭证，应返回 success=false。"""
+    rows = [
+        ("Total amount Due", 200),
+        ("5000", 240),
+        ("Loan amount: 5000", 300),
+        ("Due Date: 2026-06-03", 340),
+        ("Upload repayment screenshot", 420),
+        ("Repayment screenshot", 500),
+        ("Camera", 600),
+        ("Album", 640),
+        ("Cancel", 680),
+    ]
+    r = extract(_make(rows))
+    assert r.doc_type == "unknown"
+    assert r.success is False
+    assert any("不是银行交易凭证" in w for w in r.warnings)
+
+
 def test_amount_mismatch_warns():
     rows = [
         ("Amount (LKR) 6,900.00", 100),

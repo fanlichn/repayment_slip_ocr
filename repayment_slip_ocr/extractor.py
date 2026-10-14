@@ -646,8 +646,24 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
     return amount, fee, total
 
 
+def _is_app_loan_page(full_text: str) -> bool:
+    """检测是否为还款 App 的非凭证页面（如「发起还款」「上传截图」页）。
+
+    这类页面包含 loan amount / due date / upload / repayment screenshot /
+    camera / album / cancel 等 App UI 词，不是银行交易凭证。
+    """
+    t = full_text.lower()
+    app_indicators = ["loan amount", "due date", "upload repayment",
+                      "repayment screenshot", "total amount"]
+    app_picker = ("camera" in t and "album" in t and "cancel" in t)
+    hit = sum(1 for w in app_indicators if w in t)
+    return hit >= 2 or app_picker
+
+
 def _detect_doc_type(full_text: str) -> Optional[str]:
     t = full_text.lower()
+    if _is_app_loan_page(full_text):
+        return "unknown"
     if "deposit" in t or "cardless" in t:
         return "cash_deposit_slip"
     if "e-receipt" in t:
@@ -1781,6 +1797,10 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             payee.name = "Lak Artha (Pvt) Ltd"
 
     success = bool(amount is not None or payee.account is not None or payee.name is not None)
+    # App 还款发起页/上传截图页不是交易凭证，强制 success=false
+    if doc_type == "unknown" and _is_app_loan_page(full_text):
+        success = False
+        warnings.append("上传图片不是银行交易凭证，请上传银行还款截图")
 
     if _is_boc_app(lines):
         field_labels = _BOC_APP_LABELS

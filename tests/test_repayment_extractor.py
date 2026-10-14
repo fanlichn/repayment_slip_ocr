@@ -218,6 +218,24 @@ def test_cdm_deposit_amount_with_space_after_comma():
     assert not any("加总" in w for w in r.warnings)
 
 
+def test_cdm_deposit_amount_comma_read_as_dot():
+    """CDM 无卡存款凭条：OCR 把千分位逗号读成点（'5.000.00'）。"""
+    rows = [
+        ("COMMERCIAL BANK OF CEYLON PLC", 40),
+        ("KATUKURU-CRM1 BR", 80),
+        ("DATE 18/08/26", 120),
+        ("TIME 16:14", 160),
+        ("TRANSACTION CARDLESS DEPOSIT", 280),
+        ("ACCOUNT NUMBER 1001096962", 320),
+        ("CUSTOMER NAME LAK ARTHA SERVICES", 360),
+        ("DEPOSIT AMOUNT LKR 5.000.00", 500),
+        ("TRANSACTION STATUS SUCCESSFUL", 540),
+    ]
+    r = extract(_make(rows))
+    assert r.amount == 5000.0
+    assert r.total_debit == 5000.0
+
+
 def test_amount_mismatch_warns():
     rows = [
         ("Amount (LKR) 6,900.00", 100),

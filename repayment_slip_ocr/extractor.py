@@ -144,8 +144,20 @@ def _parse_money(s: str) -> Optional[float]:
     s = re.sub(r"(?<=\d)[,\s]+(?=\d)", ",", s)
     s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
     m = _MONEY_RE.search(s)
-    if not m:
-        m = re.search(r"\d[\d,]*", s)
+    if m:
+        # 多个点号说明 OCR 把千分位逗号读成了点（如 "5.000.00"），
+        # _MONEY_RE 只匹配到 "5.00"，需用 flexible 解析还原
+        if s.count(".") > 1:
+            return _parse_flexible_money(s)
+        try:
+            return float(m.group(0).replace(",", ""))
+        except ValueError:
+            return None
+    # _MONEY_RE 匹配不到（无小数点、或点号混淆），尝试 flexible 解析
+    val = _parse_flexible_money(s)
+    if val is not None:
+        return val
+    m = re.search(r"\d[\d,]*", s)
     if not m:
         return None
     try:

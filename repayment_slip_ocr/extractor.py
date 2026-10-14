@@ -140,6 +140,9 @@ def _clean(value: str) -> str:
 def _parse_money(s: str) -> Optional[float]:
     if not s:
         return None
+    # OCR 常在千分位逗号后插入空格（如 "5, 000.00"），先去掉数字间空格
+    s = re.sub(r"(?<=\d)[,\s]+(?=\d)", ",", s)
+    s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
     m = _MONEY_RE.search(s)
     if not m:
         m = re.search(r"\d[\d,]*", s)
@@ -623,6 +626,11 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
     # 现金存款：TOTAL 行即存款总额，优先采用（面额表的 TOTAL 比散点金额更可靠）
     if amount is None and total is not None:
         amount = total
+    # 现金存款（CDM）无 TOTAL 行，DEPOSIT AMOUNT 即总额
+    if total is None and amount is not None:
+        low_all = "\n".join(ln.text.lower() for ln in lines)
+        if "deposit" in low_all or "cardless" in low_all:
+            total = amount
     return amount, fee, total
 
 

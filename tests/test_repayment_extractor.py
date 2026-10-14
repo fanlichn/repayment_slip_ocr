@@ -189,6 +189,35 @@ def test_atm_cardless_deposit():
     assert not any("加总" in w for w in r.warnings)
 
 
+def test_cdm_deposit_amount_with_space_after_comma():
+    """CDM 无卡存款凭条：OCR 把 '5,000.00' 读成 '5, 000.00'（逗号后有空格）。"""
+    rows = [
+        ("COMMERCIAL BANK OF CEYLON PLC", 40),
+        ("KATUKURU-CRM1 BR", 80),
+        ("DATE 18/08/26", 120),
+        ("TIME 16:14", 160),
+        ("TERMINAL ID RKATUKU1HT", 200),
+        ("TRACE 8495", 240),
+        ("TRANSACTION CARDLESS DEPOSIT", 280),
+        ("ACCOUNT NUMBER 1001096962", 320),
+        ("CUSTOMER NAME LAK ARTHA SERVICES", 360),
+        ("NOTES VALUE AMOUNT", 400),
+        ("1 LKR 5, 000.00 5, 000.00", 440),
+        ("DEPOSIT AMOUNT LKR 5, 000.00", 500),
+        ("TRANSACTION STATUS SUCCESSFUL", 540),
+    ]
+    r = extract(_make(rows))
+    assert r.bank == "commercial_bank"
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.amount == 5000.0
+    assert r.total_debit == 5000.0
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.datetime == "2026-08-18T16:14:00"
+    # 明细加总 == 总额，无警告
+    assert not any("加总" in w for w in r.warnings)
+
+
 def test_amount_mismatch_warns():
     rows = [
         ("Amount (LKR) 6,900.00", 100),

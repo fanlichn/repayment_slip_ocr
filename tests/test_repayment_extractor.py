@@ -318,6 +318,45 @@ def test_cdm_real_ocr_noise():
     assert not any("加总" in w for w in r.warnings)
 
 
+def test_cdm_transaction_type_not_amount_label():
+    """CDM 凭条：'CARDLESS DEPOSIT' 是交易类型不是金额标签，其右下方的收据外噪点
+    数字（如 '13'）不应被当作金额。"""
+    from app.ocr_engine import OcrLine
+
+    def _at(text: str, x: float, y: float, h: float = 60.0) -> OcrLine:
+        w = len(text) * 22
+        return OcrLine(text=text, confidence=0.95, box=[
+            [x, y - h / 2], [x + w, y - h / 2], [x + w, y + h / 2], [x, y + h / 2],
+        ])
+
+    lines = [
+        _at("COMMERCIAL BANK OF CEYLON PLC", 450, 630),
+        _at("WARAKAPO-CRM1 BR", 850, 750),
+        _at("DATE", 786, 931),
+        _at("26/09/26", 786, 993),
+        _at("TIME", 1168, 928),
+        _at("11:31", 1161, 988),
+        _at("TERMINAL ID", 1512, 926),
+        _at("RWARAKAIHT", 1512, 988),
+        _at("TRACE", 786, 1115),
+        _at("3785", 1162, 1111),
+        _at("TRANSACTION", 789, 1299),
+        _at("CARDLESS DEPOSIT", 1289, 1292),
+        _at("13", 2289, 1429),  # 收据外的噪点数字
+        _at("ACCOUNT NUMBER:1001096962", 783, 1418),
+        _at("CUSTOMER NAME :LAK ARTHA SERVICES", 780, 1542),
+        _at("DEPOSIT AMOUNT", 767, 2569),
+        _at("LKR", 1388, 2566),
+        _at("5.100.00", 1719, 2561),
+        _at("TRANSACTION STATUS :SUCCESSFUL", 872, 2700),
+    ]
+    r = extract(lines)
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.amount == 5100.0
+    assert r.total_debit == 5100.0
+    assert not any("加总" in w for w in r.warnings)
+
+
 def test_parse_denomination_rejects_ocr_noise():
     """面额解析：含字母的 OCR 损坏行应返回 None，避免误解析。"""
     from repayment_slip_ocr.extractor import _parse_denomination

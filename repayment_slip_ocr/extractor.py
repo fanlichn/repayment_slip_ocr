@@ -312,6 +312,15 @@ _FIELD_WORDS = {
 }
 
 
+def _is_transaction_type(low: str) -> bool:
+    """判断是否为交易类型描述（如 'cardless deposit'、'cash withdrawal'）。
+
+    这类行不是金额标签，其右侧/下方的值不属于金额，提取主金额时需跳过，
+    避免把交易类型后面的无关文本（甚至收据外的噪点）误解析为金额。
+    """
+    return any(k in low for k in ("cardless", "withdrawal", "transfer", "cheque", "cash "))
+
+
 def _looks_like_label_text(value: str) -> bool:
     """某些标签后紧跟的其实是另一个标签（如账户行 "Account No 138200..." 里
     "account" 匹配后得到 "no 138200..."）。此处用于剔除明显是标签残留的取值。"""
@@ -624,13 +633,21 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
             if amount is not None and amount < 100 and amount == int(amount):
                 amount = None
             if amount is None:
+                # 交易类型描述行（如 "CARDLESS DEPOSIT"）不是金额标签，
+                # 其右侧/下方的值不属于金额，跳过避免误取（如把收据外的 "13" 当金额）
+                if "amount" not in low and _is_transaction_type(low):
+                    continue
                 side = _value_to_right(i, ordered, ln)
                 if side and not _is_denomination_label_line(side):
                     amount = _parse_money(side)
+                    if amount is not None and amount < 100 and amount == int(amount):
+                        amount = None
             if amount is None:
                 side = _right_column_value(i, ordered, ln)
                 if side and not _is_denomination_label_line(side):
                     amount = _parse_money(side)
+                    if amount is not None and amount < 100 and amount == int(amount):
+                        amount = None
             if amount is None and "deposit amount" in low:
                 amount = _money_near_label_right(ordered, ln)
             if amount is not None:

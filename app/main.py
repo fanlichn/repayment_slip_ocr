@@ -12,10 +12,13 @@ from pydantic import BaseModel
 
 from .config import get_settings
 from .extractor import extract
+from .logging_setup import setup_logging
 from .ocr_engine import create_engine, create_name_engine
 from .preprocessing import build_variants, load_image
 from .schemas import ExtractedResult
 from .url_fetch import UrlFetchError, fetch_image_bytes
+
+setup_logging("nic_ocr")
 
 _engine = None
 _name_engine = None  # 多语言姓名第二引擎（僧伽罗语/泰米尔语），可为 None

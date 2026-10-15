@@ -15,12 +15,15 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from app.config import get_settings
+from app.logging_setup import setup_logging
 from app.ocr_engine import create_engine
 from app.preprocessing import build_variants, load_image
 from app.url_fetch import UrlFetchError, fetch_image_bytes
 
 from .extractor import dedup_lines, extract
 from .schemas import RepaymentResult
+
+setup_logging("repayment_ocr")
 
 _engine = None
 

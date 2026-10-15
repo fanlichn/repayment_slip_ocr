@@ -414,6 +414,76 @@ def test_cdm_denom_ocr_letter_misread_and_total_noise():
     assert not any("加总" in w for w in r.warnings)
 
 
+def test_cdm_quantity_ocr_duplicate_variant():
+    """CDM 凭条：同一数量被 OCR 识别成多个变体（"8" 和 "18"），
+    应按 y 去重保留置信度最高的，避免与面额行按索引配对时错位。
+
+    真实面额：100 x 8 + 500 x 1 + 1000 x 3 + 5000 x 1 = 9300
+    OCR 损坏：数量 "8" 被同时识别为 "8"（conf 0.984）和 "18"（conf 0.574）。
+    """
+    from app.ocr_engine import OcrLine
+
+    def _at(text: str, x: float, y: float, h: float = 32.0, conf: float = 0.95) -> OcrLine:
+        w = len(text) * 16
+        return OcrLine(text=text, confidence=conf, box=[
+            [x, y - h / 2], [x + w, y - h / 2], [x + w, y + h / 2], [x, y + h / 2],
+        ])
+
+    lines = [
+        _at("COMMERCIAL BANK OF CEYLON PLC", 329, 412),
+        _at("RATNAPUR-CRM1 BR", 440, 476),
+        _at("DATE", 278, 574),
+        _at("30/06/26", 276, 606),
+        _at("TIME", 474, 571),
+        _at("17:30", 476, 603),
+        _at("TERMINAL ID", 652, 566),
+        _at("RRATNARIHT", 649, 600),
+        _at("TRACE", 281, 670),
+        _at("5581", 474, 667),
+        _at("TRANSACTION", 283, 764),
+        _at("CARDLESS DEPOSIT", 540, 761),
+        _at("ACCOUNT NUMBER", 283, 827),
+        _at("1001096962", 537, 824),
+        _at("CUSTOMER NAME LAK ARTHA SERVICES", 281, 888),
+        _at("NARRATION:NIMESH 811002542V", 281, 984),
+        _at("MOBILE NO", 281, 1080),
+        _at("SOURCE OF FUNDS:UNKNOWN", 285, 1144),
+        _at("NOTES", 281, 1239),
+        _at("VALUE", 424, 1240),
+        _at("AMOUNT", 784, 1241),
+        # 数量列："8" 被 OCR 识别成两个变体
+        _at("8", 360, 1302, conf=0.984),
+        _at("18", 358, 1302, conf=0.574),
+        _at("1", 358, 1335),
+        _at("3", 360, 1365),
+        # 面额列
+        _at("100.00", 527, 1303),
+        _at("500.00", 522, 1335),
+        _at("LKR 1.000.00", 423, 1366),
+        _at("LKR5.000.00", 423, 1398),
+        # 金额列
+        _at("800.00", 784, 1304),
+        _at("500.00", 786, 1337),
+        _at("3.000.00", 752, 1368),
+        _at("5.000.00", 750, 1400),
+        _at("DEPOSIT AMOUNT", 283, 1457),
+        _at("LKR", 583, 1461),
+        _at("9.300.00", 750, 1463),
+        _at("TRANSACTION STATUS", 333, 1520),
+        _at("SUCCESSFUL", 664, 1524),
+    ]
+    r = extract(lines)
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.amount == 9300.0
+    assert r.total_debit == 9300.0
+    denoms = {(d.denomination, d.quantity) for d in r.deposit_breakdown}
+    assert (100.0, 8) in denoms
+    assert (500.0, 1) in denoms
+    assert (1000.0, 3) in denoms
+    assert (5000.0, 1) in denoms
+    assert not any("加总" in w for w in r.warnings)
+
+
 def test_parse_denomination_rejects_ocr_noise():
     """面额解析：含字母的 OCR 损坏行应返回 None，避免误解析。"""
     from repayment_slip_ocr.extractor import _parse_denomination

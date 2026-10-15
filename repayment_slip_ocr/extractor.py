@@ -1015,7 +1015,7 @@ def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[Denomi
         if cx < b1:
             m = re.fullmatch(r"\d{1,3}", text)
             if m:
-                qty_rows.append((y, int(m.group(0))))
+                qty_rows.append((y, int(m.group(0)), ln.confidence))
         elif cx < b2:
             val = _parse_denomination(text)
             if val is not None and val in _COMMON_DENOMS:
@@ -1028,6 +1028,16 @@ def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[Denomi
     if not denom_rows:
         return []
     qty_rows.sort()
+    # 数量去重：OCR 常把同一数量识别成多个变体（如 "8" / "18"），
+    # 同一 y 行只保留置信度最高的一个，避免与面额行按索引配对时错位
+    unique_qty: List[tuple] = []
+    for y, qty, conf in qty_rows:
+        if unique_qty and abs(y - unique_qty[-1][0]) < 15:
+            if conf > unique_qty[-1][2]:
+                unique_qty[-1] = (y, qty, conf)
+        else:
+            unique_qty.append((y, qty, conf))
+    qty_rows = [(y, qty) for y, qty, _ in unique_qty]
     denom_rows.sort()
     amount_rows.sort()
     if total_amount is not None:

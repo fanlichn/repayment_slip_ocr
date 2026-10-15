@@ -277,6 +277,57 @@ def test_cdm_amount_with_notes_header():
     assert not any("加总" in w for w in r.warnings)
 
 
+def test_cdm_real_ocr_noise():
+    """CDM 凭条实际 OCR 噪声：损坏标签/日期行不影响金额和时间提取。"""
+    rows = [
+        ("COMMERCIAL BANK OF CEYLON PLC", 590),
+        ("NARAHENP-CRM1 BR", 670),
+        ("DATE", 785),
+        ("2509/26", 815),
+        ("25/09/26", 815),
+        ("TIME", 770),
+        ("16:22", 805),
+        ("TERMINAL ID", 755),
+        ("RNARAHN1HT", 790),
+        ("TRACE", 880),
+        ("9122", 870),
+        ("TRANSACTION CARDLESS DEPOSIT", 960),
+        ("ACCOUNT NUMBER 1001096962", 1030),
+        ("CUSTOMER NAME LAK ARTHA SERVICES", 1090),
+        ("NARRATION TRECORY", 1200),
+        ("MOBILE NO.", 1300),
+        ("SOURCE OF FUNDS UNKNOWN", 1370),
+        ("NOTES", 1475),
+        ("VALUE", 1475),
+        ("AMOUNT", 1465),
+        ("LKR 5.000.00", 1540),
+        ("5.000.00", 1535),
+        ("DEPOSIT AMOUNT", 1620),
+        ("5.000.00", 1610),
+        ("JF11jS11 AMOUNT", 1615),  # OCR 损坏标签行，应产生 11.0 噪声
+        ("TRANSACTION STATUS SUCCESSFUL", 1685),
+    ]
+    r = extract(_make(rows))
+    assert r.bank == "commercial_bank"
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.amount == 5000.0
+    assert r.total_debit == 5000.0
+    assert r.datetime == "2026-09-25T16:22:00"
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert not any("加总" in w for w in r.warnings)
+
+
+def test_parse_denomination_rejects_ocr_noise():
+    """面额解析：含字母的 OCR 损坏行应返回 None，避免误解析。"""
+    from repayment_slip_ocr.extractor import _parse_denomination
+    assert _parse_denomination("LKR 5.000.00") == 5000.0
+    assert _parse_denomination("LKR5.000.00") == 5000.0
+    assert _parse_denomination("LKR 5 0OU OO") is None  # OCR 把 000 读成 0OU
+    assert _parse_denomination("5 000 0U") is None
+    assert _parse_denomination("LKR 1,000.00") == 1000.0
+
+
 def test_app_loan_page_is_rejected():
     """还款 App 的「发起还款」页面不是银行凭证，应返回 success=false。"""
     rows = [

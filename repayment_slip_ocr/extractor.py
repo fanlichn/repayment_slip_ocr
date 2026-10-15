@@ -616,6 +616,10 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
             if _looks_like_label_text(ln.text):
                 continue
             amount = _parse_money_skip_denom(ln.text)
+            # OCR 常把标签读坏产生小整数噪声（如 "JF11jS11 AMOUNT" → 11），
+            # 含 amount/deposit 的行解析出 < 100 的纯整数通常是噪声，跳过
+            if amount is not None and amount < 100 and amount == int(amount):
+                amount = None
             if amount is None:
                 side = _value_to_right(i, ordered, ln)
                 if side and not _is_denomination_label_line(side):
@@ -810,6 +814,14 @@ def _find_datetime(lines) -> Optional[str]:
         combined = _parse_datetime(f"{d} {t}" if t else d)
         if combined:
             return combined
+        # d 可能是 OCR 损坏值（如 "2509/26"），尝试从全卡找有效日期与 t 组合
+        if t:
+            for ln in lines:
+                dm = re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", ln.text)
+                if dm:
+                    combined = _parse_datetime(f"{dm.group(0)} {t}")
+                    if combined:
+                        return combined
 
     # 兜底：纯日期
     for ln in lines:
@@ -911,8 +923,15 @@ def _parse_denomination(s: str) -> Optional[float]:
     收据面额恒为整数元（100/1000/5000 等），末尾两位 ".00" 为分。把数字按分隔符
     切成分组、末组 "00" 视为分，其余拼接成整数，从而正确还原
     "LKR 5, 000. 00" / "LKR5.000.00" -> 5000、"LKR 1,000.00" -> 1000。
+
+    OCR 严重损坏的行（如 "LKR 5 0OU OO"，含字母 OU）会误解析为 50，
+    因此去掉币种词后仍含字母的行直接返回 None。
     """
     s = re.sub(r"(?i)lkr", "", s).strip()
+    s = re.sub(r"(?i)\brs\.?", "", s).strip()
+    # 去掉币种词后仍含字母，说明 OCR 把数字读成了字母，不可靠
+    if re.search(r"[a-zA-Z]", s):
+        return None
     groups = re.findall(r"\d+", s)
     if not groups:
         return None

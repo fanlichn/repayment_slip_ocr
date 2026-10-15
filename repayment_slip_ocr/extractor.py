@@ -603,9 +603,22 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
     total = None
     amount = None
     ordered0 = _sorted_by_y(lines)
+    # 先扫 "amount charged"（PayMaster 扣款总额），优先级高于 subtotal/total
     for i, ln in enumerate(ordered0):
         low = ln.text.lower()
-        if fee is None and ("fee" in low or "charge" in low):
+        if "amount charged" in low:
+            total = _parse_money(ln.text)
+            if total is None:
+                side = _value_to_right(i, ordered0, ln)
+                if not side:
+                    side = _right_column_value(i, ordered0, ln)
+                if side:
+                    total = _parse_money(side)
+    for i, ln in enumerate(ordered0):
+        low = ln.text.lower()
+        # "amount charged" 是扣款总额（如 PayMaster），不是手续费；subtotal 不是总额
+        is_amount_charged = "amount charged" in low
+        if fee is None and ("fee" in low or "charges" in low) and not is_amount_charged:
             fee = _parse_money(ln.text)
             if fee is None:
                 side = _value_to_right(i, ordered0, ln)
@@ -613,7 +626,7 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
                     side = _right_column_value(i, ordered0, ln)
                 if side:
                     fee = _parse_money(side)
-        if total is None and "total" in low:
+        if total is None and "total" in low and "subtotal" not in low:
             total = _parse_money(ln.text)
             if total is None:
                 side = _value_to_right(i, ordered0, ln)
@@ -625,9 +638,11 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
     ordered = _sorted_by_y(lines)
     for i, ln in enumerate(ordered):
         low = ln.text.lower()
-        if "total" in low or "fee" in low or "charge" in low:
+        # "subtotal" 是本金（如 PayMaster），不是 total，不跳过
+        is_subtotal = "subtotal" in low
+        if ("total" in low and not is_subtotal) or "fee" in low or "charge" in low:
             continue
-        if "amount" in low or "deposit" in low:
+        if "amount" in low or "deposit" in low or is_subtotal:
             # 跳过纯表头行（如 "NOTES VALUE AMOUNT"），避免误取右侧/下方的错误值
             if _looks_like_label_text(ln.text):
                 continue
@@ -669,8 +684,10 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
     # 现金存款：TOTAL 行即存款总额，优先采用（面额表的 TOTAL 比散点金额更可靠）
     if amount is None and total is not None:
         amount = total
-    # 现金存款（CDM）无 TOTAL 行，DEPOSIT AMOUNT 即总额
-    if total is None and amount is not None:
+    # 现金存款（CDM）无 TOTAL 行，DEPOSIT AMOUNT 即总额。
+    # 注意：若已识别到 fee（转账收据），不应把 total 设为 amount，
+    # 否则 amount+fee != total 会产生误报。
+    if total is None and amount is not None and fee is None:
         low_all = "\n".join(ln.text.lower() for ln in lines)
         if "deposit" in low_all or "cardless" in low_all:
             total = amount
@@ -1178,12 +1195,21 @@ def _parse_flexible_money(text: str) -> Optional[float]:
     return best_val
 
 
+_LKR_FLEX_RE = re.compile(
+    r"\blkr\b|l\.k\.r|1\.kr|lkr(?=\d)|\bkr\b",
+    re.IGNORECASE,
+)
+
+
 def _find_credit_slip_printed_amount(lines) -> Optional[float]:
-    """从机打区 LKR 标签附近取存款金额，兼容 OCR 格式错误。"""
+    """从机打区 LKR 标签附近取存款金额，兼容 OCR 格式错误。
+
+    OCR 常把 "LKR" 读成 "1.KR" / "L KR" / "L.K.R" 或与金额粘连成
+    "LKR35,800.00"，因此用宽松正则匹配 LKR 变体。
+    若完全未识别到 LKR，则回退到底部区域扫描最大金额。
+    """
     ordered = _sorted_by_y(lines)
-    lkr_lines = [ln for ln in ordered if re.search(r"\blkr\b", ln.text, re.IGNORECASE)]
-    if not lkr_lines:
-        return None
+    lkr_lines = [ln for ln in ordered if _LKR_FLEX_RE.search(ln.text)]
 
     candidates = []
     for lkr in lkr_lines:
@@ -1192,18 +1218,38 @@ def _find_credit_slip_printed_amount(lines) -> Optional[float]:
         for ln in ordered:
             ly = _line_center_y(ln.box)
             lx = _line_center_x(ln.box)
-            if abs(ly - lkr_y) > 50:
+            if abs(ly - lkr_y) > 80:
                 continue
-            if lx < lkr_x - 30 and ln is not lkr:
+            if lx < lkr_x - 50 and ln is not lkr:
+                continue
+            if _is_denomination_label_line(ln.text):
                 continue
             val = _parse_flexible_money(ln.text)
-            if val is not None and val > 0:
+            # 拒绝 < 100 的噪声（如 "LKR 5" 截断、数量词等）
+            if val is not None and val >= 100:
                 candidates.append((abs(ly - lkr_y), abs(lx - lkr_x), val))
 
-    if not candidates:
-        return None
-    candidates.sort()
-    return candidates[0][2]
+    if candidates:
+        candidates.sort()
+        return candidates[0][2]
+
+    # Fallback: LKR 完全未识别，扫描底部区域找最大金额
+    if not lkr_lines:
+        all_vals = []
+        for ln in ordered:
+            if _is_denomination_label_line(ln.text):
+                continue
+            val = _parse_flexible_money(ln.text)
+            # 排除账号/手机号等大整数（>1000万）和 <100 的噪声
+            if val is not None and 100 <= val <= 10_000_000:
+                all_vals.append((val, _line_center_y(ln.box)))
+        if all_vals:
+            # 优先取底部（y 较大）的金额，取底部前 5 个中的最大值
+            all_vals.sort(key=lambda x: -x[1])
+            bottom = all_vals[:5]
+            return max(v[0] for v in bottom)
+
+    return None
 
 
 def _find_deposit_total_from_table(lines) -> Optional[float]:

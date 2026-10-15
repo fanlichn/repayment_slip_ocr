@@ -236,6 +236,47 @@ def test_cdm_deposit_amount_comma_read_as_dot():
     assert r.total_debit == 5000.0
 
 
+def test_cdm_datetime_split_lines():
+    """CDM 凭条：OCR 把 DATE/TIME 标签和值拆成独立行，时间仍应被提取。"""
+    rows = [
+        ("COMMERCIAL BANK OF CEYLON PLC", 40),
+        ("NARAHENP-CRM1 BR", 80),
+        ("DATE", 120),
+        ("25/09/26", 125),
+        ("TIME", 120),
+        ("16:22", 125),
+        ("TERMINAL ID", 120),
+        ("RNARAHN1HT", 125),
+        ("TRANSACTION CARDLESS DEPOSIT", 280),
+        ("ACCOUNT NUMBER 1001096962", 320),
+        ("CUSTOMER NAME LAK ARTHA SERVICES", 360),
+        ("DEPOSIT AMOUNT LKR 5,000.00", 500),
+        ("TRANSACTION STATUS SUCCESSFUL", 540),
+    ]
+    r = extract(_make(rows))
+    assert r.datetime == "2026-09-25T16:22:00"
+    assert r.amount == 5000.0
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+
+
+def test_cdm_amount_with_notes_header():
+    """CDM 凭条：含 NOTES VALUE AMOUNT 表头行，不应取错金额。"""
+    rows = [
+        ("COMMERCIAL BANK OF CEYLON PLC", 40),
+        ("TRANSACTION CARDLESS DEPOSIT", 280),
+        ("ACCOUNT NUMBER 1001096962", 320),
+        ("CUSTOMER NAME LAK ARTHA SERVICES", 360),
+        ("NOTES VALUE AMOUNT", 400),
+        ("1 LKR 5.000.00 5.000.00", 440),
+        ("DEPOSIT AMOUNT LKR 5.000.00", 500),
+        ("TRANSACTION STATUS SUCCESSFUL", 540),
+    ]
+    r = extract(_make(rows))
+    assert r.amount == 5000.0
+    assert r.total_debit == 5000.0
+    assert not any("加总" in w for w in r.warnings)
+
+
 def test_app_loan_page_is_rejected():
     """还款 App 的「发起还款」页面不是银行凭证，应返回 success=false。"""
     rows = [

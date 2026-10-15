@@ -612,6 +612,9 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
         if "total" in low or "fee" in low or "charge" in low:
             continue
         if "amount" in low or "deposit" in low:
+            # 跳过纯表头行（如 "NOTES VALUE AMOUNT"），避免误取右侧/下方的错误值
+            if _looks_like_label_text(ln.text):
+                continue
             amount = _parse_money_skip_denom(ln.text)
             if amount is None:
                 side = _value_to_right(i, ordered, ln)
@@ -793,6 +796,16 @@ def _find_datetime(lines) -> Optional[str]:
     # 日期与时间分行（如纸质凭条 DATE 07/10/26 / TIME 18:12）
     d = _match_label_value(lines, _DATE_LABELS)
     t = _match_label_value(lines, _TIME_LABELS)
+    # 校验时间值必须是 HH:MM 格式，否则可能误取了日期/其他值
+    if t and not re.match(r"^\s*([01]?\d|2[0-3]):[0-5]\d\s*$", t):
+        t = None
+    # 兜底：OCR 把 TIME 标签和值拆成两行，扫描全卡找 HH:MM 时间
+    if not t:
+        for ln in lines:
+            tm = re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", ln.text)
+            if tm and not re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", ln.text):
+                t = tm.group(0)
+                break
     if d:
         combined = _parse_datetime(f"{d} {t}" if t else d)
         if combined:
@@ -1057,39 +1070,46 @@ def _parse_flexible_money(text: str) -> Optional[float]:
     - 单个逗号无点：千分位（5,300 → 5300）
     - 单个点且后接 2 位数字：小数点（5300.00）；否则千分位（5.300 → 5300）
     """
-    m = re.search(r"[\d.,]+", text.replace(" ", ""))
-    if not m:
+    candidates = re.findall(r"[\d.,]+", text.replace(" ", ""))
+    if not candidates:
         return None
-    s = m.group(0)
-    if not any(c.isdigit() for c in s):
-        return None
-
-    if "," in s and "." in s:
-        last_comma = s.rfind(",")
-        last_dot = s.rfind(".")
-        if last_dot > last_comma:
+    best_val = None
+    best_score = -1
+    for s in candidates:
+        if not any(c.isdigit() for c in s):
+            continue
+        original = s
+        if "," in s and "." in s:
+            last_comma = s.rfind(",")
+            last_dot = s.rfind(".")
+            if last_dot > last_comma:
+                s = s.replace(",", "")
+            else:
+                s = s.replace(".", "").replace(",", ".")
+        elif s.count(".") > 1:
+            parts = s.split(".")
+            s = "".join(parts[:-1]) + "." + parts[-1]
+        elif s.count(",") > 1:
+            parts = s.split(",")
+            s = "".join(parts[:-1]) + "." + parts[-1]
+        elif "," in s and "." not in s:
             s = s.replace(",", "")
-        else:
-            s = s.replace(".", "").replace(",", ".")
-    elif s.count(".") > 1:
-        parts = s.split(".")
-        s = "".join(parts[:-1]) + "." + parts[-1]
-    elif s.count(",") > 1:
-        parts = s.split(",")
-        s = "".join(parts[:-1]) + "." + parts[-1]
-    elif "," in s and "." not in s:
-        s = s.replace(",", "")
-    elif "." in s and "," not in s:
-        parts = s.split(".")
-        if len(parts) == 2 and len(parts[1]) == 2:
-            pass
-        else:
-            s = s.replace(".", "")
-
-    try:
-        return float(s)
-    except ValueError:
-        return None
+        elif "." in s and "," not in s:
+            parts = s.split(".")
+            if len(parts) == 2 and len(parts[1]) == 2:
+                pass
+            else:
+                s = s.replace(".", "")
+        try:
+            val = float(s)
+        except ValueError:
+            continue
+        # 优先选位数最多（最像金额）的候选，避免取到 "1" 这类数量词
+        score = len(original.replace(",", "").replace(".", ""))
+        if score > best_score:
+            best_score = score
+            best_val = val
+    return best_val
 
 
 def _find_credit_slip_printed_amount(lines) -> Optional[float]:

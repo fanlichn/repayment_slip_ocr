@@ -262,6 +262,10 @@ def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optiona
         val = _parse_money(other.text)
         if val is None:
             continue
+        # 存款金额通常 ≥ 100，< 100 的纯整数多半是 OCR 噪声
+        # （如 "000008" 由 "8,000.00" 读坏而来），跳过
+        if val < 100 and val == int(val):
+            continue
         if best is None or dy < best[0]:
             best = (dy, val)
     return best[1] if best else None
@@ -946,12 +950,18 @@ def _parse_denomination(s: str) -> Optional[float]:
 
     OCR 严重损坏的行（如 "LKR 5 0OU OO"，含字母 OU）会误解析为 50，
     因此去掉币种词后仍含字母的行直接返回 None。
+    但部分字母是数字的常见 OCR 误读（Q/O→0、I/l→1、Z→2、S→5、B→8），
+    先还原再判断。
     """
     s = re.sub(r"(?i)lkr", "", s).strip()
     s = re.sub(r"(?i)\brs\.?", "", s).strip()
-    # 去掉币种词后仍含字母，说明 OCR 把数字读成了字母，不可靠
-    if re.search(r"[a-zA-Z]", s):
+    # OCR 常见数字→字母误读还原（仅在还原后无字母时才使用）
+    restored = s.translate(str.maketrans({"Q": "0", "q": "0", "O": "0", "o": "0",
+                                          "I": "1", "l": "1", "Z": "2", "z": "2",
+                                          "S": "5", "s": "5", "B": "8", "b": "8"}))
+    if re.search(r"[a-zA-Z]", restored):
         return None
+    s = restored
     groups = re.findall(r"\d+", s)
     if not groups:
         return None
@@ -961,7 +971,14 @@ def _parse_denomination(s: str) -> Optional[float]:
         integer = "".join(groups)
     if not integer:
         return None
-    return float(int(integer))
+    val = float(int(integer))
+    # OCR 可能丢了小数点导致面额放大 10/100/1000 倍（如 "5.00000" → 500000），
+    # 尝试缩小到常见面额
+    if val not in _COMMON_DENOMS:
+        for div in (10, 100, 1000):
+            if val / div in _COMMON_DENOMS:
+                return val / div
+    return val
 
 
 def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[DenominationOut]:
@@ -1845,9 +1862,15 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     if deposit_breakdown:
         breakdown_sum = sum(d.amount for d in deposit_breakdown)
         if amount is not None and abs(breakdown_sum - amount) > 0.05:
-            warnings.append(
-                f"纸币明细加总({breakdown_sum}) != 存款总额({amount})"
-            )
+            # 面额表是逐行扫描的，比总额行的 OCR 更可靠（总额常被读成
+            # "000008" 之类的损坏串），不一致时优先采用明细加总
+            amount = breakdown_sum
+            if total is not None:
+                total = breakdown_sum
+        elif amount is None:
+            amount = breakdown_sum
+            if total is None:
+                total = breakdown_sum
 
     # 收款方归一化：还款场景常见 Lak Artha 系列写法
     if payee.name:

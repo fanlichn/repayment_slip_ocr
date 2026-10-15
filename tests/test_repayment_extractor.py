@@ -357,6 +357,63 @@ def test_cdm_transaction_type_not_amount_label():
     assert not any("加总" in w for w in r.warnings)
 
 
+def test_cdm_denom_ocr_letter_misread_and_total_noise():
+    """CDM 凭条：面额行字母误读（1.000.0Q）+ 总额读成前导零串（000008）。
+
+    真实面额：1000 x 3 + 5000 x 1 = 8000
+    OCR 损坏：LKR1.000.0Q（Q 是 0 的误读）、LKR 5.00000（丢了小数点）、
+    总额 8,000.00 读成 000008。
+    """
+    from app.ocr_engine import OcrLine
+
+    def _at(text: str, x: float, y: float, h: float = 60.0) -> OcrLine:
+        w = len(text) * 22
+        return OcrLine(text=text, confidence=0.95, box=[
+            [x, y - h / 2], [x + w, y - h / 2], [x + w, y + h / 2], [x, y + h / 2],
+        ])
+
+    lines = [
+        _at("COMMERCIAL BANK OF CEYLON PLC", 249, 786),
+        _at("MAHARAGA-CRMI BR", 416, 880),
+        _at("DATE", 162, 1011),
+        _at("07/10/26", 160, 1061),
+        _at("TIME", 462, 1021),
+        _at("17:01", 461, 1069),
+        _at("TERMINAL ID", 734, 1030),
+        _at("RMAHARATHT", 728, 1080),
+        _at("TRACE", 162, 1156),
+        _at("2519", 453, 1165),
+        _at("TRANSACTION", 163, 1292),
+        _at("CARDLESS DEPOSIT", 546, 1306),
+        _at("ACCOUNT NUMBER1001096962", 157, 1390),
+        _at("CUSTOMER NAMELAK ARTHA SERVICES", 151, 1486),
+        _at("NARRATION:UDAYANGA", 145, 1623),
+        _at("MOBILE NO", 137, 1764),
+        _at("SOURCE OF FUNDSUNKNOWN", 136, 1860),
+        _at("NOTES", 130, 1997),
+        _at("VALUE", 352, 2000),
+        _at("AMOUNT", 877, 1995),
+        _at("3", 254, 2088),
+        _at("LKR1.000.0Q", 352, 2089),
+        _at("3.000.00", 825, 2079),
+        _at("LKR 5.00000", 346, 2135),
+        _at("5.000.00", 816, 2122),
+        _at("DEPOSIT AMOUNT", 128, 2217),
+        _at("LKR", 583, 2215),
+        _at("000008", 809, 2195),
+        _at("TRANSACTION STATUS", 210, 2298),
+        _at("SUCCESSFUL", 692, 2279),
+    ]
+    r = extract(lines)
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.amount == 8000.0
+    assert r.total_debit == 8000.0
+    denoms = {(d.denomination, d.quantity) for d in r.deposit_breakdown}
+    assert (1000.0, 3) in denoms
+    assert (5000.0, 1) in denoms
+    assert not any("加总" in w for w in r.warnings)
+
+
 def test_parse_denomination_rejects_ocr_noise():
     """面额解析：含字母的 OCR 损坏行应返回 None，避免误解析。"""
     from repayment_slip_ocr.extractor import _parse_denomination

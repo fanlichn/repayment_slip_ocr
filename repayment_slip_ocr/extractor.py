@@ -140,6 +140,9 @@ def _clean(value: str) -> str:
 def _parse_money(s: str) -> Optional[float]:
     if not s:
         return None
+    # OCR 把币种词 LKR 读成 "1.KR"、"1KR" 等：短数字+点/无点+字母，不是金额
+    if re.match(r"^\s*\d{1,2}\.?[A-Za-z]{1,3}\s*$", s):
+        return None
     # OCR 常在千分位逗号后插入空格（如 "5, 000.00"），先去掉数字间空格
     s = re.sub(r"(?<=\d)[,\s]+(?=\d)", ",", s)
     s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)

@@ -9,7 +9,7 @@ import base64
 import binascii
 import time
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Any, Dict
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -52,7 +52,7 @@ class UrlRequest(BaseModel):
     image_url: str
 
 
-def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, str]:
+def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     settings = get_settings()
     if len(buf) > settings.max_upload_bytes:
         raise HTTPException(status_code=413, detail="文件过大")
@@ -66,7 +66,9 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, str]:
 
     result = extract(unique, include_lines=include_lines)
     result.elapsed_ms = (time.perf_counter() - t0) * 1000
-    return result.fields
+    out: Dict[str, Any] = {"success": result.success}
+    out.update(result.fields)
+    return out
 
 
 @app.get("/health")
@@ -74,13 +76,13 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/ocr", response_model=Dict[str, str], response_model_exclude_none=True)
+@app.post("/ocr", response_model=Dict[str, Any], response_model_exclude_none=True)
 async def ocr(file: UploadFile = File(...), include_lines: bool = False):
     buf = await file.read()
     return _recognize(buf, include_lines=include_lines)
 
 
-@app.post("/ocr_base64", response_model=Dict[str, str], response_model_exclude_none=True)
+@app.post("/ocr_base64", response_model=Dict[str, Any], response_model_exclude_none=True)
 async def ocr_base64(req: Base64Request, include_lines: bool = False):
     try:
         buf = base64.b64decode(req.image_base64, validate=True)
@@ -89,7 +91,7 @@ async def ocr_base64(req: Base64Request, include_lines: bool = False):
     return _recognize(buf, include_lines=include_lines)
 
 
-@app.post("/ocr_url", response_model=Dict[str, str], response_model_exclude_none=True)
+@app.post("/ocr_url", response_model=Dict[str, Any], response_model_exclude_none=True)
 def ocr_url(req: UrlRequest, include_lines: bool = False):
     try:
         buf = fetch_image_bytes(req.image_url, get_settings())

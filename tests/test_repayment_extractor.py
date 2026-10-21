@@ -626,6 +626,47 @@ def test_sampath_vishwa_two_column_fields():
     assert r.fields["Destination Bank"] == "COMMERCIAL BANK OF CEYLON"
 
 
+def test_sampath_vishwa_real_ocr_noise():
+    """真实 Vishwa 回执 OCR 行：含重复变体（同 y 带冒号前缀）与值换行（gap 更大），
+    字段应一个不漏，且不把重复变体或下一字段的值误拼进来。"""
+    lines = [
+        _lr("VISHWA", 1282, 226, 1404, 254),
+        _lr("Status", 57, 414, 181, 462),
+        _lr(": Success", 740, 422, 919, 459),
+        _lr(": Success", 737, 419, 919, 460),  # 重复变体，不应重复拼接
+        _lr("Transaction ID", 57, 491, 330, 532),
+        _lr("89101292", 737, 494, 947, 531),
+        _lr(": 89101292", 738, 494, 947, 531),  # 重复变体
+        _lr("Date & Time", 56, 562, 294, 607),
+        _lr(": 09/10/2026 01:19 PM", 738, 567, 1160, 602),
+        _lr("Source Account Number", 60, 641, 514, 676),
+        _lr("*2918", 869, 636, 986, 679),
+        _lr("Amount", 56, 713, 206, 751),
+        _lr(": LKR 5,500.00", 737, 711, 1015, 752),
+        _lr("Beneficiary Name", 60, 786, 387, 827),
+        _lr(": Lak Artha Pyt Ltd", 740, 787, 1078, 820),
+        _lr("Beneficiary Account No", 62, 859, 497, 896),
+        _lr(": 1001096962", 738, 859, 993, 896),
+        _lr("Beneficiary Remarks", 62, 934, 443, 971),
+        _lr(": 913171047v", 737, 933, 991, 969),
+        _lr("Destination Bank", 62, 1006, 377, 1043),
+        _lr(": COMMERCIAL BANK OF", 738, 1005, 1238, 1040),
+        _lr("CEYLON", 737, 1067, 910, 1104),  # 续行，与上值 y 间距 > 55
+    ]
+    r = extract(lines)
+
+    assert r.bank == "vishwa"
+    assert r.fields["Status"] == "Success"
+    assert r.fields["Transaction ID"] == "89101292"
+    assert r.fields["Date & Time"] == "09/10/2026 01:19 PM"
+    assert r.fields["Source Account Number"] == "*2918"
+    assert r.fields["Amount"] == "LKR 5,500.00"
+    assert r.fields["Beneficiary Name"] == "Lak Artha Pyt Ltd"
+    assert r.fields["Beneficiary Account No."] == "1001096962"
+    assert r.fields["Beneficiary Remarks"] == "913171047v"
+    assert r.fields["Destination Bank"] == "COMMERCIAL BANK OF CEYLON"
+
+
 def test_peoples_pay_two_column():
     """真实 People's Bank People's Pay 回执：左标右值两栏版式。
 

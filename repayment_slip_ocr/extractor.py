@@ -252,8 +252,29 @@ def _right_column_line(idx: int, lines, label_line, max_vy: float = 170.0):
     return best[1] if best else None
 
 
-def _collect_column_block(lines, value_line, max_gap: float = 55.0, x_tol: float = 140.0) -> str:
-    """拼接同一右列连续值块，兼容目标值换到下一行的电子回执版式。"""
+def _row_has_left_label(lines, value_line, other, base_left_x, x_tol: float = 140.0, y_tol: float = 20.0) -> bool:
+    """判断候选行 other 左侧同一水平带是否存在标签行。"""
+    oy = _line_center_y(other.box)
+    for peer in lines:
+        if peer is value_line or peer is other:
+            continue
+        py = _line_center_y(peer.box)
+        if abs(py - oy) > y_tol:
+            continue
+        px = min(p[0] for p in peer.box)
+        if px < base_left_x - x_tol:
+            return True
+    return False
+
+
+def _collect_column_block(lines, value_line, max_gap: float = 400.0, x_tol: float = 140.0, min_gap: float = 30.0) -> str:
+    """拼接同一右列连续值块，兼容目标值换到下一行的电子回执版式。
+
+    向下扫描，区分三种情况：
+    * y 间距过小（min_gap）视为同一水平带的 OCR 重复变体，跳过；
+    * 左侧同一水平带出现标签行，说明进入下一组字段，停止；
+    * 右侧同列的行视为当前值的续行，拼接。
+    """
     parts = [_clean(value_line.text)]
     base_left_x = min(p[0] for p in value_line.box)
     last_y = _line_center_y(value_line.box)
@@ -265,26 +286,18 @@ def _collect_column_block(lines, value_line, max_gap: float = 55.0, x_tol: float
         if not seen_value:
             continue
         oy = _line_center_y(other.box)
-        if oy - last_y > max_gap:
+        dy = oy - last_y
+        if dy > max_gap:
             break
+        if dy < min_gap:
+            continue  # 同一水平带的重复变体
         ox = min(p[0] for p in other.box)
-        if abs(ox - base_left_x) > x_tol:
-            continue
-        # 若该候选行左侧同一水平带存在新的标签行，说明已经进入下一组字段，不再拼接。
-        row_has_left_label = False
-        for peer in lines:
-            if peer is value_line or peer is other:
-                continue
-            py = _line_center_y(peer.box)
-            px1 = max(p[0] for p in peer.box)
-            if abs(py - oy) > 20:
-                continue
-            if px1 >= base_left_x - 40:
-                continue
-            row_has_left_label = True
-            break
-        if row_has_left_label:
-            break
+        if ox < base_left_x - x_tol:
+            break  # 左侧出现新标签行，进入下一组字段
+        if _row_has_left_label(lines, value_line, other, base_left_x, x_tol=x_tol):
+            break  # 右侧行但左侧同行有标签，属下一字段
+        if ox > base_left_x + x_tol:
+            continue  # 更靠右的其它内容（如 logo）
         text = _clean(other.text)
         if not text or _looks_like_label_text(text):
             continue

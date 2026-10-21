@@ -197,6 +197,12 @@ def _value_to_right(idx: int, lines, label_line) -> Optional[str]:
 
     用垂直重叠度挑选右侧候选行，避免把相邻标签的值张冠李戴。
     """
+    best_line = _value_line_to_right(idx, lines, label_line)
+    return _clean(best_line.text) if best_line else None
+
+
+def _value_line_to_right(idx: int, lines, label_line):
+    """返回与标签同行、位于右侧的最佳值行对象。"""
     ly0 = min(p[1] for p in label_line.box)
     ly1 = max(p[1] for p in label_line.box)
     label_right_x = max(p[0] for p in label_line.box)
@@ -213,8 +219,8 @@ def _value_to_right(idx: int, lines, label_line) -> Optional[str]:
             continue  # 无垂直重叠
         overlap = min(ly1, oy1) - max(ly0, oy0)
         if best is None or overlap > best[0]:
-            best = (overlap, other.text)
-    return _clean(best[1]) if best else None
+            best = (overlap, other)
+    return best[1] if best else None
 
 
 def _right_column_value(idx: int, lines, label_line, max_vy: float = 170.0) -> Optional[str]:
@@ -223,6 +229,12 @@ def _right_column_value(idx: int, lines, label_line, max_vy: float = 170.0) -> O
     部分电子回单的值比标签略低（如 BOC "Other Charges" 的值在标签下一行），严格按
     垂直重叠会取空，这里用「在标签右侧 + 垂直方向不高于 max_vy」的宽松窗口兜底。
     """
+    best_line = _right_column_line(idx, lines, label_line, max_vy=max_vy)
+    return _clean(best_line.text) if best_line else None
+
+
+def _right_column_line(idx: int, lines, label_line, max_vy: float = 170.0):
+    """返回标签右侧（可略偏下）的最佳值行对象。"""
     ly = _line_center_y(label_line.box)
     rx = max(p[0] for p in label_line.box)
     best = None
@@ -236,8 +248,49 @@ def _right_column_value(idx: int, lines, label_line, max_vy: float = 170.0) -> O
         if oy < ly - 5 or oy - ly > max_vy:
             continue
         if best is None or oy < best[0]:
-            best = (oy, other.text)
-    return _clean(best[1]) if best else None
+            best = (oy, other)
+    return best[1] if best else None
+
+
+def _collect_column_block(lines, value_line, max_gap: float = 55.0, x_tol: float = 140.0) -> str:
+    """拼接同一右列连续值块，兼容目标值换到下一行的电子回执版式。"""
+    parts = [_clean(value_line.text)]
+    base_left_x = min(p[0] for p in value_line.box)
+    last_y = _line_center_y(value_line.box)
+    seen_value = False
+    for other in _sorted_by_y(lines):
+        if other is value_line:
+            seen_value = True
+            continue
+        if not seen_value:
+            continue
+        oy = _line_center_y(other.box)
+        if oy - last_y > max_gap:
+            break
+        ox = min(p[0] for p in other.box)
+        if abs(ox - base_left_x) > x_tol:
+            continue
+        # 若该候选行左侧同一水平带存在新的标签行，说明已经进入下一组字段，不再拼接。
+        row_has_left_label = False
+        for peer in lines:
+            if peer is value_line or peer is other:
+                continue
+            py = _line_center_y(peer.box)
+            px1 = max(p[0] for p in peer.box)
+            if abs(py - oy) > 20:
+                continue
+            if px1 >= base_left_x - 40:
+                continue
+            row_has_left_label = True
+            break
+        if row_has_left_label:
+            break
+        text = _clean(other.text)
+        if not text or _looks_like_label_text(text):
+            continue
+        parts.append(text)
+        last_y = oy
+    return " ".join(parts)
 
 
 def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optional[float]:
@@ -1821,6 +1874,18 @@ _BOC_APP_LABELS = (
     "Total Amount",
 )
 
+_SAMPATH_VISHWA_LABELS = (
+    "Status",
+    "Transaction ID",
+    "Date & Time",
+    "Source Account Number",
+    "Amount",
+    "Beneficiary Name",
+    "Beneficiary Account No.",
+    "Beneficiary Remarks",
+    "Destination Bank",
+)
+
 
 def _norm_label(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
@@ -1842,11 +1907,11 @@ def _build_label_fields(lines, labels) -> dict:
         key = wanted.get(_norm_label(ln.text))
         if key is None or key in fields:
             continue
-        side = _value_to_right(i, ordered, ln)
-        if not side:
-            side = _right_column_value(i, ordered, ln)
-        if side:
-            fields[key] = side
+        side_line = _value_line_to_right(i, ordered, ln)
+        if side_line is None:
+            side_line = _right_column_line(i, ordered, ln)
+        if side_line is not None:
+            fields[key] = _collect_column_block(ordered, side_line)
         else:
             below = _value_below(i, ordered, ln)
             if below:
@@ -1942,6 +2007,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
 
     if _is_boc_app(lines):
         field_labels = _BOC_APP_LABELS
+    elif bank == "vishwa":
+        field_labels = _SAMPATH_VISHWA_LABELS
     elif bank == "peoples_bank":
         field_labels = _PEOPLES_BANK_LABELS
     else:

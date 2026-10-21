@@ -587,6 +587,45 @@ def test_commercial_bank_e_receipt_two_column():
     assert r.fields["Status"] == "Completed"
 
 
+def test_sampath_vishwa_two_column_fields():
+    """Sampath Vishwa 回执应返回图片原始字段名 -> 原文值映射。"""
+    lines = [
+        _lr("Sampath Vishwa Mobile - Online Transfer", 220, 150, 720, 190),
+        _lr("Status", 48, 332, 168, 368),
+        _lr("Success", 430, 332, 560, 368),
+        _lr("Transaction ID", 48, 390, 260, 426),
+        _lr("89101292", 430, 390, 570, 426),
+        _lr("Date & Time", 48, 448, 246, 484),
+        _lr("09/10/2026 01:19 PM", 430, 448, 720, 484),
+        _lr("Source Account Number", 48, 506, 344, 542),
+        _lr("*******2918", 430, 506, 620, 542),
+        _lr("Amount", 48, 564, 170, 600),
+        _lr("LKR 5,500.00", 430, 564, 640, 600),
+        _lr("Beneficiary Name", 48, 622, 290, 658),
+        _lr("Lak Artha Pvt Ltd", 430, 622, 710, 658),
+        _lr("Beneficiary Account No.", 48, 680, 372, 716),
+        _lr("1001096962", 430, 680, 610, 716),
+        _lr("Beneficiary Remarks", 48, 738, 336, 774),
+        _lr("913171047v", 430, 738, 610, 774),
+        _lr("Destination Bank", 48, 796, 286, 832),
+        _lr("COMMERCIAL BANK OF", 430, 796, 760, 832),
+        _lr("CEYLON", 430, 840, 570, 876),
+        _lr("VISHWA", 690, 140, 810, 190),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "vishwa"
+    assert r.fields["Status"] == "Success"
+    assert r.fields["Transaction ID"] == "89101292"
+    assert r.fields["Date & Time"] == "09/10/2026 01:19 PM"
+    assert r.fields["Source Account Number"] == "*******2918"
+    assert r.fields["Amount"] == "LKR 5,500.00"
+    assert r.fields["Beneficiary Name"] == "Lak Artha Pvt Ltd"
+    assert r.fields["Beneficiary Account No."] == "1001096962"
+    assert r.fields["Beneficiary Remarks"] == "913171047v"
+    assert r.fields["Destination Bank"] == "COMMERCIAL BANK OF CEYLON"
+
+
 def test_peoples_pay_two_column():
     """真实 People's Bank People's Pay 回执：左标右值两栏版式。
 

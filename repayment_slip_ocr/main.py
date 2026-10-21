@@ -52,6 +52,33 @@ class UrlRequest(BaseModel):
     image_url: str
 
 
+def _structured_fallback(result) -> Dict[str, Any]:
+    """无明确 label 的图片：用统一的结构化字段名作为 key 返回。"""
+    refs = result.references
+    transaction_reference = (
+        refs.txn_ref or refs.transaction_id or refs.bank_reference_number
+        or refs.retrieval_ref or refs.e_receipt_reference or refs.my_ref
+        or refs.receiver_ref
+    )
+    return {
+        "status": result.status,
+        "bank": result.bank,
+        "amount": result.amount,
+        "fee": result.fee,
+        "total_debit": result.total_debit,
+        "currency": result.currency,
+        "datetime": result.datetime,
+        "payer_name": result.payer.name,
+        "payer_account": result.payer.account,
+        "payer_bank": result.payer.bank,
+        "payee_name": result.payee.name,
+        "payee_account": result.payee.account,
+        "payee_bank": result.payee.bank,
+        "transaction_reference": transaction_reference,
+        "remarks": refs.remarks,
+    }
+
+
 def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     settings = get_settings()
     if len(buf) > settings.max_upload_bytes:
@@ -67,7 +94,7 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     result = extract(unique, include_lines=include_lines)
     result.elapsed_ms = (time.perf_counter() - t0) * 1000
     out: Dict[str, Any] = {"success": result.success}
-    out.update(result.fields)
+    out.update(result.fields if result.fields else _structured_fallback(result))
     return out
 
 

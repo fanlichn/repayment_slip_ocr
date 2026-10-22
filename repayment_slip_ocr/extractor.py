@@ -2084,7 +2084,7 @@ def _right_column_buckets(lines, labels) -> dict:
         if k and k not in seen:
             seen.add(k)
             label_lines.append((k, ln))
-    buckets = {k: {} for k, _ in label_lines}
+    buckets = {k: [] for k, _ in label_lines}
     for ln in ordered:
         text = ln.text.strip()
         if _norm_label(text) in label_keys:
@@ -2105,15 +2105,20 @@ def _right_column_buckets(lines, labels) -> dict:
         val = _clean(text)
         if not val or _looks_like_label_text(val):
             continue
-        # 同一标签可能因 OCR 产生多份变体（如 "Bank of Ceylon****1089" 与
-        # "Bank of Ceylon ****1089" 仅空格差异），按去空格小写归并，保留置信度最高者
-        norm = re.sub(r"\s+", "", val).lower()
-        existing = buckets[best_k].get(norm)
-        if existing is None or ln.confidence > existing[2]:
-            buckets[best_k][norm] = (oy, val, ln.confidence)
+        buckets[best_k].append((oy, val, ln.confidence))
     result = {}
-    for k, d in buckets.items():
-        result[k] = [v for _, v, _ in sorted(d.values(), key=lambda t: t[0])]
+    for k, items in buckets.items():
+        items.sort(key=lambda t: t[0])
+        # 同一视觉行的多个 OCR 变体（0↔O、冒号↔小数点、空格差异等）按 y 去重，
+        # 保留置信度最高者；不同 y 的行（多行值）保留并拼接。
+        deduped = []
+        for oy, val, conf in items:
+            if deduped and abs(oy - deduped[-1][0]) <= 15.0:
+                if conf > deduped[-1][2]:
+                    deduped[-1] = (oy, val, conf)
+            else:
+                deduped.append((oy, val, conf))
+        result[k] = [v for _, v, _ in deduped]
     return result
 
 

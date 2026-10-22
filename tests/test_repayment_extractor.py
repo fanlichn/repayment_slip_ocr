@@ -704,6 +704,32 @@ def test_commercial_bank_e_receipt_ocr_colon_amount():
     assert r.fields["Status"] == "Completed"
 
 
+def test_commercial_bank_e_receipt_dedup_ocr_variants():
+    """同一视觉行的多个 OCR 变体（0↔O、冒号↔小数点、截断掩码）应按 y 去重，只保留一个。"""
+    L = lambda txt, x0, x1, y, conf=0.9: _lr(txt, x0, y - 14, x1, y + 14, conf)
+    lines = [
+        L("e-Receipt", 133, 231, 390),
+        L("Bank Reference Number", 41, 326, 446),
+        L("O600072786183", 588, 800, 446, 0.99),
+        L("0600072786183", 588, 800, 447, 0.95),
+        L("Sender's Account Number", 40, 349, 496),
+        L("80******82", 587, 730, 496, 0.99),
+        L("80****82", 587, 730, 497, 0.91),
+        L("**82", 587, 730, 498, 0.89),
+        L("Transfer Amount", 43, 251, 574),
+        L("2,500:00", 588, 704, 574, 0.99),
+        L("2,500.00", 588, 704, 575, 0.95),
+        L("Status", 43, 124, 884),
+        L("Completed", 591, 727, 884),
+    ]
+    r = extract(lines)
+
+    assert r.fields["Bank Reference Number"] == "O600072786183"
+    assert r.fields["Sender's Account Number"] == "80******82"
+    assert r.fields["Transfer Amount"] == "2,500.00"
+    assert r.fields["Status"] == "Completed"
+
+
 def test_sampath_vishwa_two_column_fields():
     """Sampath Vishwa 回执应返回图片原始字段名 -> 原文值映射。"""
     lines = [

@@ -810,6 +810,45 @@ def test_sampath_vishwa_real_ocr_noise():
     assert r.fields["Destination Bank"] == "COMMERCIAL BANK OF CEYLON"
 
 
+def test_peoples_bank_one_time_transfer():
+    """People's Bank「One Time Transfer」确认回执：标签在上、值在下，字段应完整。"""
+    L = _lr
+    lines = [
+        L("PEOPLE'S", 525, 164, 839, 222),
+        L("BANK", 519, 219, 689, 278),
+        L("One Time Transfer", 288, 331, 851, 386),
+        L("ACKNOWLEDGEMENT", 291, 558, 909, 606),
+        L("Beneficiary Account Number", 63, 686, 695, 733),
+        L("1001096962", 61, 750, 366, 806),
+        L("Beneficiary Name", 63, 858, 453, 906),
+        L("LAK ARTHA PVT LTD", 61, 925, 580, 972),
+        L("Transfer Amount", 61, 1361, 433, 1417),
+        L("LKR 9,200.00", 58, 1428, 401, 1484),
+        L("Fee & Charges", 58, 1547, 398, 1603),
+        L("LKR 25.00", 58, 1631, 323, 1681),
+        L("Debit Amount", 61, 1736, 372, 1784),
+        L("LKR 9,200.00", 61, 1803, 395, 1850),
+        L("Total Debit Amount", 63, 1906, 490, 1953),
+        L("LKR 9,225.00", 58, 1967, 395, 2022),
+        L("Transfer On", 61, 2075, 323, 2122),
+        L("10-10-2026", 63, 2142, 335, 2189),
+        L("Transfer Description", 55, 2239, 508, 2298),
+        L("pay", 53, 2307, 160, 2379),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "peoples_bank"
+    assert r.success is True
+    assert r.fields["Beneficiary Account Number"] == "1001096962"
+    assert r.fields["Beneficiary Name"] == "LAK ARTHA PVT LTD"
+    assert r.fields["Transfer Amount"] == "LKR 9,200.00"
+    assert r.fields["Fee & Charges"] == "LKR 25.00"
+    assert r.fields["Debit Amount"] == "LKR 9,200.00"
+    assert r.fields["Total Debit Amount"] == "LKR 9,225.00"
+    assert r.fields["Transfer On"] == "10-10-2026"
+    assert r.fields["Transfer Description"] == "pay"
+
+
 def test_peoples_pay_two_column():
     """真实 People's Bank People's Pay 回执：左标右值两栏版式。
 

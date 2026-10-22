@@ -1402,7 +1402,7 @@ def _breakdown_single_line(lines) -> List[DenominationOut]:
 # "Commercial Bank PLC" 误判（还款场景收款方恒为 Lak Artha / Commercial Bank）。
 _BANK_MARKERS = [
     ("vishwa", ("vishwa",)),
-    ("peoples_bank", ("peoplespay", "people's pay", "people's bank")),
+    ("peoples_bank", ("peoplespay", "people's pay", "people's bank", "people's")),
     ("commercial_bank", ("cardless deposit", "combank", "transfer within", "e-receipt", "bank reference number", "sender's account number", "beneficiary notified", "cash credit slip")),
     ("ipay", ("ipay",)),
     ("boc", ("bank of ceylon", "boc flex", "boc")),
@@ -1428,6 +1428,22 @@ def _is_boc_app(lines) -> bool:
     """BOC 手机银行 "Transaction Successful" 版式（Account Information 卡片）。"""
     full = " ".join(ln.text for ln in lines).lower()
     return any(m in full for m in _BOC_APP_MARKERS)
+
+
+_PEOPLES_OTP_MARKERS = (
+    "acknowledgement",
+    "transfer description",
+    "debit amount",
+    "beneficiary mobile number",
+)
+
+
+def _is_peoples_otp(lines) -> bool:
+    """People's Bank "One Time Transfer" 确认回执（ACKNOWLEDGEMENT），标签在上、值在下。"""
+    full = " ".join(ln.text for ln in lines).lower()
+    if "acknowledgement" not in full:
+        return False
+    return any(m in full for m in _PEOPLES_OTP_MARKERS[1:])
 
 
 _BOC_FLEX_MARKERS = (
@@ -1922,6 +1938,20 @@ _PEOPLES_BANK_LABELS = (
     "Trace No",
 )
 
+# People's Bank "One Time Transfer" 确认回执（ACKNOWLEDGEMENT）：标签在上、值在下。
+_PEOPLES_OTP_LABELS = (
+    "Beneficiary Account Number",
+    "Beneficiary Name",
+    "Email Address",
+    "Beneficiary Mobile Number",
+    "Transfer Amount",
+    "Fee & Charges",
+    "Debit Amount",
+    "Total Debit Amount",
+    "Transfer On",
+    "Transfer Description",
+)
+
 _E_RECEIPT_LABELS = (
     "Bank Reference Number",
     "Sender's Account Number",
@@ -2301,6 +2331,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
 
     if bank == "ipay":
         fields = _build_ipay_fields(lines)
+    elif _is_peoples_otp(lines):
+        fields = _build_label_fields(lines, _PEOPLES_OTP_LABELS)
     elif bank == "peoples_bank":
         fields = _build_peoples_pay_fields(lines, payer, payee)
     elif doc_type == "e_receipt":

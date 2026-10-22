@@ -577,6 +577,8 @@ def _account_near(lines, anchor_line) -> Optional[str]:
 
 
 def _extract_parties(lines, bank: Optional[str] = None) -> tuple[PartyOut, PartyOut]:
+    if bank == "ipay":
+        return _extract_ipay_parties(lines)
     if bank == "peoples_bank":
         return _extract_peoples_bank_parties(lines)
     if _is_boc_app(lines):
@@ -1247,7 +1249,7 @@ def _parse_flexible_money(text: str) -> Optional[float]:
     - 单个逗号无点：千分位（5,300 → 5300）
     - 单个点且后接 2 位数字：小数点（5300.00）；否则千分位（5.300 → 5300）
     """
-    candidates = re.findall(r"[\d.,]+", text.replace(" ", ""))
+    candidates = [c.strip(".,") for c in re.findall(r"[\d.,]+", text.replace(" ", ""))]
     if not candidates:
         return None
     best_val = None
@@ -1386,12 +1388,12 @@ _BANK_MARKERS = [
     ("vishwa", ("vishwa",)),
     ("peoples_bank", ("peoplespay", "people's pay", "people's bank")),
     ("commercial_bank", ("cardless deposit", "combank", "transfer within", "e-receipt", "bank reference number", "sender's account number", "beneficiary notified", "cash credit slip")),
+    ("ipay", ("ipay",)),
     ("boc", ("bank of ceylon", "boc flex", "boc")),
     ("hnb", ("hatton national", "hnb", "this is an auto generated receipt")),
     ("dfcc", ("dfcc bank", "dfcc")),
     ("ntb", ("nations trust",)),
     ("lb_finance", ("cash in mobile", "lb finance", "lbcim")),
-    ("ipay", ("ipay",)),
     ("pay_master", ("paymaster", "pay master")),
     ("qpayment", ("q payment", "qpayment")),
     ("flash", ("flash",)),
@@ -1981,6 +1983,17 @@ _LB_FINANCE_LABELS = (
     "Status",
 )
 
+_IPAY_LABELS = (
+    "Transaction Date",
+    "Transaction ID",
+    "Type",
+    "From",
+    "To",
+    "Recipient",
+    "Remarks",
+    "Status",
+)
+
 
 def _norm_label(s: str) -> str:
     """标签归一化：去非字母数字，并还原常见 OCR 字母数字混淆（0→O、1→I）。"""
@@ -2036,6 +2049,99 @@ def _build_label_fields(lines, labels) -> dict:
                 fields[lbl] = value
                 break
     return fields
+
+
+_IPAY_LABEL_KEYS = {_norm_label(lbl): lbl for lbl in _IPAY_LABELS}
+
+
+def _ipay_label_buckets(lines) -> dict:
+    """iPay 回执为干净的两栏版式（左列标签 / 右列值，值可多行）。
+
+    右列值行按其 y 中心与左列标签行的 y 中心做最近邻归属（阈值 80px），
+    从而把 "From" 下的姓名+银行、以及 "To" 下的银行+账号正确分到各自标签，
+    避免通用 `_collect_column_block` 把所有右列行串进一个字段。
+    """
+    ordered = _sorted_by_y(lines)
+    label_lines: list = []
+    seen = set()
+    for ln in ordered:
+        k = _IPAY_LABEL_KEYS.get(_norm_label(ln.text))
+        if k and k not in seen:
+            seen.add(k)
+            label_lines.append((k, ln))
+    buckets = {k: {} for k, _ in label_lines}
+    for ln in ordered:
+        text = ln.text.strip()
+        if _norm_label(text) in _IPAY_LABEL_KEYS:
+            continue  # 标签行本身不作为值
+        ox = min(p[0] for p in ln.box)
+        if ox < 400:
+            continue  # 左列 / 居中内容（页眉、页脚）不是字段值
+        oy = _line_center_y(ln.box)
+        best_k = None
+        best_d = 81.0
+        for k, lbl in label_lines:
+            d = abs(oy - _line_center_y(lbl.box))
+            if d < best_d:
+                best_d = d
+                best_k = k
+        if best_k is None:
+            continue
+        val = _clean(text)
+        if not val or _looks_like_label_text(val):
+            continue
+        # 同一标签可能因 OCR 产生多份变体（如 "Bank of Ceylon****1089" 与
+        # "Bank of Ceylon ****1089" 仅空格差异），按去空格小写归并，保留置信度最高者
+        norm = re.sub(r"\s+", "", val).lower()
+        existing = buckets[best_k].get(norm)
+        if existing is None or ln.confidence > existing[2]:
+            buckets[best_k][norm] = (oy, val, ln.confidence)
+    result = {}
+    for k, d in buckets.items():
+        result[k] = [v for _, v, _ in sorted(d.values(), key=lambda t: t[0])]
+    return result
+
+
+def _build_ipay_fields(lines) -> dict:
+    buckets = _ipay_label_buckets(lines)
+    return {k: " ".join(v) for k, v in buckets.items() if v}
+
+
+def _extract_ipay_parties(lines) -> tuple:
+    buckets = _ipay_label_buckets(lines)
+    payer = PartyOut()
+    payee = PartyOut()
+
+    from_vals = buckets.get("From", [])
+    to_vals = buckets.get("To", [])
+    recipient_vals = buckets.get("Recipient", [])
+
+    # From: 首行姓名，后续行 bank + 掩码账号（如 "Bank of Ceylon ****1089"）
+    if from_vals:
+        payer.name = from_vals[0]
+        for v in from_vals[1:]:
+            tok = _account_token(v)
+            if tok:
+                payer.account = tok
+                bank = re.sub(r"[0-9*Xx]{6,}", "", v).strip(" -")
+                if bank:
+                    payer.bank = bank
+            elif payer.bank is None:
+                payer.bank = v
+    # To: 首行银行，后续行账号（如 "Commercial Bank PLC" + "1001096962"）
+    if to_vals:
+        payee.bank = to_vals[0]
+        for v in to_vals[1:]:
+            tok = _account_token(v)
+            if tok:
+                payee.account = tok
+    # Recipient: 收款方姓名
+    if recipient_vals:
+        payee.name = recipient_vals[0]
+
+    payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+    return payer, payee
 
 
 def _build_peoples_pay_fields(lines, payer, payee) -> dict:
@@ -2163,10 +2269,12 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         field_labels = _CDM_LABELS
     elif bank == "lb_finance":
         field_labels = _LB_FINANCE_LABELS
+    elif bank == "ipay":
+        field_labels = _IPAY_LABELS
     else:
         field_labels = _E_RECEIPT_LABELS
 
-    fields = _build_peoples_pay_fields(lines, payer, payee) if bank == "peoples_bank" else _build_label_fields(lines, field_labels)
+    fields = _build_ipay_fields(lines) if bank == "ipay" else (_build_peoples_pay_fields(lines, payer, payee) if bank == "peoples_bank" else _build_label_fields(lines, field_labels))
     # 时间无标签（如 BOC App 独立的 "10.08.2026 , 06:45 PM" 行）时，从 OCR 原文补 Date & Time
     if not any("date" in k.lower() or "time" in k.lower() for k in fields):
         raw_dt = _find_datetime_raw(lines)

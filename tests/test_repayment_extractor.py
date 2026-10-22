@@ -1269,3 +1269,58 @@ def test_hnb_fund_transfer_receipt():
     assert r.payee.bank == "Commercial Bank PLC"
     assert r.references.txn_ref == "189359/154299101"
     assert r.references.receiver_ref == "Champika Dias 751251866V"
+
+
+def test_ipay_fund_transfer():
+    """iPay 转账回执：左列标签 / 右列值两栏，From 下姓名+银行、To 下银行+账号，
+    头部 "Rs.5,512.00" 为交易金额。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 18, x1, y + 18)
+    lines = [
+        L("Rs.5,512.00", 509, 691, 612),
+        L("Transaction Summary", 426, 772, 417),
+        L("Transaction Date", 75, 297, 780),
+        L("2026-10-09 14:16:09", 603, 868, 783),
+        L("Transaction ID", 78, 265, 875),
+        L("2026100908460800001", 600, 903, 869),
+        L("Type", 75, 147, 951),
+        L("Fund Transfer", 595, 785, 948),
+        L("From", 72, 154, 1044),
+        L("Sameera", 601, 724, 1021),
+        L("Bank of Ceylon ****1089", 600, 913, 1081),
+        L("To", 75, 118, 1173),
+        L("Commercial Bank PLC", 600, 892, 1146),
+        L("1001096962", 596, 767, 1194),
+        L("Recipient", 75, 204, 1284),
+        L("LAK artha pvt Ltd", 597, 825, 1270),
+        L("Remarks", 74, 199, 1381),
+        L("0714362384", 598, 767, 1378),
+        L("Status", 74, 167, 1481),
+        L("SUCCESS", 600, 745, 1484),
+        L("This transaction was performed using iPay", 343, 854, 1584),
+        L("www.ipay.lk", 72, 490, 1790),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "ipay"
+    assert r.doc_type == "fund_transfer_receipt"
+    assert r.status == "success"
+    assert r.success is True
+    assert r.amount == 5512.0
+    assert r.datetime == "2026-10-09T14:16:09"
+    assert r.payer.name == "Sameera"
+    assert r.payer.account == "****1089"
+    assert r.payer.bank == "Bank of Ceylon"
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank PLC"
+    assert r.references.transaction_id == "2026100908460800001"
+    assert r.references.remarks == "0714362384"
+    assert r.fields["Transaction Date"] == "2026-10-09 14:16:09"
+    assert r.fields["Transaction ID"] == "2026100908460800001"
+    assert r.fields["Type"] == "Fund Transfer"
+    assert r.fields["From"] == "Sameera Bank of Ceylon ****1089"
+    assert r.fields["To"] == "Commercial Bank PLC 1001096962"
+    assert r.fields["Recipient"] == "LAK artha pvt Ltd"
+    assert r.fields["Remarks"] == "0714362384"
+    assert r.fields["Status"] == "SUCCESS"
+

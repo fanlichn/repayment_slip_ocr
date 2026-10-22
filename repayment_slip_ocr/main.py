@@ -95,6 +95,7 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     result.elapsed_ms = (time.perf_counter() - t0) * 1000
     out: Dict[str, Any] = {"success": result.success}
     out.update(result.fields if result.fields else _structured_fallback(result))
+    out["bank"] = result.bank.upper() if result.bank else ""
     if include_lines:
         out["lines"] = [l.dict() for l in result.lines]
     return out

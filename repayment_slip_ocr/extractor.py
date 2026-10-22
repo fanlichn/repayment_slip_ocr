@@ -1993,6 +1993,42 @@ def _build_label_fields(lines, labels) -> dict:
     return fields
 
 
+def _build_peoples_pay_fields(lines, payer, payee) -> dict:
+    """People's Pay 回执：Pay from / Pay to 两个分区，字段用 Payer/Payee 别名区分。
+
+    页面有多个同名字段（Name / Bank / Account No），按分区归属分别标记；
+    标签漏识别时用结构化字段（payer/payee）兜底。
+    """
+    payer_zone, payee_zone, _ = _split_zones(lines)
+
+    fields = _build_label_fields(
+        lines,
+        ("Amount (LKR)", "Fee Amount (LKR)", "Total debit amount (LKR)", "Date & Time", "Trace No"),
+    )
+
+    # Pay from 区 -> Payer 别名
+    payer_fields = _build_label_fields(payer_zone or lines, ("Name", "Bank", "Account No", "Account Currency"))
+    if payer_fields.get("Name") or payer.name:
+        fields["Payer Name"] = payer_fields.get("Name") or payer.name
+    if payer_fields.get("Bank") or payer.bank:
+        fields["Payer Bank"] = payer_fields.get("Bank") or payer.bank
+    if payer_fields.get("Account No") or payer.account:
+        fields["Payer Account No"] = payer_fields.get("Account No") or payer.account
+    if payer_fields.get("Account Currency"):
+        fields["Account Currency"] = payer_fields["Account Currency"]
+
+    # Pay to 区 -> Payee 别名
+    payee_fields = _build_label_fields(payee_zone or lines, ("Name", "Bank Name", "Account No"))
+    if payee_fields.get("Name") or payee.name:
+        fields["Payee Name"] = payee_fields.get("Name") or payee.name
+    if payee_fields.get("Bank Name") or payee.bank:
+        fields["Payee Bank"] = payee_fields.get("Bank Name") or payee.bank
+    if payee_fields.get("Account No") or payee.account:
+        fields["Payee Account No"] = payee_fields.get("Account No") or payee.account
+
+    return fields
+
+
 _BRANCH_RE = re.compile(r"(?i)^[a-z0-9][a-z0-9\-./ ]*\bbr\b$")
 
 
@@ -2081,7 +2117,7 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     else:
         field_labels = _E_RECEIPT_LABELS
 
-    fields = _build_label_fields(lines, field_labels)
+    fields = _build_peoples_pay_fields(lines, payer, payee) if bank == "peoples_bank" else _build_label_fields(lines, field_labels)
     # 时间无标签（如 BOC App 独立的 "10.08.2026 , 06:45 PM" 行）时，从 OCR 原文补 Date & Time
     if not any("date" in k.lower() or "time" in k.lower() for k in fields):
         raw_dt = _find_datetime_raw(lines)

@@ -1951,6 +1951,18 @@ _BOC_FLEX_LABELS = (
     "Beneficiary Bank",
 )
 
+_CDM_LABELS = (
+    "TRANSACTION",
+    "ACCOUNT NUMBER",
+    "CUSTOMER NAME",
+    "NARRATION",
+    "MOBILE NO.",
+    "SOURCE OF FUNDS",
+    "DEPOSIT AMOUNT",
+    "TRANSACTION STATUS",
+    "TRACE",
+)
+
 
 def _norm_label(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
@@ -1979,8 +1991,12 @@ def _build_label_fields(lines, labels) -> dict:
             fields[key] = _collect_column_block(ordered, side_line)
         else:
             below = _value_below(i, ordered, ln)
-            if below:
-                fields[key] = below
+            if below and not _looks_like_label_text(below):
+                below_norm = _norm_label(below)
+                # 下方是另一个标签（或标签+值，如空值字段 "NARRATION:" 下接 "MOBILE NO. :"），
+                # 不应作为当前字段的值
+                if below_norm not in wanted and not any(below_norm.startswith(n) for n in wanted):
+                    fields[key] = below
     # 单栏：标签与值在同一行
     for ln in ordered:
         for lbl in labels:
@@ -2114,6 +2130,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         field_labels = _SAMPATH_VISHWA_LABELS
     elif bank == "peoples_bank":
         field_labels = _PEOPLES_BANK_LABELS
+    elif _is_cash_deposit(lines):
+        field_labels = _CDM_LABELS
     else:
         field_labels = _E_RECEIPT_LABELS
 

@@ -189,6 +189,44 @@ def test_atm_cardless_deposit():
     assert not any("加总" in w for w in r.warnings)
 
 
+def test_cdm_field_labels():
+    """CDM 无卡存款凭条：单行 Label : Value 字段应完整提取，空值字段不误取下一标签。"""
+    rows = [
+        ("COMMERCIAL BANK", 40),
+        ("COMMERCIAL BANK OF CEYLON PLC", 80),
+        ("BANDARAG-CRM2 BR", 120),
+        ("DATE TIME TERMINAL ID", 160),
+        ("09/10/26 08:14 RBANDAR2HT", 200),
+        ("TRACE 5107", 240),
+        ("TRANSACTION : CARDLESS DEPOSIT", 280),
+        ("ACCOUNT NUMBER: 1001096962", 320),
+        ("CUSTOMER NAME :LAK ARTHA SERVICES", 360),
+        ("NARRATION:", 400),
+        ("MOBILE NO. :", 440),
+        ("SOURCE OF FUNDS:UNKNOWN", 480),
+        ("NOTES VALUE AMOUNT", 520),
+        ("1 LKR 100.00 100.00", 560),
+        ("1 LKR 1,000.00 1,000.00", 600),
+        ("1 LKR 5,000.00 5,000.00", 640),
+        ("DEPOSIT AMOUNT: LKR 6,100.00", 680),
+        ("TRANSACTION STATUS : SUCCESSFUL", 720),
+        ("THANK YOU FOR BANKING WITH US", 760),
+    ]
+    r = extract(_make(rows))
+
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.fields["TRANSACTION"] == "CARDLESS DEPOSIT"
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+    assert r.fields["CUSTOMER NAME"] == "LAK ARTHA SERVICES"
+    assert r.fields["SOURCE OF FUNDS"] == "UNKNOWN"
+    assert r.fields["DEPOSIT AMOUNT"] == "LKR 6,100.00"
+    assert r.fields["TRANSACTION STATUS"] == "SUCCESSFUL"
+    assert r.fields["TRACE"] == "5107"
+    # 空值字段不应误取下一标签
+    assert "NARRATION" not in r.fields
+    assert "MOBILE NO." not in r.fields
+
+
 def test_cdm_deposit_amount_with_space_after_comma():
     """CDM 无卡存款凭条：OCR 把 '5,000.00' 读成 '5, 000.00'（逗号后有空格）。"""
     rows = [

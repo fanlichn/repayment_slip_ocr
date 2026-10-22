@@ -688,7 +688,7 @@ def test_sampath_vishwa_two_column_fields():
     assert r.bank == "vishwa"
     assert r.fields["Status"] == "Success"
     assert r.fields["Transaction ID"] == "89101292"
-    assert r.fields["Date & Time"] == "09/10/2026 01:19 PM"
+    assert r.fields["Date & Time"] == "2026-10-09 13:19:00"
     assert r.fields["Source Account Number"] == "*******2918"
     assert r.fields["Amount"] == "LKR 5,500.00"
     assert r.fields["Beneficiary Name"] == "Lak Artha Pvt Ltd"
@@ -729,7 +729,7 @@ def test_sampath_vishwa_real_ocr_noise():
     assert r.bank == "vishwa"
     assert r.fields["Status"] == "Success"
     assert r.fields["Transaction ID"] == "89101292"
-    assert r.fields["Date & Time"] == "09/10/2026 01:19 PM"
+    assert r.fields["Date & Time"] == "2026-10-09 13:19:00"
     assert r.fields["Source Account Number"] == "*2918"
     assert r.fields["Amount"] == "LKR 5,500.00"
     assert r.fields["Beneficiary Name"] == "Lak Artha Pyt Ltd"
@@ -805,7 +805,7 @@ def test_peoples_pay_two_column():
     assert r.fields["Amount (LKR)"] == "7,900.00"
     assert r.fields["Fee Amount (LKR)"] == "25.00"
     assert r.fields["Total debit amount (LKR)"] == "7,925.00"
-    assert r.fields["Date & Time"] == "2026/10/08 12:02:53"
+    assert r.fields["Date & Time"] == "2026-10-08 12:02:53"
     assert r.fields["Trace No"] == "2026100800600901"
     assert r.fields["Remarks"] == "loan"
 
@@ -864,7 +864,7 @@ def test_boc_app_transaction_successful():
     assert r.fields["Reference/Remarks"] == "Nikesh ayeshan"
     assert r.fields["Other Charges"] == "LKR 40.00"
     assert r.fields["Total Amount"] == "LKR 6,040.00"
-    assert r.fields["Date & Time"] == "10.08.2026 , 06:45 PM"
+    assert r.fields["Date & Time"] == "2026-08-10 18:45:00"
 
 
 def test_boc_flex_fund_transfer():
@@ -894,7 +894,7 @@ def test_boc_flex_fund_transfer():
 
     assert r.bank == "boc"
     assert r.fields["Transaction Amount"] == "LKR 5,700.00"
-    assert r.fields["Transaction Date & Time"] == "09-10-2026 01:47 PM"
+    assert r.fields["Transaction Date & Time"] == "2026-10-09 13:47:00"
     assert r.fields["Transaction ID"] == "FX10858294700000"
     assert r.fields["Charges & Fee"] == "LKR 25.00"
     assert r.fields["Remarks"] == "sss"
@@ -1025,7 +1025,7 @@ def test_lb_finance_field_labels():
     assert r.fields["Remarks"] == "Pradeep"
     assert r.fields["Reference No."] == "0056146132"
     assert r.fields["Status"] == "Successfu!"
-    assert r.fields["Transaction Date & Time"] == "09/10/2026 09.42 AM"
+    assert r.fields["Transaction Date & Time"] == "2026-10-09 09:42:00"
 
 
 def test_commercial_bank_cash_credit_slip():

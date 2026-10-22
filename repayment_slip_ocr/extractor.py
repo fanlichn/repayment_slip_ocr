@@ -2175,6 +2175,12 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     # Remarks 兜底：结构化字段已提取但 fields 无 Remarks 时补上（如 People's Pay 占位标签下一行值）
     if references.remarks and not any("remark" in k.lower() for k in fields):
         fields["Remarks"] = references.remarks
+    # 时间字段统一成 24 小时制（YYYY-MM-DD HH:MM:SS），去掉 AM/PM 与点号分隔
+    for k in list(fields.keys()):
+        if "date" in k.lower() or "time" in k.lower():
+            parsed = _parse_datetime(fields[k])
+            if parsed:
+                fields[k] = parsed.replace("T", " ")
 
     return RepaymentResult(
         success=success,

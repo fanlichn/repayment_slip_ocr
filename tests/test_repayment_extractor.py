@@ -787,6 +787,7 @@ def test_boc_app_transaction_successful():
     assert r.fields["Reference/Remarks"] == "Nikesh ayeshan"
     assert r.fields["Other Charges"] == "LKR 40.00"
     assert r.fields["Total Amount"] == "LKR 6,040.00"
+    assert r.fields["Date & Time"] == "10.08.2026 , 06:45 PM"
 
 
 def test_boc_flex_fund_transfer():

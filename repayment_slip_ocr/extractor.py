@@ -940,6 +940,30 @@ def _find_datetime(lines) -> Optional[str]:
     return None
 
 
+def _find_datetime_raw(lines) -> Optional[str]:
+    """提取无标签的纯日期时间行原文（如 "10.08.2026 , 06:45 PM"）。
+
+    只匹配整行几乎就是日期时间的行，避免把带标签的时间行
+    （如 "Date & Time : 09/10/2026 01:19 PM"）重复提取。
+    """
+    pat = re.compile(
+        r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s*[,\s]?\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
+        re.IGNORECASE,
+    )
+    for ln in _sorted_by_y(lines):
+        text = ln.text.strip()
+        m = pat.search(text)
+        if not m:
+            continue
+        rest = (text[:m.start()] + text[m.end():]).strip(" :：.-,，")
+        if rest:
+            continue
+        raw = m.group(0).strip()
+        if _parse_datetime(raw):
+            return raw
+    return None
+
+
 _REMARKS_LABELS = [
     "beneficiary's account narration", "account narration", "remarks",
     "narration", "description", "reference/remarks",
@@ -2057,6 +2081,13 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     else:
         field_labels = _E_RECEIPT_LABELS
 
+    fields = _build_label_fields(lines, field_labels)
+    # 时间无标签（如 BOC App 独立的 "10.08.2026 , 06:45 PM" 行）时，从 OCR 原文补 Date & Time
+    if not any("date" in k.lower() or "time" in k.lower() for k in fields):
+        raw_dt = _find_datetime_raw(lines)
+        if raw_dt:
+            fields["Date & Time"] = raw_dt
+
     return RepaymentResult(
         success=success,
         doc_type=doc_type,
@@ -2070,7 +2101,7 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         currency="LKR",
         datetime=dt,
         references=references,
-        fields=_build_label_fields(lines, field_labels),
+        fields=fields,
         deposit_breakdown=deposit_breakdown,
         branch=branch,
         terminal_id=terminal_id,

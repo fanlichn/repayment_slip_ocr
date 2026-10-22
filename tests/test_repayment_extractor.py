@@ -227,6 +227,39 @@ def test_cdm_field_labels():
     assert "MOBILE NO." not in r.fields
 
 
+def test_cdm_real_ocr_field_labels():
+    """CDM 凭条真实 OCR：ACC0UNT(0→O)、DEPOSIT AMOUNT 拆分 LKR+金额、面额表 AMOUNT 干扰。"""
+    lines = [
+        _lr("TRACE", 209, 467, 323, 519),
+        _lr("5107", 455, 483, 540, 527),
+        _lr("TRANSACTION", 214, 593, 442, 634),
+        _lr(": CARDLESS DEPOSIT", 496, 602, 832, 635),
+        _lr("ACC0UNT NUMBER: 1001096962", 218, 677, 721, 710),
+        _lr("CUSTOMER NAME :LAK ARTHA SERVICES", 216, 753, 854, 788),
+        _lr("NARRATION:", 212, 861, 420, 912),
+        _lr("MOBILE NO. :", 212, 974, 443, 1033),
+        _lr("SOURCE OF FUNDS:UNKNOWN", 214, 1036, 673, 1109),
+        _lr("NOTES", 206, 1177, 329, 1235),
+        _lr("VALUE", 394, 1159, 508, 1213),
+        _lr("AMOUNT", 821, 1146, 943, 1190),
+        _lr("DEPOSIT AMOUNT:", 217, 1390, 520, 1465),
+        _lr("LKR", 589, 1374, 664, 1422),
+        _lr("6,100.00", 784, 1371, 948, 1415),
+    ]
+    r = extract(lines)
+
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+    assert r.fields["DEPOSIT AMOUNT"] == "6,100.00"
+    assert r.fields["TRANSACTION"] == "CARDLESS DEPOSIT"
+    assert r.fields["CUSTOMER NAME"] == "LAK ARTHA SERVICES"
+    assert r.fields["SOURCE OF FUNDS"] == "UNKNOWN"
+    assert r.fields["TRACE"] == "5107"
+    # 空值字段不误取面额表表头 / 下一标签
+    assert "MOBILE NO." not in r.fields
+    assert "NARRATION" not in r.fields
+
+
 def test_cdm_deposit_amount_with_space_after_comma():
     """CDM 无卡存款凭条：OCR 把 '5,000.00' 读成 '5, 000.00'（逗号后有空格）。"""
     rows = [

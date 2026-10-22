@@ -170,7 +170,11 @@ def _parse_money(s: str) -> Optional[float]:
 
 
 def _value_after_label(line_text: str, label: str) -> Optional[str]:
-    m = re.search(r"\b" + re.escape(label) + r"\b\s*[:：]?\s*(.+)", line_text, re.IGNORECASE)
+    # label 中字母数字易混淆字符做 OCR 容错（O↔0、I↔1），兼容 "ACC0UNT" 匹配 "ACCOUNT"
+    pattern = re.escape(label)
+    pattern = re.sub(r"[Oo0]", "[O0]", pattern)
+    pattern = re.sub(r"[Ii1]", "[I1]", pattern)
+    m = re.search(r"\b" + pattern + r"\b\s*[:：]?\s*(.+)", line_text, re.IGNORECASE)
     if not m:
         return None
     value = _clean(m.group(1))
@@ -1965,7 +1969,9 @@ _CDM_LABELS = (
 
 
 def _norm_label(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", s.lower())
+    """标签归一化：去非字母数字，并还原常见 OCR 字母数字混淆（0→O、1→I）。"""
+    s = re.sub(r"[^a-z0-9]", "", s.lower())
+    return s.replace("0", "o").replace("1", "i")
 
 
 def _build_label_fields(lines, labels) -> dict:
@@ -1991,7 +1997,13 @@ def _build_label_fields(lines, labels) -> dict:
             side_value = _collect_column_block(ordered, side_line)
             # 跳过标签词（如面额表表头 "AMOUNT"）
             if side_value and not _looks_like_label_text(side_value):
-                fields[key] = side_value
+                # 金额字段右侧若是纯币种词 LKR（值被 OCR 拆成 "LKR" + 金额），改找金额数字
+                if _norm_label(side_value) == "lkr" and "amount" in _norm_label(key):
+                    money = _money_near_label_right(ordered, ln)
+                    if money is not None:
+                        fields[key] = f"{money:,.2f}"
+                else:
+                    fields[key] = side_value
         else:
             below = _value_below(i, ordered, ln)
             if below and not _looks_like_label_text(below):

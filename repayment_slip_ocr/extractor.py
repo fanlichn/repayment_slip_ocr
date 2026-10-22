@@ -1988,7 +1988,10 @@ def _build_label_fields(lines, labels) -> dict:
         if side_line is None:
             side_line = _right_column_line(i, ordered, ln)
         if side_line is not None:
-            fields[key] = _collect_column_block(ordered, side_line)
+            side_value = _collect_column_block(ordered, side_line)
+            # 跳过标签词（如面额表表头 "AMOUNT"）
+            if side_value and not _looks_like_label_text(side_value):
+                fields[key] = side_value
         else:
             below = _value_below(i, ordered, ln)
             if below and not _looks_like_label_text(below):

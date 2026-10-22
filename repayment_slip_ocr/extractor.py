@@ -1409,6 +1409,7 @@ _BANK_MARKERS = [
     ("hnb", ("hatton national", "hnb", "this is an auto generated receipt")),
     ("dfcc", ("dfcc bank", "dfcc")),
     ("ntb", ("nations trust",)),
+    ("nsb", ("nsb online banking", "nsb")),
     ("lb_finance", ("cash in mobile", "lb finance", "lbcim")),
     ("pay_master", ("paymaster", "pay master")),
     ("qpayment", ("q payment", "qpayment")),
@@ -1952,6 +1953,33 @@ _PEOPLES_OTP_LABELS = (
     "Transfer Description",
 )
 
+# NSB Online Banking 回执：三栏（Source / Receiver / Transaction Details），左标右值。
+_NSB_SOURCE_LABELS = (
+    "Account No.",
+    "Account Type",
+    "Transfer Type",
+)
+_NSB_RECEIVER_LABELS = (
+    "Account No.",
+    "Beneficiary Name",
+    "Benefi. Bank Name",
+    "Benefi. Branch Name",
+    "Benefi. Account Type",
+)
+_NSB_TXN_LABELS = (
+    "Transaction Reference",
+    "Transaction Date/Time",
+    "Transfer Amount",
+    "Fee & Charges",
+    "Total Amount",
+    "Transaction Type",
+    "Status",
+    "Payment Type",
+    "Beneficiary Reference",
+    "Your Reference",
+    "Transaction Purpose",
+)
+
 _E_RECEIPT_LABELS = (
     "Bank Reference Number",
     "Sender's Account Number",
@@ -2048,13 +2076,15 @@ def _norm_label(s: str) -> str:
     return s.replace("0", "o").replace("1", "i")
 
 
-def _build_label_fields(lines, labels) -> dict:
+def _build_label_fields(lines, labels, same_row: bool = False) -> dict:
     """按白名单标签，提取「单据原始英文字段名 -> 原文值」的扁平映射。
 
     兼容两种版式：
     * 两栏「左标签 / 右值 / 下方」（如 Commercial Bank e-Receipt、People's Pay）；
     * 单栏「Label Value」或「Label: Value」同行。
     匹配时忽略空格/标点，容忍 OCR 的 "( LKR )"、"Date &Time" 等变体。
+    same_row=True 时仅取标签同一水平带右侧的值，不做「下方取值」兜底，
+    用于值恒与标签同行、空值字段不误取下一字段值的版式（如 NSB）。
     """
     wanted = {_norm_label(lbl): lbl for lbl in labels}
     fields: dict = {}
@@ -2065,7 +2095,7 @@ def _build_label_fields(lines, labels) -> dict:
         if key is None or key in fields:
             continue
         side_line = _value_line_to_right(i, ordered, ln)
-        if side_line is None:
+        if side_line is None and not same_row:
             side_line = _right_column_line(i, ordered, ln)
         if side_line is not None:
             side_value = _collect_column_block(ordered, side_line)
@@ -2078,7 +2108,7 @@ def _build_label_fields(lines, labels) -> dict:
                         fields[key] = f"{money:,.2f}"
                 else:
                     fields[key] = side_value
-        else:
+        elif not same_row:
             below = _value_below(i, ordered, ln)
             if below and not _looks_like_label_text(below):
                 below_norm = _norm_label(below)
@@ -2160,6 +2190,52 @@ def _build_ipay_fields(lines) -> dict:
 def _build_ereceipt_fields(lines) -> dict:
     buckets = _right_column_buckets(lines, _E_RECEIPT_LABELS)
     return {k: " ".join(v) for k, v in buckets.items() if v}
+
+
+def _build_nsb_fields(lines) -> dict:
+    """NSB Online Banking 回执：三栏（Source / Receiver / Transaction Details）。
+
+    左列 Source/Receiver 与右列 Transaction 用 x 分界；Source 与 Receiver 之间用
+    分区标题的 y 分界。两栏同名 "Account No." 分别标记为 Source/Receiver 前缀。
+    """
+    ordered = _sorted_by_y(lines)
+    source_y = None
+    receiver_y = None
+    for ln in ordered:
+        t = ln.text.strip().lower()
+        if source_y is None and "source account details" in t:
+            source_y = _line_center_y(ln.box)
+        elif receiver_y is None and "receiver account details" in t:
+            receiver_y = _line_center_y(ln.box)
+
+    source_lines, receiver_lines, txn_lines = [], [], []
+    for ln in lines:
+        x = min(p[0] for p in ln.box)
+        y = _line_center_y(ln.box)
+        if x >= 560:
+            txn_lines.append(ln)
+        elif receiver_y is not None and y >= receiver_y:
+            receiver_lines.append(ln)
+        elif source_y is not None and y >= source_y:
+            source_lines.append(ln)
+
+    fields = _build_label_fields(txn_lines, _NSB_TXN_LABELS, same_row=True)
+
+    src = _build_label_fields(source_lines, _NSB_SOURCE_LABELS, same_row=True)
+    if src.get("Account No."):
+        fields["Source Account No."] = src["Account No."]
+    if src.get("Account Type"):
+        fields["Account Type"] = src["Account Type"]
+    if src.get("Transfer Type"):
+        fields["Transfer Type"] = src["Transfer Type"]
+
+    rcv = _build_label_fields(receiver_lines, _NSB_RECEIVER_LABELS, same_row=True)
+    if rcv.get("Account No."):
+        fields["Receiver Account No."] = rcv["Account No."]
+    for k, v in rcv.items():
+        if k != "Account No.":
+            fields[k] = v
+    return fields
 
 
 def _extract_ipay_parties(lines) -> tuple:
@@ -2337,6 +2413,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         fields = _build_peoples_pay_fields(lines, payer, payee)
     elif doc_type == "e_receipt":
         fields = _build_ereceipt_fields(lines)
+    elif bank == "nsb":
+        fields = _build_nsb_fields(lines)
     else:
         fields = _build_label_fields(lines, field_labels)
     # 金额小数点被 OCR 误读为冒号时还原（如 "2,500:00" → "2,500.00"）

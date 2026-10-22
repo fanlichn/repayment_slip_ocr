@@ -849,6 +849,78 @@ def test_peoples_bank_one_time_transfer():
     assert r.fields["Transfer Description"] == "pay"
 
 
+def test_nsb_online_banking():
+    """NSB Online Banking 回执：三栏（Source / Receiver / Transaction Details）。"""
+    L = _lr
+    lines = [
+        L("NSB Online Banking", 432, 148, 762, 184),
+        # Source Account Details（左栏）
+        L("Source Account Details", 75, 364, 382, 387),
+        L("Account No.", 68, 442, 204, 470),
+        L("107******815", 332, 440, 477, 470),
+        L("Account Type", 67, 488, 220, 522),
+        L("Savings Account", 336, 495, 517, 518),
+        L("Transfer Type", 66, 539, 220, 571),
+        L("CEFT", 334, 543, 409, 568),
+        # Receiver Account Details（中栏）
+        L("Receiver Account Details", 73, 847, 404, 870),
+        L("Account No.", 68, 915, 204, 943),
+        L("1001096962", 336, 918, 473, 941),
+        L("Beneficiary Name", 68, 966, 258, 990),
+        L("Lak Artha (pvt). Ltd", 338, 968, 540, 991),
+        L("Benefi. Bank Name", 70, 1018, 274, 1041),
+        L("Commercial Bank PLC", 338, 1018, 576, 1041),
+        L("Benefi. Branch Name", 70, 1068, 297, 1091),
+        L("Digital Branch", 338, 1068, 488, 1091),
+        L("Benefi. Account Type", 70, 1114, 300, 1144),
+        L("Savings Account", 336, 1119, 517, 1142),
+        # Transaction Details（右栏）
+        L("Transaction Reference", 571, 443, 814, 467),
+        L("IB7261584996", 872, 442, 1030, 465),
+        L("Transaction Date/Time", 571, 495, 812, 516),
+        L("2026-10-09 18:14:33", 872, 491, 1092, 515),
+        L("Transfer Amount", 571, 543, 752, 566),
+        L("Rs 10,000.00", 874, 543, 1021, 566),
+        L("Fee & Charges", 568, 589, 731, 621),
+        L("Rs 25.00", 874, 594, 978, 618),
+        L("Total Amount", 568, 639, 719, 671),
+        L("Rs 10,025.00", 874, 644, 1021, 667),
+        L("Transaction Type", 568, 691, 760, 721),
+        L("Thirdparty Account", 871, 691, 1078, 721),
+        L("Status", 567, 738, 645, 773),
+        L("Success", 871, 740, 974, 772),
+        L("Payment Type", 569, 794, 726, 822),
+        L("Immediate Payment", 872, 795, 1086, 819),
+        L("Beneficiary Reference", 571, 845, 807, 868),
+        L("20261009383976153", 874, 845, 1097, 868),
+        L("Transaction Purpose", 572, 946, 796, 968),
+        L("Loan Repayment", 872, 943, 1060, 971),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "nsb"
+    assert r.success is True
+    assert r.amount == 10000.0
+    assert r.fields["Transaction Reference"] == "IB7261584996"
+    assert r.fields["Transaction Date/Time"] == "2026-10-09 18:14:33"
+    assert r.fields["Transfer Amount"] == "Rs 10,000.00"
+    assert r.fields["Fee & Charges"] == "Rs 25.00"
+    assert r.fields["Total Amount"] == "Rs 10,025.00"
+    assert r.fields["Transaction Type"] == "Thirdparty Account"
+    assert r.fields["Status"] == "Success"
+    assert r.fields["Payment Type"] == "Immediate Payment"
+    assert r.fields["Beneficiary Reference"] == "20261009383976153"
+    assert r.fields["Transaction Purpose"] == "Loan Repayment"
+    assert r.fields["Source Account No."] == "107******815"
+    assert r.fields["Account Type"] == "Savings Account"
+    assert r.fields["Transfer Type"] == "CEFT"
+    assert r.fields["Receiver Account No."] == "1001096962"
+    assert r.fields["Beneficiary Name"] == "Lak Artha (pvt). Ltd"
+    assert r.fields["Benefi. Bank Name"] == "Commercial Bank PLC"
+    assert r.fields["Benefi. Branch Name"] == "Digital Branch"
+    assert r.fields["Benefi. Account Type"] == "Savings Account"
+
+
 def test_peoples_pay_two_column():
     """真实 People's Bank People's Pay 回执：左标右值两栏版式。
 

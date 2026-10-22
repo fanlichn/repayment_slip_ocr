@@ -2123,6 +2123,9 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         raw_dt = _find_datetime_raw(lines)
         if raw_dt:
             fields["Date & Time"] = raw_dt
+    # Remarks 兜底：结构化字段已提取但 fields 无 Remarks 时补上（如 People's Pay 占位标签下一行值）
+    if references.remarks and not any("remark" in k.lower() for k in fields):
+        fields["Remarks"] = references.remarks
 
     return RepaymentResult(
         success=success,

@@ -736,6 +736,7 @@ def test_peoples_pay_two_column():
     assert r.fields["Total debit amount (LKR)"] == "7,925.00"
     assert r.fields["Date & Time"] == "2026/10/08 12:02:53"
     assert r.fields["Trace No"] == "2026100800600901"
+    assert r.fields["Remarks"] == "loan"
 
 
 def test_boc_app_transaction_successful():

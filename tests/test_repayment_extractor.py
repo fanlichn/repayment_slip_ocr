@@ -658,6 +658,52 @@ def test_commercial_bank_e_receipt_two_column():
     assert r.fields["Status"] == "Completed"
 
 
+def test_commercial_bank_e_receipt_ocr_colon_amount():
+    """Commercial Bank e-Receipt：金额小数点被 OCR 误读为冒号（"2,500:00"），
+    且 Beneficiary's Account Currency 应纳入输出、Narration 不应串入后续字段值。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 14, x1, y + 14)
+    lines = [
+        L("e-Receipt", 133, 231, 390),
+        L("Transfer within ComBank", 352, 802, 400),
+        L("Bank Reference Number", 41, 326, 446),
+        L("O600072786183", 588, 800, 446),
+        L("Sender's Account Number", 40, 349, 496),
+        L("80******82", 587, 730, 496),
+        L("Sender's Name", 40, 219, 535),
+        L("MRN P C HN SANJEEWA ABERATHNE", 588, 1044, 535),
+        L("Transfer Amount", 43, 251, 574),
+        L("2,500:00", 588, 704, 574),
+        L("Transfer Currency", 41, 263, 610),
+        L("LKR", 586, 640, 610),
+        L("Beneficiary Name", 41, 251, 649),
+        L("LAK ARTHA SERVICES (PVT)LTD", 588, 963, 649),
+        L("Beneficiary's Account Currency", 41, 413, 688),
+        L("LKR", 586, 640, 688),
+        L("Beneficiary Account Number", 40, 384, 730),
+        L("1001096962", 588, 747, 730),
+        L("Beneficiary's Account Narration", 43, 418, 772),
+        L("Z5B379", 588, 672, 772),
+        L("Transaction Date/Time", 41, 320, 805),
+        L("21/10/202604.04AM", 588, 865, 805),
+        L("Payment Date", 43, 213, 847),
+        L("21-10-26", 584, 708, 847),
+        L("Status", 43, 124, 884),
+        L("Completed", 591, 727, 884),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "commercial_bank"
+    assert r.doc_type == "e_receipt"
+    assert r.amount == 2500.0
+    assert r.fields["Bank Reference Number"] == "O600072786183"
+    assert r.fields["Transfer Amount"] == "2,500.00"  # 冒号还原为小数点
+    assert r.fields["Beneficiary's Account Currency"] == "LKR"
+    assert r.fields["Beneficiary Account Number"] == "1001096962"
+    # 不串值：Narration 只应包含 Z5B379
+    assert r.fields["Beneficiary's Account Narration"] == "Z5B379"
+    assert r.fields["Status"] == "Completed"
+
+
 def test_sampath_vishwa_two_column_fields():
     """Sampath Vishwa 回执应返回图片原始字段名 -> 原文值映射。"""
     lines = [

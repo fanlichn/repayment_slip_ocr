@@ -1291,6 +1291,22 @@ def _parse_flexible_money(text: str) -> Optional[float]:
     return best_val
 
 
+def _normalize_money_text(value: str) -> str:
+    """OCR 常把金额小数点误读成冒号（如 "2,500:00"），还原为 "2,500.00"。"""
+    if not value:
+        return value
+    return re.sub(r"(\d):(\d{1,2})(?!\d)", r"\1.\2", value)
+
+
+def _normalize_money_fields(fields: dict) -> dict:
+    """对金额类字段的值做冒号→小数点归一化。"""
+    for k in list(fields.keys()):
+        kl = k.lower()
+        if any(w in kl for w in ("amount", "fee", "total", "debit", "charge")):
+            fields[k] = _normalize_money_text(fields[k])
+    return fields
+
+
 _LKR_FLEX_RE = re.compile(
     r"\blkr\b|l\.k\.r|1\.kr|lkr(?=\d)|\bkr\b",
     re.IGNORECASE,
@@ -1913,6 +1929,7 @@ _E_RECEIPT_LABELS = (
     "Transfer Amount",
     "Transfer Currency",
     "Beneficiary Name",
+    "Beneficiary's Account Currency",
     "Beneficiary Account Number",
     "Beneficiary's Account Narration",
     "Transaction Date/Time",
@@ -2051,28 +2068,26 @@ def _build_label_fields(lines, labels) -> dict:
     return fields
 
 
-_IPAY_LABEL_KEYS = {_norm_label(lbl): lbl for lbl in _IPAY_LABELS}
-
-
-def _ipay_label_buckets(lines) -> dict:
-    """iPay 回执为干净的两栏版式（左列标签 / 右列值，值可多行）。
+def _right_column_buckets(lines, labels) -> dict:
+    """两栏版式（左列标签 / 右列值，值可多行）通用归属。
 
     右列值行按其 y 中心与左列标签行的 y 中心做最近邻归属（阈值 80px），
-    从而把 "From" 下的姓名+银行、以及 "To" 下的银行+账号正确分到各自标签，
+    从而把多行值（如 iPay 的 "From" 下姓名+银行、"To" 下银行+账号）分到各自标签，
     避免通用 `_collect_column_block` 把所有右列行串进一个字段。
     """
+    label_keys = {_norm_label(lbl): lbl for lbl in labels}
     ordered = _sorted_by_y(lines)
     label_lines: list = []
     seen = set()
     for ln in ordered:
-        k = _IPAY_LABEL_KEYS.get(_norm_label(ln.text))
+        k = label_keys.get(_norm_label(ln.text))
         if k and k not in seen:
             seen.add(k)
             label_lines.append((k, ln))
     buckets = {k: {} for k, _ in label_lines}
     for ln in ordered:
         text = ln.text.strip()
-        if _norm_label(text) in _IPAY_LABEL_KEYS:
+        if _norm_label(text) in label_keys:
             continue  # 标签行本身不作为值
         ox = min(p[0] for p in ln.box)
         if ox < 400:
@@ -2103,12 +2118,17 @@ def _ipay_label_buckets(lines) -> dict:
 
 
 def _build_ipay_fields(lines) -> dict:
-    buckets = _ipay_label_buckets(lines)
+    buckets = _right_column_buckets(lines, _IPAY_LABELS)
+    return {k: " ".join(v) for k, v in buckets.items() if v}
+
+
+def _build_ereceipt_fields(lines) -> dict:
+    buckets = _right_column_buckets(lines, _E_RECEIPT_LABELS)
     return {k: " ".join(v) for k, v in buckets.items() if v}
 
 
 def _extract_ipay_parties(lines) -> tuple:
-    buckets = _ipay_label_buckets(lines)
+    buckets = _right_column_buckets(lines, _IPAY_LABELS)
     payer = PartyOut()
     payee = PartyOut()
 
@@ -2274,7 +2294,16 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     else:
         field_labels = _E_RECEIPT_LABELS
 
-    fields = _build_ipay_fields(lines) if bank == "ipay" else (_build_peoples_pay_fields(lines, payer, payee) if bank == "peoples_bank" else _build_label_fields(lines, field_labels))
+    if bank == "ipay":
+        fields = _build_ipay_fields(lines)
+    elif bank == "peoples_bank":
+        fields = _build_peoples_pay_fields(lines, payer, payee)
+    elif doc_type == "e_receipt":
+        fields = _build_ereceipt_fields(lines)
+    else:
+        fields = _build_label_fields(lines, field_labels)
+    # 金额小数点被 OCR 误读为冒号时还原（如 "2,500:00" → "2,500.00"）
+    fields = _normalize_money_fields(fields)
     # 时间无标签（如 BOC App 独立的 "10.08.2026 , 06:45 PM" 行）时，从 OCR 原文补 Date & Time
     if not any("date" in k.lower() or "time" in k.lower() for k in fields):
         raw_dt = _find_datetime_raw(lines)

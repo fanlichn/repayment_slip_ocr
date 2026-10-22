@@ -1384,6 +1384,19 @@ def _is_boc_app(lines) -> bool:
     return any(m in full for m in _BOC_APP_MARKERS)
 
 
+_BOC_FLEX_MARKERS = (
+    "flex online banking",
+    "sender a/c details",
+    "beneficiary a/c details",
+)
+
+
+def _is_boc_flex(lines) -> bool:
+    """BOC Flex 网页版转账回执（Transaction Details / A/C Details 分区）。"""
+    full = " ".join(ln.text for ln in lines).lower()
+    return any(m in full for m in _BOC_FLEX_MARKERS)
+
+
 _CDM_MARKERS = ("cardless deposit",)
 
 
@@ -1899,6 +1912,21 @@ _SAMPATH_VISHWA_LABELS = (
     "Destination Bank",
 )
 
+_BOC_FLEX_LABELS = (
+    "Transaction Amount",
+    "Transaction Date & Time",
+    "Transaction ID",
+    "Charges & Fee",
+    "Remarks",
+    "Transaction Status",
+    "Account Number",
+    "Sender's Name",
+    "Sender's Bank",
+    "Account No",
+    "Beneficiary Name",
+    "Beneficiary Bank",
+)
+
 
 def _norm_label(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
@@ -2020,6 +2048,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
 
     if _is_boc_app(lines):
         field_labels = _BOC_APP_LABELS
+    elif _is_boc_flex(lines):
+        field_labels = _BOC_FLEX_LABELS
     elif bank == "vishwa":
         field_labels = _SAMPATH_VISHWA_LABELS
     elif bank == "peoples_bank":

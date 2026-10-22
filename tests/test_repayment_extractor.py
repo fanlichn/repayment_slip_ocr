@@ -789,6 +789,46 @@ def test_boc_app_transaction_successful():
     assert r.fields["Total Amount"] == "LKR 6,040.00"
 
 
+def test_boc_flex_fund_transfer():
+    """BOC Flex 网页版转账回执：Transaction Details + Sender/Beneficiary A/C Details 分区，
+    单行 "Label : Value" 格式，应完整提取所有字段（含两个不同的 Account Number / Account No）。"""
+    rows = [
+        ("BOC", 40),
+        ("Flex Online Banking", 80),
+        ("Fund Transfer", 120),
+        ("Transaction Details", 160),
+        ("Transaction Amount : LKR 5,700.00", 200),
+        ("Transaction Date & Time : 09-10-2026 01:47 PM", 240),
+        ("Transaction ID : FX10858294700000", 280),
+        ("Charges & Fee : LKR 25.00", 320),
+        ("Remarks : sss", 360),
+        ("Transaction Status : SUCCESS", 400),
+        ("Sender A/C Details", 440),
+        ("Account Number : **3943", 480),
+        ("Sender's Name : MR A MEVIN", 520),
+        ("Sender's Bank : Bank of Ceylon", 560),
+        ("Beneficiary A/C Details", 600),
+        ("Account No : 1001096962", 640),
+        ("Beneficiary Name : Lakartha", 680),
+        ("Beneficiary Bank : Commercial Bank", 720),
+    ]
+    r = extract(_make(rows))
+
+    assert r.bank == "boc"
+    assert r.fields["Transaction Amount"] == "LKR 5,700.00"
+    assert r.fields["Transaction Date & Time"] == "09-10-2026 01:47 PM"
+    assert r.fields["Transaction ID"] == "FX10858294700000"
+    assert r.fields["Charges & Fee"] == "LKR 25.00"
+    assert r.fields["Remarks"] == "sss"
+    assert r.fields["Transaction Status"] == "SUCCESS"
+    assert r.fields["Account Number"] == "**3943"
+    assert r.fields["Sender's Name"] == "MR A MEVIN"
+    assert r.fields["Sender's Bank"] == "Bank of Ceylon"
+    assert r.fields["Account No"] == "1001096962"
+    assert r.fields["Beneficiary Name"] == "Lakartha"
+    assert r.fields["Beneficiary Bank"] == "Commercial Bank"
+
+
 def test_commercial_bank_to_only_transfer_successful():
     """Commercial Bank 手机 App「转账成功」回执：仅收款方（To）、无付款方区。
 

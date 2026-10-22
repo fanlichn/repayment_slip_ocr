@@ -1967,6 +1967,20 @@ _CDM_LABELS = (
     "TRACE",
 )
 
+_LB_FINANCE_LABELS = (
+    "From",
+    "From Bank",
+    "From Account",
+    "To Bank",
+    "To Account",
+    "Beneficiary Name",
+    "Amount",
+    "Remarks",
+    "Transaction Date & Time",
+    "Reference No.",
+    "Status",
+)
+
 
 def _norm_label(s: str) -> str:
     """标签归一化：去非字母数字，并还原常见 OCR 字母数字混淆（0→O、1→I）。"""
@@ -2147,6 +2161,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         field_labels = _PEOPLES_BANK_LABELS
     elif _is_cash_deposit(lines):
         field_labels = _CDM_LABELS
+    elif bank == "lb_finance":
+        field_labels = _LB_FINANCE_LABELS
     else:
         field_labels = _E_RECEIPT_LABELS
 

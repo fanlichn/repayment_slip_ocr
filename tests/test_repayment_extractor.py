@@ -987,6 +987,47 @@ def test_lb_finance_fund_transfer_acknowledgement():
     assert r.references.remarks == "Pradeep"
 
 
+def test_lb_finance_field_labels():
+    """LB Finance 回执：两栏布局（label 左、value 右带冒号前缀）应完整提取所有字段。"""
+    lines = [
+        _lr("From", 100, 995, 191, 1042),
+        _lr(": D M P Madushanka.", 510, 1001, 835, 1036),
+        _lr("From Bank", 102, 1041, 275, 1076),
+        _lr(": LB Finance PLC", 510, 1041, 788, 1076),
+        _lr("From Account", 102, 1081, 322, 1117),
+        _lr(": XXXX XXXX 2851", 510, 1081, 810, 1117),
+        _lr("To Bank", 101, 1116, 238, 1160),
+        _lr(": Commercial Bank.", 510, 1122, 805, 1157),
+        _lr("To Account", 101, 1154, 283, 1198),
+        _lr(": 1001096962", 508, 1162, 728, 1195),
+        _lr("Beneficiary Name", 98, 1195, 378, 1240),
+        _lr(": Lak Artha Pvt", 510, 1200, 742, 1235),
+        _lr("Amount", 98, 1238, 232, 1281),
+        _lr(": 5,555.00 LKR", 510, 1240, 745, 1276),
+        _lr("Remarks", 100, 1281, 242, 1316),
+        _lr(": Pradeep", 508, 1278, 665, 1319),
+        _lr("Transaction Date & Time : 09/10/2026 09.42 AM", 102, 1318, 862, 1354),
+        _lr("Reference No.", 101, 1353, 328, 1397),
+        _lr(": 0056146132", 510, 1359, 728, 1394),
+        _lr("Status", 102, 1393, 208, 1438),
+        _lr(": Successfu!", 508, 1397, 702, 1432),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "lb_finance"
+    assert r.fields["From"] == "D M P Madushanka"
+    assert r.fields["From Bank"] == "LB Finance PLC"
+    assert r.fields["From Account"] == "XXXX XXXX 2851"
+    assert r.fields["To Bank"] == "Commercial Bank"
+    assert r.fields["To Account"] == "1001096962"
+    assert r.fields["Beneficiary Name"] == "Lak Artha Pvt"
+    assert r.fields["Amount"] == "5,555.00 LKR"
+    assert r.fields["Remarks"] == "Pradeep"
+    assert r.fields["Reference No."] == "0056146132"
+    assert r.fields["Status"] == "Successfu!"
+    assert r.fields["Transaction Date & Time"] == "09/10/2026 09.42 AM"
+
+
 def test_commercial_bank_cash_credit_slip():
     """Commercial Bank 纸质现金存款凭条（CASH CREDIT SLIP）。
 

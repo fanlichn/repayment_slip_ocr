@@ -1989,6 +1989,7 @@ _E_RECEIPT_LABELS = (
     "Beneficiary Name",
     "Beneficiary's Account Currency",
     "Beneficiary Account Number",
+    "Beneficiary's Account Number",
     "Beneficiary's Account Narration",
     "Transaction Date/Time",
     "Payment Date",

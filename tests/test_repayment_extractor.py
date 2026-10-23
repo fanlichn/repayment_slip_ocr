@@ -730,6 +730,19 @@ def test_commercial_bank_e_receipt_dedup_ocr_variants():
     assert r.fields["Status"] == "Completed"
 
 
+def test_commercial_bank_e_receipt_apostrophe_account():
+    """ComBank e-Receipt：'Beneficiary's Account Number'（带撇号 s）应识别账号。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 14, x1, y + 14)
+    lines = [
+        L("e-Receipt", 133, 231, 390),
+        L("Beneficiary's Account Number", 134, 1369, 1504),
+        L("1001096962", 1986, 2490, 1504),
+    ]
+    r = extract(lines)
+    assert r.bank == "commercial_bank"
+    assert r.fields["Beneficiary's Account Number"] == "1001096962"
+
+
 def test_sampath_vishwa_two_column_fields():
     """Sampath Vishwa 回执应返回图片原始字段名 -> 原文值映射。"""
     lines = [

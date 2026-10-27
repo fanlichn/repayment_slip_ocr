@@ -565,6 +565,13 @@ def test_parse_denomination_rejects_ocr_noise():
     assert _parse_denomination("LKR 1,000.00") == 1000.0
 
 
+def test_parse_datetime_mm_dd_fallback():
+    """美式 MM/DD 日期（如 "10.27.2026"）在 DD/MM 解析失败时应兜底解析。"""
+    from repayment_slip_ocr.extractor import _parse_datetime
+    assert _parse_datetime("10.27.2026 , 01:38 PM") == "2026-10-27T13:38:00"
+    assert _parse_datetime("10.08.2026 , 06:45 PM") == "2026-08-10T18:45:00"  # 仍按 DD/MM
+
+
 def test_app_loan_page_is_rejected():
     """还款 App 的「发起还款」页面不是银行凭证，应返回 success=false。"""
     rows = [

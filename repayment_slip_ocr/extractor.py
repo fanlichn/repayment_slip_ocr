@@ -858,6 +858,15 @@ def _parse_datetime(s: str) -> Optional[str]:
         "%d-%m-%y %H:%M:%S",
         "%Y/%m/%d",
         "%Y-%m-%d",
+        # MM/DD 美式日期兜底（如 "10/27/2026"）：仅当上面的 DD/MM 解析失败（月 > 12）时命中
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m-%d-%Y %I:%M:%S %p",
+        "%m/%d/%Y %I:%M %p",
+        "%m-%d-%Y %I:%M %p",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%m/%d/%y",
+        "%m-%d-%y",
     ]
     for fmt in formats:
         try:

@@ -109,6 +109,20 @@ def _line_center_x(box) -> float:
     return sum(xs) / len(xs)
 
 
+def _is_rotated_box(box) -> bool:
+    """检测非水平/垂直的旋转文本框（如截图上的斜向水印、批注）。
+
+    正常文本四边分别接近水平/垂直，斜向文本顶边两点 y 差（或侧边 x 差）明显偏大。
+    """
+    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = box
+    return (
+        abs(y0 - y1) > 25.0
+        or abs(y2 - y3) > 25.0
+        or abs(x0 - x3) > 25.0
+        or abs(x1 - x2) > 25.0
+    )
+
+
 def _sorted_by_y(lines) -> List:
     return sorted(lines, key=lambda l: _line_center_y(l.box))
 
@@ -2326,6 +2340,9 @@ def _extract_branch(lines) -> Optional[str]:
 
 def extract(lines, include_lines: bool = False) -> RepaymentResult:
     warnings: List[str] = []
+
+    # 先剔除旋转文本框（截图上的斜向水印/批注），避免其大范围 box 抢占字段值
+    lines = [ln for ln in lines if not _is_rotated_box(ln.box)]
 
     full_text = " ".join(ln.text for ln in lines)
 

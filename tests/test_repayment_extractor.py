@@ -1006,6 +1006,51 @@ def test_peoples_pay_two_column():
     assert r.fields["Remarks"] == "loan"
 
 
+def test_boc_app_rotated_watermark_filtered():
+    """BOC App 回执带斜向水印（如 "-Huyanmin (324)"），不应抢占字段值。"""
+    L = lambda txt, x0, x1, y0, y1: OcrLine(
+        text=txt, confidence=0.9, box=[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    )
+    lines = [
+        L("Transaction Successful", 502, 971, 114, 165),
+        L("Account Information", 58, 402, 521, 562),
+        L("Transaction Type", 53, 355, 802, 856),
+        L("CASA Transfer", 849, 1111, 813, 864),
+        L("Account Number", 53, 344, 876, 925),
+        L("1001098982", 892, 1107, 889, 931),
+        L("Transfer bank", 51, 292, 946, 993),
+        L("Commercial Bank Of Ceylon", 617, 1109, 954, 1005),
+        L("Reference/Remarks", 51, 396, 1074, 1126),
+        L("J9V2VX", 965, 1108, 1092, 1130),
+        L("Amount", 45, 190, 1258, 1310),
+        L("LKR 5,000.00", 863, 1102, 1273, 1318),
+        L("Other Charges", 46, 304, 1345, 1394),
+        L("Fund Transfer/Card", 44, 384, 1414, 1464),
+        L("LKR 20", 967, 1104, 1423, 1467),
+        L("Settlement Service Charge", 46, 504, 1476, 1527),
+        L("Total Amount", 42, 282, 1541, 1590),
+        L("LKR 5,020.00", 857, 1100, 1556, 1603),
+        # 斜向水印（旋转框）
+        OcrLine(text="-Huyanmin (324)", confidence=0.9,
+                box=[[368.0, 883.0], [666.0, 777.0], [681.0, 821.0], [384.0, 927.0]]),
+        OcrLine(text="uyaomin (324)", confidence=0.9,
+                box=[[387.0, 1421.0], [662.0, 1324.0], [677.0, 1368.0], [402.0, 1465.0]]),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "boc"
+    assert r.fields["Transaction Type"] == "CASA Transfer"
+    assert r.fields["Account Number"] == "1001098982"
+    assert r.fields["Transfer bank"] == "Commercial Bank Of Ceylon"
+    assert r.fields["Reference/Remarks"] == "J9V2VX"
+    assert r.fields["Amount"] == "LKR 5,000.00"
+    assert r.fields["Other Charges"] == "LKR 20"
+    assert r.fields["Total Amount"] == "LKR 5,020.00"
+    assert r.amount == 5000.0
+    assert r.fee == 20.0
+    assert r.total_debit == 5020.0
+
+
 def test_boc_app_transaction_successful():
     """真实 BOC 手机银行 Transaction Successful 回执：Account Information 卡片两栏版式。
 

@@ -330,6 +330,38 @@ def test_cdm_datetime_split_lines():
     assert r.payee.name == "Lak Artha (Pvt) Ltd"
 
 
+def test_cdm_date_time_terminal_header_fields():
+    """CDM 凭条：DATE/TIME/TERMINAL ID 为并排表头、值在各自下方，应分别提取。"""
+    lines = [
+        _lr("DATE", 416, 493, 521, 541),
+        _lr("30/10/26", 421, 546, 612, 586),
+        _lr("TIME", 702, 497, 806, 546),
+        _lr("09:28", 702, 546, 828, 592),
+        _lr("TERMINAL ID", 962, 499, 1221, 555),
+        _lr("RAKKARA1HT", 962, 545, 1199, 602),
+        _lr("TRACE", 416, 632, 543, 681),
+        _lr("1480", 702, 632, 806, 683),
+        _lr("TRANSACTION", 421, 774, 684, 812),
+        _lr(": CARDLESS DEPOSIT", 743, 774, 1173, 817),
+        _lr("ACCOUNT NUMBER: 1001096962", 414, 859, 1035, 908),
+        _lr("CUSTOMER NAME :LAK ARTHA SERVICES", 414, 954, 1199, 999),
+        _lr("SOURCE OF FUNDS:UNKNOWN", 408, 1331, 965, 1369),
+        _lr("DEPOSIT AMOUNT:", 394, 1809, 762, 1843),
+        _lr("LKR", 856, 1797, 944, 1846),
+        _lr("7,900.00", 1100, 1793, 1298, 1835),
+        _lr("TRANSACTION STATUS : SUCCESSFUL", 473, 1900, 1220, 1926),
+    ]
+    r = extract(lines)
+
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.terminal_id == "RAKKARA1HT"
+    assert r.trace_no == "1480"
+    assert r.datetime == "2026-10-30T09:28:00"
+    assert r.fields["TERMINAL ID"] == "RAKKARA1HT"
+    assert r.fields["TIME"] == "09:28"
+    assert r.fields["DATE"] == "2026-10-30 00:00:00"
+
+
 def test_cdm_amount_with_notes_header():
     """CDM 凭条：含 NOTES VALUE AMOUNT 表头行，不应取错金额。"""
     rows = [

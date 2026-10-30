@@ -2066,6 +2066,9 @@ _CDM_LABELS = (
     "DEPOSIT AMOUNT",
     "TRANSACTION STATUS",
     "TRACE",
+    "DATE",
+    "TIME",
+    "TERMINAL ID",
 )
 
 _LB_FINANCE_LABELS = (
@@ -2119,8 +2122,12 @@ def _build_label_fields(lines, labels, same_row: bool = False) -> dict:
         if key is None or key in fields:
             continue
         side_line = _value_line_to_right(i, ordered, ln)
+        if side_line is not None and _norm_label(side_line.text) in wanted:
+            side_line = None  # 右侧是相邻标签（如 DATE/TIME/TERMINAL ID 表头），非值
         if side_line is None and not same_row:
             side_line = _right_column_line(i, ordered, ln)
+            if side_line is not None and _norm_label(side_line.text) in wanted:
+                side_line = None
         if side_line is not None:
             side_value = _collect_column_block(ordered, side_line)
             # 跳过标签词（如面额表表头 "AMOUNT"）

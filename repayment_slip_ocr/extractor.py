@@ -3695,8 +3695,14 @@ def _recover_cdm_account_number(lines) -> Optional[str]:
     best = None
     for ln in ordered:
         cy = _line_center_y(ln.box)
-        # 竖排时 TRANSACTION/NARRATION 的 y 几乎重叠，放宽带状过滤
-        if y0 is not None and y1 is not None and abs(y1 - y0) > 80:
+        has_acct_label = bool(re.search(r"(?i)account", ln.text))
+        # 带 ACCOUNT 标签的行不按 y 带过滤（复检框偏移时仍可回收）
+        if (
+            not has_acct_label
+            and y0 is not None
+            and y1 is not None
+            and abs(y1 - y0) > 80
+        ):
             if cy < min(y0, y1) - 40 or cy > max(y0, y1) + 40:
                 continue
         conf = float(getattr(ln, "confidence", 0.0) or 0.0)
@@ -3707,7 +3713,7 @@ def _recover_cdm_account_number(lines) -> Optional[str]:
             score = _account_candidate_score(acct, conf)
             if best is None or score > best[0]:
                 best = (score, acct)
-        if re.search(r"(?i)account", ln.text):
+        if has_acct_label:
             tok = _account_token(_value_after_label(ln.text, "account number") or "")
             if not tok:
                 tok = _account_token(ln.text)

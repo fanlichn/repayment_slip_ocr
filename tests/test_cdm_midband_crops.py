@@ -8,9 +8,12 @@ from repayment_slip_ocr.main import (
     _anchor_scale_y,
     _cdm_account_digits_weak,
     _has_cdm_deposit_amount_text,
+    _pad_crop_for_ocr,
     _prepare_cdm_amount_band_crops,
     _prepare_cdm_band_crops,
     _prepare_cdm_header_band_crops,
+    _priority_cdm_amount_crops,
+    _priority_cdm_party_crops,
 )
 
 
@@ -139,3 +142,18 @@ def test_nawalapi_sparse_crops_cover_party_amount_terminal():
     assert _has_cdm_deposit_amount_text(
         [_lr("11,400.00", 1700, 3344, 2100, 3376), _lr("10,000.00", 1813, 3023, 2160, 3112)]
     )
+
+    # 优先中高裁须覆盖账号带与右列总额（Paddle 细条无边距易漏）
+    pri_party = _priority_cdm_party_crops(img, lines)
+    assert pri_party
+    assert any(top <= 2000 <= top + crop.shape[0] for crop, top, _ in pri_party)
+    assert pri_party[0][0].shape[0] >= 400
+    pri_amt = _priority_cdm_amount_crops(img, lines)
+    assert pri_amt
+    assert any(
+        top <= 3350 <= top + crop.shape[0] and left <= 1900 <= left + crop.shape[1]
+        for crop, top, left in pri_amt
+    )
+    padded, top2, left2 = _pad_crop_for_ocr(pri_party[0][0], pri_party[0][1], pri_party[0][2], pad=24)
+    assert padded.shape[0] == pri_party[0][0].shape[0] + 48
+    assert top2 == pri_party[0][1] - 24

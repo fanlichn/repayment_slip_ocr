@@ -483,24 +483,24 @@ def _prepare_cdm_amount_band_crops(img: np.ndarray, lines: List[OcrLine]) -> Lis
             "status",
         ],
     )
-    # AMOUNT 列表头 x：专裁右列（400 / 1,000 / 10,000 / 11,400）
+    # AMOUNT 列表头左缘：专裁右列（400 / 1,000 / 10,000 / 11,400）
     amount_xs = []
     notes_ys = []
     lkr_ys = []
     for ln in lines:
         low = ln.text.strip().lower()
         cy = _line_center_y(ln.box)
-        cx = _line_center_x(ln.box)
         if low.rstrip(":.") == "amount" or low.startswith("amount"):
-            amount_xs.append(cx)
+            amount_xs.append(min(p[0] for p in ln.box))
         if _looks_like_notes_header_text(low) or low.startswith("value"):
             notes_ys.append(cy)
         if re.fullmatch(r"lkr", low) and cy > h * 0.55:
             lkr_ys.append(cy)
             amount_xs.append(min(p[0] for p in ln.box))
 
-    col_x0 = int(min(amount_xs) - 80) if amount_xs else int(w * 0.50)
-    col_x0 = max(rx0, min(col_x0, int(w * 0.70)))
+    # 总额数字比 AMOUNT 表头更靠左，少裁会只剩 ".00"
+    col_x0 = int(min(amount_xs) - 220) if amount_xs else int(w * 0.42)
+    col_x0 = max(rx0, min(col_x0, int(w * 0.55)))
     y_notes = min(notes_ys) if notes_ys else h * 0.65
     y_lkr = max(lkr_ys) if lkr_ys else h * 0.82
 
@@ -584,7 +584,8 @@ def _prepare_cdm_header_band_crops(img: np.ndarray, lines: List[OcrLine]) -> Lis
     return out
 
 
-def _cdm_band_prep_variants(crop_img: np.ndarray) -> List[np.ndarray]:
+def _cdm_band_prep_variants(crop_img: np.ndarray, heavy: bool = False) -> List[np.ndarray]:
+    """复检预处理。默认轻量（原图+CLAHE+锐化）；heavy 才上二值，避免上百次空跑。"""
     out = [crop_img]
     if len(crop_img.shape) == 3:
         gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
@@ -593,14 +594,13 @@ def _cdm_band_prep_variants(crop_img: np.ndarray) -> List[np.ndarray]:
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     out.append(enhanced)
-    # 锐化：热敏点阵在细条带上更易出框
     blur = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
     sharp = cv2.addWeighted(enhanced, 1.6, blur, -0.6, 0)
     out.append(sharp)
-    # 折痕断裂：横向闭运算把断开笔画粘回（ACCOUNT / 11,400）
     h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
-    closed = cv2.morphologyEx(sharp, cv2.MORPH_CLOSE, h_kernel, iterations=1)
-    out.append(closed)
+    out.append(cv2.morphologyEx(sharp, cv2.MORPH_CLOSE, h_kernel, iterations=1))
+    if not heavy:
+        return out
     binary = cv2.adaptiveThreshold(
         enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
     )
@@ -610,65 +610,161 @@ def _cdm_band_prep_variants(crop_img: np.ndarray) -> List[np.ndarray]:
     out.append(otsu)
     kernel = np.ones((2, 2), np.uint8)
     out.append(cv2.dilate(binary, kernel, iterations=1))
-    out.append(cv2.dilate(otsu, kernel, iterations=1))
     out.append(cv2.bitwise_not(binary))
     return out
 
 
-def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
-    """对 CDM 的 TRANSACTION~NARRATION 中间带二次 OCR，补账号/户名。
+def _pad_crop_for_ocr(
+    crop_img: np.ndarray, top: float, left: float, pad: int = 24
+) -> tuple:
+    """Paddle 检测器对无边距细条常漏字；白边 padding 后偏移回推。"""
+    if crop_img is None or crop_img.size == 0:
+        return crop_img, top, left
+    if len(crop_img.shape) == 3:
+        value = (255, 255, 255)
+    else:
+        value = 255
+    padded = cv2.copyMakeBorder(
+        crop_img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=value
+    )
+    return padded, float(top) - pad, float(left) - pad
 
-    细条带优先 + CLAHE/锐化/二值/加粗 + 放大：热敏字细、宽幅裁常整段漏 ACCOUNT 行。
-    """
+
+def _run_cdm_band_ocr(
+    engine,
+    crop_img: np.ndarray,
+    top: float,
+    left: float,
+    scales: tuple,
+    heavy: bool = False,
+) -> List[OcrLine]:
     found: List[OcrLine] = []
-
-    def _run(crop_img: np.ndarray, top: float, left: float, scale: float) -> List[OcrLine]:
-        work = crop_img
-        if scale != 1.0:
-            work = cv2.resize(
-                crop_img,
-                None,
-                fx=scale,
-                fy=scale,
-                interpolation=cv2.INTER_CUBIC,
+    crop_img, top, left = _pad_crop_for_ocr(crop_img, top, left)
+    for prep in _cdm_band_prep_variants(crop_img, heavy=heavy):
+        for scale in scales:
+            work = prep
+            if scale != 1.0:
+                work = cv2.resize(
+                    prep, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+                )
+            raw = engine.recognize(work)
+            found = dedup_lines(
+                found + _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
             )
-        raw = engine.recognize(work)
-        return _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
+    return found
 
-    crops = _prepare_cdm_band_crops(img, lines)
-    for crop, top, left in crops:
-        # 细条（高<220）优先用更大倍率
-        thin = crop.shape[0] < 220
-        scales = (2.0, 2.5, 3.0, 3.5) if thin else (1.0, 2.0, 2.5, 3.0)
-        for prep in _cdm_band_prep_variants(crop):
-            for scale in scales:
-                found = dedup_lines(found + _run(prep, top, left, scale))
-                if _has_strong_cdm_account(found):
-                    return found
+
+def _priority_cdm_party_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    """优先中高裁：TRANSACTION→NOTES 整段（诊断 party_mid），Paddle 需要上下文。"""
+    h, w = img.shape[:2]
+    rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
+    party_x1 = min(rx1, max(rx0 + int((rx1 - rx0) * 0.82), int(w * 0.65)))
+    y_txn = min(_anchor_ys(lines, ["transaction", "cardless", "trace"]), default=h * 0.35)
+    y_notes = min(_anchor_ys(lines, ["notes", "hotes", "value"]), default=h * 0.70)
+    y0 = max(0, int(y_txn - 20))
+    y1 = min(h, int(y_notes + 10))
+    out: List[tuple] = []
+    if y1 - y0 >= 80:
+        # 整段 + 上半（ACCOUNT/CUSTOMER 常在 TRANSACTION 下 0–55%）
+        for ya, yb in (
+            (y0, y1),
+            (y0, y0 + int((y1 - y0) * 0.55)),
+            (y0 + int((y1 - y0) * 0.15), y0 + int((y1 - y0) * 0.70)),
+        ):
+            crop = img[ya:yb, rx0:party_x1]
+            if crop.size:
+                out.append((crop, float(ya), float(rx0)))
+    return out
+
+
+def _priority_cdm_amount_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    """优先右列 AMOUNT + 底部 LKR 总额（诊断 notes_right / amt_lkr）。
+
+    注意：11,400 / 10,000 左缘常比 AMOUNT 表头更靠左，col 起点须再左移。
+    """
+    h, w = img.shape[:2]
+    rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
+    y_notes = min(_anchor_ys(lines, ["notes", "hotes", "value", "amount"]), default=h * 0.65)
+    amount_lefts = [
+        min(p[0] for p in ln.box)
+        for ln in lines
+        if ln.text.strip().lower().rstrip(":.").startswith("amount")
+    ]
+    # 表头左缘再左偏，避免裁掉 10,000 / 11,400 千位
+    col_x0 = int(min(amount_lefts) - 220) if amount_lefts else int(w * 0.42)
+    col_x0 = max(rx0, min(col_x0, int(w * 0.55)))
+    y0 = max(0, int(y_notes - 30))
+    out: List[tuple] = []
+    for ya, yb, xa in (
+        (y0, h, col_x0),
+        (y0, min(h, y0 + int(h * 0.28)), col_x0),
+        (int(h * 0.70), h, max(rx0, int(w * 0.32))),
+        (int(h * 0.78), h, max(rx0, col_x0 - 120)),
+        (int(h * 0.78), h, max(rx0, int(w * 0.38))),
+    ):
+        top, bottom = max(0, ya), min(h, yb)
+        left = max(0, xa)
+        if bottom - top < 40:
+            continue
+        crop = img[top:bottom, left:rx1]
+        if crop.size:
+            out.append((crop, float(top), float(left)))
+    return out
+
+
+def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
+    """对 CDM 的 TRANSACTION~NARRATION 中间带二次 OCR，补账号/户名。"""
+    found: List[OcrLine] = []
+    # 1) 中高优先裁 + 轻量预处理（原先细条×重预处理把账号跑丢且极慢）
+    for crop, top, left in _priority_cdm_party_crops(img, lines):
+        found = dedup_lines(
+            found + _run_cdm_band_ocr(engine, crop, top, left, (1.5, 2.0, 2.5))
+        )
+        if _has_strong_cdm_account(found):
+            return found
+    # 2) 细条/宽窗兜底，仍限轻量
+    for crop, top, left in _prepare_cdm_band_crops(img, lines)[:10]:
+        scales = (2.0, 2.5) if crop.shape[0] < 220 else (1.5, 2.0)
+        found = dedup_lines(
+            found + _run_cdm_band_ocr(engine, crop, top, left, scales)
+        )
+        if _has_strong_cdm_account(found):
+            return found
+    # 3) 仍无账号时对优先裁加重预处理一次
+    if not _has_strong_cdm_account(found):
+        for crop, top, left in _priority_cdm_party_crops(img, lines)[:2]:
+            found = dedup_lines(
+                found
+                + _run_cdm_band_ocr(engine, crop, top, left, (2.0, 2.5), heavy=True)
+            )
+            if _has_strong_cdm_account(found):
+                return found
     return found
 
 
 def _ocr_cdm_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     """复检 CDM DEPOSIT AMOUNT / 面额表区域。"""
     found: List[OcrLine] = []
-
-    def _run(crop_img: np.ndarray, top: float, left: float, scale: float) -> List[OcrLine]:
-        work = crop_img
-        if scale != 1.0:
-            work = cv2.resize(
-                crop_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+    for crop, top, left in _priority_cdm_amount_crops(img, lines):
+        found = dedup_lines(
+            found + _run_cdm_band_ocr(engine, crop, top, left, (1.5, 2.0, 2.5))
+        )
+        if _has_cdm_deposit_amount_text(found):
+            return found
+    for crop, top, left in _prepare_cdm_amount_band_crops(img, lines)[:8]:
+        found = dedup_lines(
+            found + _run_cdm_band_ocr(engine, crop, top, left, (2.0, 2.5))
+        )
+        if _has_cdm_deposit_amount_text(found):
+            return found
+    if not _has_cdm_deposit_amount_text(found):
+        for crop, top, left in _priority_cdm_amount_crops(img, lines)[:2]:
+            found = dedup_lines(
+                found
+                + _run_cdm_band_ocr(engine, crop, top, left, (2.0, 2.5), heavy=True)
             )
-        raw = engine.recognize(work)
-        return _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
-
-    for crop, top, left in _prepare_cdm_amount_band_crops(img, lines):
-        thin = crop.shape[0] < 180
-        scales = (2.0, 2.5, 3.0, 3.5) if thin else (1.5, 2.0, 2.5, 3.0)
-        for prep in _cdm_band_prep_variants(crop):
-            for scale in scales:
-                found = dedup_lines(found + _run(prep, top, left, scale))
-                if _has_cdm_deposit_amount_text(found):
-                    return found
+            if _has_cdm_deposit_amount_text(found):
+                return found
     return found
 
 
@@ -685,24 +781,12 @@ def _has_cdm_terminal_text(lines: List[OcrLine]) -> bool:
 def _ocr_cdm_header_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     """复检 TERMINAL ID / BRANCH。"""
     found: List[OcrLine] = []
-
-    def _run(crop_img: np.ndarray, top: float, left: float, scale: float) -> List[OcrLine]:
-        work = crop_img
-        if scale != 1.0:
-            work = cv2.resize(
-                crop_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
-            )
-        raw = engine.recognize(work)
-        return _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
-
-    for crop, top, left in _prepare_cdm_header_band_crops(img, lines):
-        for prep in _cdm_band_prep_variants(crop):
-            for scale in (1.5, 2.0, 2.5, 3.0):
-                found = dedup_lines(found + _run(prep, top, left, scale))
-                if _has_cdm_terminal_text(found) and any(
-                    re.search(r"(?i)\bbr\b", ln.text) for ln in found
-                ):
-                    return found
+    for crop, top, left in _prepare_cdm_header_band_crops(img, lines)[:6]:
+        found = dedup_lines(
+            found + _run_cdm_band_ocr(engine, crop, top, left, (1.5, 2.0, 2.5))
+        )
+        if _has_cdm_terminal_text(found):
+            return found
     return found
 
 
@@ -963,11 +1047,12 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     unique = dedup_lines(lines)
 
     result = extract(unique, include_lines=False)
+    # CDM 复检只用未纠偏原图：框坐标来自多 variant 混合，套到 rotate 后的 color 会裁空
+    _cdm_band_variants = ("color_raw", "enhanced")
     # CDM 中间段（ACCOUNT/CUSTOMER）易被拇指/倾角/合成截图漏检或截断：对中间带复检
     if _cdm_missing_party_fields(result):
-        # 先未纠偏原图，再 enhanced；纠偏色图常把中间行读丢
         extras: List[OcrLine] = []
-        for name in ("color_raw", "enhanced", "color"):
+        for name in _cdm_band_variants:
             extras.extend(_ocr_cdm_party_band(_engine, _variant_img(variants, name), unique))
             probe = dedup_lines(unique + extras)
             probe_result = extract(probe, include_lines=False)
@@ -984,7 +1069,7 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     # CDM DEPOSIT AMOUNT：远距/竖排常漏总额，对金额带复检
     if _cdm_missing_deposit_amount(result):
         extras = []
-        for name in ("color_raw", "enhanced", "color"):
+        for name in _cdm_band_variants:
             extras.extend(_ocr_cdm_amount_band(_engine, _variant_img(variants, name), unique))
             probe = dedup_lines(unique + extras)
             probe_result = extract(probe, include_lines=False)
@@ -999,7 +1084,7 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     # CDM TERMINAL ID / BRANCH：并排表头右侧与网点行常漏
     if _cdm_missing_header_fields(result):
         extras = []
-        for name in ("color_raw", "enhanced", "color"):
+        for name in _cdm_band_variants:
             extras.extend(_ocr_cdm_header_band(_engine, _variant_img(variants, name), unique))
             probe = dedup_lines(unique + extras)
             probe_result = extract(probe, include_lines=False)

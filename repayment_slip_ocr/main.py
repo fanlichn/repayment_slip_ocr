@@ -23,7 +23,7 @@ from app.ocr_engine import OcrLine, create_engine
 from app.preprocessing import build_variants, load_image
 from app.url_fetch import UrlFetchError, fetch_image_bytes
 
-from .extractor import dedup_lines, extract
+from .extractor import _parse_money, dedup_lines, extract
 
 setup_logging("repayment_ocr")
 
@@ -237,6 +237,83 @@ def _variant_img(variants: List[dict], name: str):
     return variants[0]["img"]
 
 
+def _boc_missing_hero_amount(result) -> bool:
+    """BOC Transaction Details 已识别但漏了顶部大额 Transfer Amount。"""
+    fields = result.fields or {}
+    if not fields.get("Receiver's Account No") and not fields.get("Sender's Account No"):
+        return False
+    if fields.get("Transfer Amount"):
+        return False
+    if result.amount is None:
+        return True
+    fee = _parse_money(fields["Fees & Charges"]) if fields.get("Fees & Charges") else None
+    if fee is not None and abs(result.amount - fee) < 0.01:
+        return True
+    return False
+
+
+def _has_boc_hero_amount_text(lines: List[OcrLine], fee_hint: Optional[float] = None) -> bool:
+    for ln in lines:
+        low = ln.text.lower()
+        if "fee" in low or "charge" in low:
+            continue
+        if not re.search(r"(?i)\blkr\b", ln.text) and not re.search(
+            r"\d{1,3}(?:,\d{3})+\.\d{2}", ln.text
+        ):
+            continue
+        m = _parse_money(ln.text)
+        if m is None or m < 100:
+            continue
+        if fee_hint is not None and abs(m - fee_hint) < 0.01:
+            continue
+        return True
+    return False
+
+
+def _ocr_boc_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
+    """复检 BOC Transaction Details 顶部大额（标题 ~ Receiver's Account 之间）。"""
+    h, w = img.shape[:2]
+    ref_h = max(_line_max_y(lines), float(h))
+    scale_y = h / ref_h
+    y0 = h * 0.04
+    y1 = h * 0.32
+    for ln in lines:
+        low = ln.text.lower()
+        if "transaction detail" in low:
+            y0 = max(p[1] for p in ln.box) * scale_y
+        if "receiver" in low and "account" in low:
+            y1 = min(y1, min(p[1] for p in ln.box) * scale_y)
+    if y1 <= y0 + 30:
+        y0, y1 = h * 0.05, h * 0.30
+    top = max(0, int(y0) - int(h * 0.01))
+    bottom = min(h, int(y1) + int(h * 0.01))
+    left = max(0, int(w * 0.05))
+    right = min(w, int(w * 0.95))
+    crop = img[top:bottom, left:right]
+    if crop.size == 0:
+        return []
+
+    def _run(crop_img: np.ndarray, scale: float) -> List[OcrLine]:
+        work = crop_img
+        if scale != 1.0:
+            work = cv2.resize(
+                crop_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+            )
+        raw = engine.recognize(work)
+        return _offset_ocr_lines(raw, dy=float(top), dx=float(left), scale=scale)
+
+    found = _run(crop, 1.0)
+    if not _has_boc_hero_amount_text(found):
+        if len(crop.shape) == 3:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = crop
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        found = dedup_lines(found + _run(enhanced, 1.0) + _run(enhanced, 2.0))
+    return found
+
+
 def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     settings = get_settings()
     if len(buf) > settings.max_upload_bytes:
@@ -269,7 +346,22 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
                 result = extract(unique, include_lines=include_lines)
             elif include_lines:
                 result = extract(unique, include_lines=True)
-    elif include_lines:
+    # BOC Transaction Details：顶部 LKR 大额常被反光漏读
+    if _boc_missing_hero_amount(result):
+        extras = []
+        for name in ("color_raw", "enhanced", "color"):
+            extras.extend(_ocr_boc_amount_band(_engine, _variant_img(variants, name), unique))
+            probe = dedup_lines(unique + extras)
+            probe_result = extract(probe, include_lines=False)
+            if not _boc_missing_hero_amount(probe_result):
+                unique = probe
+                result = extract(unique, include_lines=include_lines)
+                break
+        else:
+            if extras:
+                unique = dedup_lines(unique + extras)
+                result = extract(unique, include_lines=False)
+    if include_lines and not result.lines:
         result = extract(unique, include_lines=True)
 
     result.elapsed_ms = (time.perf_counter() - t0) * 1000

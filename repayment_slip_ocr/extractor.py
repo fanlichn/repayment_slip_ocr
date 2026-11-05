@@ -1859,6 +1859,91 @@ def _is_boc_mobile_txn_details(lines) -> bool:
     return "bank of ceylon" in full or has_fees or "remarks" in norms
 
 
+def _looks_like_lak_artha_name(name: str) -> bool:
+    """Lak Artha 户名容错：Kak Artha / L.a.k Artha / Lakatha 等 OCR 变体。"""
+    if not name:
+        return False
+    low = name.lower()
+    compact = re.sub(r"[^a-z]", "", low)
+    if "lakartha" in compact or "lak artha" in low or "lak-artha" in low:
+        return True
+    # 首字母 L↔K 混淆
+    if re.match(r"^[kl]akartha", compact):
+        return True
+    if compact in {"lakatha", "lakarth", "kakarth", "lakarthaservices", "kakarthapvt"}:
+        return True
+    return False
+
+
+def _pick_boc_hero_transfer_amount(lines, fee: Optional[float]) -> Optional[float]:
+    """从 OCR 行挑选 BOC Transaction Details 顶部主金额（排除手续费）。"""
+    hero_amounts = []
+    for ln in lines:
+        if _looks_like_label_text(ln.text):
+            continue
+        low = ln.text.lower()
+        if "fee" in low or "charge" in low:
+            continue
+        if re.fullmatch(r"\d{4}[./\-]\d{1,2}[./\-]\d{1,2}", ln.text.strip()):
+            continue
+        if not re.search(r"(?i)\blkr\b", ln.text) and not re.search(
+            r"\d{1,3}(?:,\d{3})+\.\d{2}|\d+\.\d{2}", ln.text
+        ):
+            continue
+        if re.fullmatch(r"\d{8,}", re.sub(r"\s", "", ln.text)):
+            continue
+        m = _parse_money(ln.text)
+        if m is not None and m >= 100:
+            hero_amounts.append(m)
+    if not hero_amounts:
+        return None
+    hero_amounts.sort(reverse=True)
+    for cand in hero_amounts:
+        if fee is not None and abs(cand - fee) < 0.01:
+            continue
+        return cand
+    return None
+
+
+def _boc_sender_name_quality(name: str) -> float:
+    """越高越好：偏好全大写整词，惩罚「m R e s」这类单字母碎读。"""
+    if not name:
+        return -1.0
+    letters = [c for c in name if c.isalpha()]
+    if not letters:
+        return 0.0
+    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+    toks = [t for t in re.split(r"\s+", name) if t]
+    singles = sum(1 for t in toks if len(re.sub(r"[^A-Za-z]", "", t)) == 1)
+    return upper_ratio * 2.0 + min(len(name), 48) * 0.02 - singles * 0.35
+
+
+def _repair_boc_sender_name(fields: dict, lines) -> None:
+    """Sender's Name 被低置信度碎读时，优先取同行高置信全大写姓名。"""
+    cur = fields.get("Sender's Name") or ""
+    best = None
+    for ln in lines:
+        raw = ln.text.strip()
+        # "Sender's NameMR E S M HI SENEVIRATNE" / "Sender's Name  MR ..."
+        m = re.match(
+            r"(?i)^\s*sender'?s?\s*name\s*[:：]?\s*(.+)$",
+            raw,
+        )
+        if not m:
+            continue
+        name = _clean(m.group(1))
+        if not name or _looks_like_label_text(name) or len(name) < 6:
+            continue
+        conf = float(getattr(ln, "confidence", 0.0) or 0.0)
+        score = conf + _boc_sender_name_quality(name)
+        if best is None or score > best[0]:
+            best = (score, name)
+    if best and (
+        not cur or _boc_sender_name_quality(best[1]) > _boc_sender_name_quality(cur) + 0.15
+    ):
+        fields["Sender's Name"] = best[1]
+
+
 _CDM_MARKERS = ("cardless deposit",)
 _CDM_HEADER_NORMS = {"date", "time", "terminalid", "trace", "depositamount"}
 
@@ -2537,10 +2622,8 @@ def _extract_boc_mobile_txn_parties(lines) -> tuple[PartyOut, PartyOut]:
     payer.account = fields.get("Sender's Account No")
     payer.name = fields.get("Sender's Name")
     payer.bank = fields.get("Sender's Bank Name") or "Bank of Ceylon"
-    if payee.name:
-        compact = re.sub(r"[^a-z]", "", payee.name.lower())
-        if "lakartha" in compact:
-            payee.name = "Lak Artha (Pvt) Ltd"
+    if payee.name and _looks_like_lak_artha_name(payee.name):
+        payee.name = "Lak Artha (Pvt) Ltd"
     payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
     payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
     return payer, payee
@@ -3707,12 +3790,9 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             if total is None:
                 total = breakdown_sum
 
-    # 收款方归一化：还款场景常见 Lak Artha 系列写法（含 "L.a.k Artha" OCR 插点）
-    if payee.name:
-        low = payee.name.lower()
-        compact = re.sub(r"[^a-z]", "", low)
-        if "lakartha" in compact or "lak artha" in low or "lak-artha" in low:
-            payee.name = "Lak Artha (Pvt) Ltd"
+    # 收款方归一化：还款场景常见 Lak Artha 系列写法（含 Kak/L.a.k OCR 混淆）
+    if payee.name and _looks_like_lak_artha_name(payee.name):
+        payee.name = "Lak Artha (Pvt) Ltd"
 
     success = bool(amount is not None or payee.account is not None or payee.name is not None)
     # App 还款发起页/上传截图页不是交易凭证，强制 success=false
@@ -3848,41 +3928,17 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
                     break
     elif _is_boc_mobile_txn_details(lines):
         fields = _build_label_fields(lines, _BOC_MOBILE_TXN_LABELS)
+        _repair_boc_sender_name(fields, lines)
         # 顶部大额为转账金额；Fees & Charges 为手续费（勿把 25 当成主金额）
         fee_v = fields.get("Fees & Charges")
         if fee_v:
             parsed_fee = _parse_money(fee_v)
             if parsed_fee is not None:
                 fee = parsed_fee
-        hero_amounts = []
-        for ln in lines:
-            if _looks_like_label_text(ln.text):
-                continue
-            low = ln.text.lower()
-            if "fee" in low or "charge" in low:
-                continue
-            # 只要带币种或千分位+两位小数的金额；排除日期 2026.11.01 / 账号
-            if re.fullmatch(r"\d{4}[./\-]\d{1,2}[./\-]\d{1,2}", ln.text.strip()):
-                continue
-            if not re.search(r"(?i)\blkr\b", ln.text) and not re.search(
-                r"\d{1,3}(?:,\d{3})+\.\d{2}|\d+\.\d{2}", ln.text
-            ):
-                continue
-            if re.fullmatch(r"\d{8,}", re.sub(r"\s", "", ln.text)):
-                continue
-            m = _parse_money(ln.text)
-            if m is not None and m >= 100:
-                hero_amounts.append(m)
-        if hero_amounts:
-            # 主金额取最大；若最大就是手续费则退而求其次
-            hero_amounts.sort(reverse=True)
-            for cand in hero_amounts:
-                if fee is not None and abs(cand - fee) < 0.01:
-                    continue
-                amount = cand
-                break
-            if amount is not None:
-                fields.setdefault("Transfer Amount", f"LKR {amount:,.2f}")
+        picked = _pick_boc_hero_transfer_amount(lines, fee)
+        if picked is not None:
+            amount = picked
+            fields.setdefault("Transfer Amount", f"LKR {amount:,.2f}")
         if fee is not None and amount is not None:
             total = amount + fee
         # 结构化收付款方以扁平字段为准（竖拍时通用分区易串位）
@@ -3892,8 +3948,9 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             payee.bank = fields["Receiver's Bank"]
         if fields.get("Receiver's Name"):
             raw_name = fields["Receiver's Name"]
-            compact = re.sub(r"[^a-z]", "", raw_name.lower())
-            payee.name = "Lak Artha (Pvt) Ltd" if "lakartha" in compact else raw_name
+            payee.name = (
+                "Lak Artha (Pvt) Ltd" if _looks_like_lak_artha_name(raw_name) else raw_name
+            )
             fields["Receiver's Name"] = payee.name
         if fields.get("Sender's Account No"):
             payer.account = fields["Sender's Account No"]

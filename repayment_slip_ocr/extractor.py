@@ -4494,8 +4494,13 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
                 if m:
                     fields["Amount"] = f"LKR {m.group(1)}"
                     break
-        # ComBank「Transfer Successful」To 区：结构化收款方写回扁平字段（API 只返回 fields）
-        if _is_to_only_receipt(lines):
+        # HNB / ComBank App：结构化 From/To 写回扁平字段（API 只返回 fields）
+        if _is_hnb_app_receipt(lines) or _is_to_only_receipt(lines):
+            if payer.name:
+                fields.setdefault("From", payer.name)
+                fields.setdefault("Sender's Name", payer.name)
+            if payer.bank:
+                fields.setdefault("Sender's Bank", payer.bank)
             if payee.name:
                 fields.setdefault("Beneficiary Name", payee.name)
                 fields.setdefault("To", payee.name)
@@ -4504,10 +4509,11 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
                 fields.setdefault("Account Number", payee.account)
             if payee.bank:
                 fields.setdefault("Beneficiary Bank", payee.bank)
-            if "beneficiary notified" in full_text.lower():
-                fields.setdefault("Status", "Beneficiary Notified")
-            elif status == "success":
-                fields.setdefault("Status", "Success")
+            if _is_to_only_receipt(lines):
+                if "beneficiary notified" in full_text.lower():
+                    fields.setdefault("Status", "Beneficiary Notified")
+                elif status == "success":
+                    fields.setdefault("Status", "Success")
     elif _is_boc_mobile_txn_details(lines):
         fields = _build_label_fields(lines, _BOC_MOBILE_TXN_LABELS)
         _repair_boc_sender_name(fields, lines)

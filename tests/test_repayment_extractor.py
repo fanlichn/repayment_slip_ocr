@@ -2521,6 +2521,48 @@ def test_hnb_fund_transfer_receipt():
     assert r.payee.bank == "Commercial Bank PLC"
     assert r.references.txn_ref == "189359/154299101"
     assert r.references.receiver_ref == "Champika Dias 751251866V"
+    assert r.fields["From"] == "DIASWUC"
+    assert r.fields["Sender's Name"] == "DIASWUC"
+    assert r.fields["Beneficiary Name"] == "Lak Artha (Pvt) Ltd"
+    assert r.fields["Beneficiary Account Number"] == "1001096962"
+    assert r.fields["Beneficiary Bank"] == "Commercial Bank PLC"
+
+
+def test_hnb_fund_transfer_lak_cash_nickname():
+    """HNB Fund Transfer Receipt：From 姓名 + To「Lak Cash - 账号」须写入扁平字段。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 14, x1, y + 14)
+    lines = [
+        L("HNB", 438, 684, 482),
+        L("Fund Transfer Receipt", 274, 929, 625),
+        L("LKR 5,850.00", 395, 805, 805),
+        L("From", 553, 653, 1153),
+        L("THASTHIKANTH K", 400, 850, 1251),
+        L("To", 569, 631, 1343),
+        L("Lak Cash - 1001096962", 219, 972, 1439),
+        L("Commercial Bank PLC", 398, 799, 1685),
+        L("Receiver reference-G4WS43", 176, 1021, 1790),
+        L("Transaction Reference-1233928/158560281", 225, 972, 1864),
+        L("Date/Time-02/11/2026 : 10.27 PM", 312, 891, 1944),
+        L("This is an auto generated receipt", 311, 889, 2114),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "hnb"
+    assert r.amount == 5850.0
+    assert r.payer.name == "THASTHIKANTH K"
+    assert r.payee.name == "Lak Cash"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank PLC"
+    assert r.fields["From"] == "THASTHIKANTH K"
+    assert r.fields["Sender's Name"] == "THASTHIKANTH K"
+    assert r.fields["To"] == "Lak Cash"
+    assert r.fields["Beneficiary Name"] == "Lak Cash"
+    assert r.fields["Beneficiary Account Number"] == "1001096962"
+    assert r.fields["Account Number"] == "1001096962"
+    assert r.fields["Beneficiary Bank"] == "Commercial Bank PLC"
+    assert r.fields["Amount"] == "LKR 5,850.00"
+    assert r.fields["Receiver Reference"] == "G4WS43"
+    assert r.fields["Payment Reference"] == "1233928/158560281"
 
 
 def test_ipay_fund_transfer():

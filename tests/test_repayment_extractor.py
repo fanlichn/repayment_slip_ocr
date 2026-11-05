@@ -1542,6 +1542,44 @@ def test_kalutara_rotated_sparse_ocr_completes_account_and_scrub():
     assert "7,600.00" in str(r2.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
 
 
+def test_cdm_crease_sparse_ocr_not_row_amount():
+    """NAWALAPI：折痕导致漏读 CARDLESS/账号/总额时，不得把行小计 400 当存款额，
+    仍应识别为 CDM 并抽出 DATE/TIME/TRACE。"""
+    lines = [
+        _lr("DATE", 500, 1238, 682, 1320),
+        _lr("TIME", 981, 1211, 1157, 1305),
+        _lr("TRACE", 513, 1461, 734, 1554),
+        _lr("3528", 999, 1429, 1183, 1523),
+        _lr("0803", 984, 1282, 1194, 1376, 0.99),
+        _lr("08:03", 983, 1287, 1193, 1381, 0.92),
+        _lr("l2 11 26", 504, 1319, 843, 1397, 0.79),
+        _lr("NOTES", 604, 2874, 831, 2972),
+        _lr("VALUE", 979, 2843, 1198, 2937),
+        _lr("AMOUNT", 1873, 2770, 2131, 2864),
+        _lr("4", 829, 3029, 881, 3098),
+        _lr("100.00", 1238, 2988, 1493, 3069),
+        _lr("400.00", 1888, 2933, 2156, 3022),
+        _lr("1", 833, 3115, 890, 3183, 0.78),
+        _lr("1.000.00", 1813, 3023, 2160, 3112),
+        _lr("2", 847, 3200, 890, 3264),
+        _lr("LKR", 1413, 3309, 1561, 3395),
+        _lr("HOTES", 608, 2874, 831, 2968, 0.88),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "commercial_bank"
+    assert r.doc_type == "cash_deposit_slip"
+    assert r.fields.get("TRANSACTION") == "CARDLESS DEPOSIT"
+    assert r.fields.get("TRACE") == "3528"
+    assert r.fields.get("TIME") == "08:03"
+    assert "2026-11-02" in str(r.fields.get("DATE") or "") or "02/11/26" in str(
+        r.fields.get("DATE") or ""
+    )
+    # 不得把 4×100 的行小计当成存款总额
+    assert r.amount != 400.0
+    assert r.fields.get("DEPOSIT AMOUNT") != "400.00"
+
+
 def test_cdm_missing_deposit_label_recovers_notes_band_amount():
     """MAHARAGA：OCR 漏掉 DEPOSIT AMOUNT 标签，但仍有 NOTES 表与 15.000.00。"""
     lines = [

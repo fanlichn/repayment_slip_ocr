@@ -493,25 +493,34 @@ def _collect_column_block(lines, value_line, max_gap: float = 400.0, x_tol: floa
     return " ".join(parts)
 
 
+def _looks_like_notes_header(text: str) -> bool:
+    """NOTES 表头；OCR 常把 N 读成 H（HOTES）。"""
+    t = " ".join((text or "").lower().split()).strip(":.")
+    return t in {"notes", "hotes", "hote"} or t.startswith(("notes", "hotes"))
+
+
 def _has_notes_value_table(lines) -> bool:
     texts = {" ".join(ln.text.lower().split()) for ln in lines}
-    return any("notes" == t or t.startswith("notes") for t in texts) and any(
-        "value" == t or t.startswith("value") for t in texts
-    )
+    has_notes = any(_looks_like_notes_header(t) for t in texts)
+    has_value = any("value" == t or t.startswith("value") for t in texts)
+    return has_notes and has_value
 
 
 def _recover_cdm_deposit_amount_from_notes_band(lines) -> Optional[float]:
     """CDM 漏读 DEPOSIT AMOUNT 标签时：从 NOTES/VALUE/AMOUNT 带回收总额。
 
     典型：表头 + 行金额/存款总额均为 15.000.00，标签被拇指挡住。
+    不完整面额表只有行金额（如 400.00=4×100）时不得当成存款总额。
     """
     if not lines:
         return None
     anchor_ys = []
     for ln in lines:
         low = " ".join(ln.text.lower().split())
-        if low in {"notes", "value", "amount"} or low.startswith(
-            ("notes", "value", "deposit amount", "depositamount")
+        if (
+            _looks_like_notes_header(low)
+            or low in {"value", "amount"}
+            or low.startswith(("value", "deposit amount", "depositamount"))
         ):
             anchor_ys.append(_line_center_y(ln.box))
         elif re.search(r"(?i)\blkr\b", ln.text) and _parse_money(ln.text) is None:
@@ -526,6 +535,7 @@ def _recover_cdm_deposit_amount_from_notes_band(lines) -> Optional[float]:
         y_min = max(ys) * 0.55
 
     cands: list = []
+    qty_like = 0
     for ln in lines:
         if not ln.box:
             continue
@@ -533,7 +543,8 @@ def _recover_cdm_deposit_amount_from_notes_band(lines) -> Optional[float]:
         if cy < y_min:
             continue
         text = ln.text.strip()
-        if re.fullmatch(r"\d{1,2}", text):
+        if re.fullmatch(r"\d{1,3}", text):
+            qty_like += 1
             continue  # 张数
         if _is_denomination_label_line(text):
             continue
@@ -551,15 +562,27 @@ def _recover_cdm_deposit_amount_from_notes_band(lines) -> Optional[float]:
         cands.append((val, cy, conf, val in _COMMON_DENOMS))
     if not cands:
         return None
+    counts = Counter(round(c[0], 2) for c in cands)
     non = [c for c in cands if not c[3]]
     if non:
         max_val = max(c[0] for c in non)
+        # 行 AMOUNT + DEPOSIT 总额重复出现 → 可信
+        if counts[round(max_val, 2)] >= 2:
+            top = [c for c in non if abs(c[0] - max_val) < 0.01]
+            top.sort(key=lambda c: (-c[2], -c[1]))
+            return top[0][0]
+        others = [c[0] for c in cands if abs(c[0] - max_val) > 0.01]
+        # 多行面额表时：候选必须严格大于带内其它金额，否则只是某一行小计（如 400）
+        if others and max_val <= max(others) + 0.01:
+            return None
+        if qty_like >= 2 and not others:
+            # 只有一个非面额金额且多行张数 → 更像行小计，缺总额
+            return None
         top = [c for c in non if abs(c[0] - max_val) < 0.01]
         top.sort(key=lambda c: (-c[2], -c[1]))
         return top[0][0]
     # 仅有面额面值时：同一金额至少出现两次（行 AMOUNT + DEPOSIT 总额）才采纳，
     # 避免不完整面额表把单个 500.00 当成存款总额。
-    counts = Counter(round(c[0], 2) for c in cands)
     dups = [v for v, n in counts.items() if n >= 2]
     if not dups:
         return None
@@ -2081,7 +2104,18 @@ def _is_cash_deposit(lines) -> bool:
         for ln in lines
         if _norm_label(ln.text) in _CDM_HEADER_NORMS
     }
-    return len(headers) >= 4 and "deposit" in full
+    if len(headers) >= 4 and "deposit" in full:
+        return True
+    # 折痕/反光漏读标题与中间段：NOTES/VALUE/AMOUNT + DATE/TIME/TRACE 仍可判定
+    if _has_notes_value_table(lines):
+        norms = {_norm_label(ln.text) for ln in lines}
+        # HOTES→NOTES 归一
+        if any(_looks_like_notes_header(ln.text) for ln in lines):
+            norms.add("notes")
+        head = norms & {"date", "time", "trace", "terminalid"}
+        if len(head) >= 2 and ("trace" in head or "terminalid" in head):
+            return True
+    return False
 
 
 _CASH_CREDIT_SLIP_MARKERS = ("cash credit slip", "current account - cash deposit")
@@ -3267,7 +3301,7 @@ def _looks_like_terminal_id_value(value: str) -> bool:
 
 
 def _normalize_cdm_time(value: str) -> Optional[str]:
-    """归一化 CDM TIME：19.11 / 19:11 → 19:11；拒绝日期误读 01:11.26 / 01/11/26。"""
+    """归一化 CDM TIME：19.11 / 19:11 / 0803 → 19:11；拒绝日期误读 01:11.26 / 01/11/26。"""
     v = _clean(value or "")
     if not v:
         return None
@@ -3277,9 +3311,13 @@ def _normalize_cdm_time(value: str) -> Optional[str]:
     if re.search(r"\d{1,2}:\d{2}\.\d{2}", v):
         return None
     m = re.match(r"^\s*([01]?\d|2[0-3])[.:\- ]([0-5]\d)\s*$", v)
+    if m:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    # OCR 丢掉冒号：0803
+    m = re.match(r"^\s*([01]\d|2[0-3])([0-5]\d)\s*$", v)
     if not m:
         return None
-    return f"{int(m.group(1)):02d}:{m.group(2)}"
+    return f"{m.group(1)}:{m.group(2)}"
 
 
 def _is_plausible_cdm_field_value(key: str, value: str) -> bool:
@@ -3346,12 +3384,36 @@ def _is_plausible_cdm_field_value(key: str, value: str) -> bool:
     return True
 
 
+def _repair_cdm_date_ocr(text: str) -> Optional[str]:
+    """CDM DATE：兼容 02/11/26，以及 OCR 把 0 读成 l/O、分隔符变空格的「l2 11 26」。"""
+    if not text:
+        return None
+    m = re.search(r"\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}", text)
+    if m:
+        return m.group(0)
+    repaired = (
+        text.replace("l", "0")
+        .replace("I", "1")
+        .replace("O", "0")
+        .replace("o", "0")
+    )
+    m = re.search(
+        r"(?<!\d)(\d{1,2})\s*[./\-\s]\s*(\d{1,2})\s*[./\-\s]\s*(\d{2,4})(?!\d)",
+        repaired,
+    )
+    if not m:
+        return None
+    d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
+    if not (1 <= d <= 31 and 1 <= mo <= 12):
+        return None
+    return f"{d:02d}/{mo:02d}/{y}"
+
+
 def _extract_cdm_typed_substring(key: str, text: str) -> Optional[str]:
     """从一行 OCR 文本中抠出符合 CDM 字段类型的子串。"""
     kn = _norm_label(key)
     if kn == "date":
-        m = re.search(r"\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}", text)
-        return m.group(0) if m else None
+        return _repair_cdm_date_ocr(text)
     if kn == "time":
         return _normalize_cdm_time(text)
     if kn == "terminalid":
@@ -4317,6 +4379,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     # 只要面额表 / CDM 表头检测命中就设为 commercial_bank。
     if (_is_cash_credit_slip(lines) or _is_cash_deposit(lines)) and not bank:
         bank = "commercial_bank"
+    if _is_cash_deposit(lines) and doc_type != "cash_deposit_slip":
+        doc_type = "cash_deposit_slip"
 
     payer, payee = _extract_parties(lines, bank)
     trace_no = _match_label_value(lines, ["trace no", "trace number", "tranceno", "trace"])

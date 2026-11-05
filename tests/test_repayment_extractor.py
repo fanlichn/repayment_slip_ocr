@@ -1460,6 +1460,45 @@ def test_cdm_recover_account_without_label_from_midband_digits():
     assert r.amount == 5000.0
 
 
+def test_kalutara_rotated_sparse_ocr_completes_account_and_scrub():
+    """KALUTARA 远距竖排：账号截成 00109696、CARDLESS 串 NARRATION/MOBILE、
+    日期残片不当 TRACE；户名命中时补全 1001096962；金额带补总额。"""
+    lines = [
+        _lr("RANSACTION", 756, 1181, 785, 1272, 0.994),
+        _lr("0109696", 727, 1317, 747, 1370, 0.968),
+        _lr("MOBILE NO.", 600, 1172, 629, 1256, 0.956),
+        _lr("ACCOUNT NUMBER:", 721, 1170, 753, 1295, 0.955),
+        _lr("KALUTARA-CRM2 BR", 894, 1236, 923, 1395, 0.954),
+        _lr("MOUNT", 537, 1425, 557, 1464, 0.953),
+        _lr("NOTES VALUE", 522, 1178, 554, 1292, 0.949),
+        _lr("NARRATION:", 646, 1175, 675, 1261, 0.936),
+        _lr("TRACE", 799, 1172, 831, 1228, 0.931),
+        _lr("DEPUSIT", 415, 1183, 438, 1236, 0.928),
+        _lr("CUSTOMER NAME LAK ARTHA SERVICES", 686, 1167, 730, 1436, 0.924),
+        _lr("CARDLESS DEPOSIT", 744, 1276, 791, 1432, 0.917),
+        _lr("KAI U1ARA CRM2 BR", 894, 1236, 926, 1384, 0.910),
+        _lr("SOURCE OF FUNDS:UNKNOWN", 571, 1175, 603, 1359, 0.898),
+        _lr("ACCOUNT NUMISE H", 722, 1166, 759, 1298, 0.853),
+        _lr("00109696", 730, 1306, 753, 1370, 0.790),
+        _lr("8888", 455, 1446, 522, 1479, 0.769),
+        _lr("D0710/26ERERLYAHIO", 825, 1162, 877, 1450, 0.540),
+    ]
+    r = extract(lines)
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+    assert "LAK ARTHA" in r.fields["CUSTOMER NAME"].upper()
+    assert r.fields["TRANSACTION"] == "CARDLESS DEPOSIT"
+    assert r.fields.get("NARRATION") in (None, "", "-")
+    assert r.fields.get("MOBILE NO.") in (None, "", "-", "–", "—")
+    assert r.fields.get("Remarks") in (None, "", "-")
+    assert r.fields.get("TRACE") not in {"0710", "8888", "660"}
+    assert r.fields["BRANCH"] == "KALUTARA-CRM2 BR"
+    # 金额带复检补到总额
+    lines_amt = lines + [_lr("DEPOSIT AMOUNT LKR 7,600.00", 400, 1400, 560, 1480, 0.96)]
+    r2 = extract(lines_amt)
+    assert r2.amount == 7600.0
+    assert "7,600.00" in str(r2.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
+
+
 def test_peoples_pay_sinhala_positional_fields():
     """僧伽罗语 People's Pay：英文 Pay from/to 标签缺失，按 People's Bank/Commercial Bank 锚点提取。"""
     lines = [

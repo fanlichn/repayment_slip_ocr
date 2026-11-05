@@ -643,6 +643,9 @@ def _is_near_known_label(value: str) -> bool:
         return False
     if compact in _KNOWN_LABEL_COMPACT:
         return True
+    # ACCOUNT NUMISE H / ACCOUNT NUMBE 等：以 accountnum 开头的残片
+    if compact.startswith("accountnum") and len(compact) <= 16:
+        return True
     for lab in _KNOWN_LABEL_COMPACT:
         if len(lab) < 4:
             continue
@@ -652,12 +655,13 @@ def _is_near_known_label(value: str) -> bool:
         # 截断标签：nsactionstatus / erminalid / ranaction
         if lab.endswith(compact) and 0 < len(lab) - len(compact) <= 3:
             return True
-        if abs(len(compact) - len(lab)) > 2:
+        if abs(len(compact) - len(lab)) > 3:
             continue
-        # 少量替换：iobileno ↔ mobileno
+        # 少量替换：iobileno ↔ mobileno；accountnumiseh ↔ accountnumber
         mismatch = sum(1 for a, b in zip(compact, lab) if a != b)
         mismatch += abs(len(compact) - len(lab))
-        if mismatch <= 2:
+        limit = 3 if len(lab) >= 10 else 2
+        if mismatch <= limit:
             return True
     return False
 
@@ -3146,13 +3150,19 @@ def _is_plausible_cdm_field_value(key: str, value: str) -> bool:
     if kn == "terminalid":
         return _looks_like_terminal_id_value(v)
     if kn == "trace":
-        return bool(re.match(r"^\d{3,6}$", v))
+        return bool(re.match(r"^\d{3,6}$", v)) and not re.search(r"[/.\-]", v)
     if kn == "transactionstatus":
         if re.search(r"(?i)source\s*of\s*funds|unknown", v):
             return False
         return bool(re.search(r"(?i)\b(successful|success|failed|fail|rejected)\b", v))
     if kn == "accountnumber":
-        return bool(re.fullmatch(r"\d{8,14}", re.sub(r"\s+", "", v)))
+        digits = re.sub(r"\s+", "", v)
+        if not re.fullmatch(r"\d{8,14}", digits):
+            return False
+        # 00 开头的 8 位多半是 10 位账号截断（1001096962 → 00109696）
+        if len(digits) < 10 and digits.startswith("00"):
+            return False
+        return True
     if kn == "transaction":
         if re.search(r"(?i)commercial\s*bank|union\s*bank|\(il\)|deposit\s*amount|source\s*of", v):
             return False
@@ -3167,7 +3177,17 @@ def _is_plausible_cdm_field_value(key: str, value: str) -> bool:
     if kn == "mobileno":
         if re.search(r"(?i)narration|account|customer|bank", v):
             return False
-        return bool(re.search(r"\d{7,}", v)) or v in {"-", "–", "—"}
+        if v in {"-", "–", "—"}:
+            return True
+        digits = re.sub(r"\D", "", v)
+        # 拒账号串位：无 +94/07 前缀的 8–14 位纯数字
+        if re.fullmatch(r"\d{8,14}", digits) and not (
+            re.search(r"(?:\+|94)", v) or digits.startswith(("07", "01"))
+        ):
+            return False
+        if digits.startswith("0") and 9 <= len(digits) <= 11:
+            return True
+        return bool(re.search(r"(?:\+|94)", v) and len(digits) >= 9)
     if kn == "depositamount":
         amt = _parse_money(v)
         # 账号常被误解析成超大金额；面额表张数等纯小整数也不当存款额
@@ -3193,14 +3213,29 @@ def _extract_cdm_typed_substring(key: str, text: str) -> Optional[str]:
                 return tok.upper()
         return None
     if kn == "trace":
-        m = re.search(r"(?<!\d)(\d{3,6})(?!\d)", text)
+        # 日期残片 D0710/26... 里的 0710 不是 TRACE；660f6 也不是
+        if re.search(r"\d{1,2}[/.\-]\d{1,2}([/.\-]\d{2,4})?", text):
+            return None
+        if re.search(r"(?i)d\d{3,4}/\d{2}", text):
+            return None
+        m = re.search(r"(?<![A-Za-z0-9])(\d{3,6})(?![A-Za-z0-9])", text)
         return m.group(1) if m else None
     if kn == "transactionstatus":
         m = re.search(r"(?i)\b(successful|success|failed|fail|rejected)\b", text)
         return m.group(0).upper() if m else None
     if kn == "accountnumber":
-        m = re.search(r"(?<!\d)(\d{8,14})(?!\d)", text)
-        return m.group(1) if m else None
+        # 同屏多段数字时取最长且非 00 截断
+        best = None
+        for m in re.finditer(r"(?<!\d)(\d{8,14})(?!\d)", text):
+            acct = m.group(1)
+            if acct in {"500000", "100000", "200000", "1000000"}:
+                continue
+            if len(acct) < 10 and acct.startswith("00"):
+                continue
+            score = (len(acct), 0 if acct.startswith("00") else 1)
+            if best is None or score > best[0]:
+                best = (score, acct)
+        return best[1] if best else None
     if kn == "transaction":
         m = re.search(r"(?i)cardless\s*deposit", text)
         return "CARDLESS DEPOSIT" if m else None
@@ -3252,23 +3287,65 @@ def _pick_cdm_typed_near(idx: int, ordered, label_line, key: str) -> Optional[st
         ocy = _line_center_y(other.box)
         y_overlap = max(0.0, min(ly1, oy1) - max(ly0, oy0))
         conf = -float(getattr(other, "confidence", 0.0) or 0.0)
+        # 账号：更长、非 00 截断优先（嵌入 score 次级键）
+        acct_boost = 0
+        if kn == "accountnumber":
+            digits = re.sub(r"\D", "", text)
+            weak = 1 if (len(digits) < 10 or digits.startswith("00")) else 0
+            acct_boost = (weak, -len(digits))
         if ox1 <= label_left + 30 and y_overlap > 0:
-            score = (0, conf, -y_overlap, label_left - ox1)
+            score = (0, acct_boost, conf, -y_overlap, label_left - ox1)
         elif ox0 >= label_right - 20 and y_overlap > 0:
             # 同带右侧：TIME 竖拍真值常在这里，优先于「下方」
-            score = (0, conf, -y_overlap, ox0 - label_right)
+            score = (0, acct_boost, conf, -y_overlap, ox0 - label_right)
         elif oy0 >= label_bottom - 20 and abs(ocx - label_cx) < 180:
             # TIME 的正下方常是 DATE 列误读，降权
             tier = 2 if kn == "time" else 1
-            score = (tier, conf, max(0.0, oy0 - label_bottom), abs(ocx - label_cx))
+            score = (tier, acct_boost, conf, max(0.0, oy0 - label_bottom), abs(ocx - label_cx))
         else:
             dist = abs(ocx - label_cx) + abs(ocy - label_cy)
             if dist > 450:
                 continue
-            score = (3, conf, dist, 0)
+            score = (3, acct_boost, conf, dist, 0)
         if best is None or score < best[0]:
             best = (score, _clean(text))
     return best[1] if best else None
+
+
+# 本产品还款入账账号；远距 OCR 常截成 00109696 / 0109696
+_LAK_ARTHA_CDM_ACCOUNT = "1001096962"
+
+
+def _blob_mentions_lak_artha(*parts: Optional[str]) -> bool:
+    blob = " ".join(p for p in parts if p).lower()
+    return "lak" in blob and "artha" in blob
+
+
+def _maybe_complete_lak_artha_account(
+    acct: Optional[str], customer: Optional[str], lines
+) -> Optional[str]:
+    """户名为 LAK ARTHA 且 OCR 账号是已知入账号的连续子串时补全。"""
+    known = _LAK_ARTHA_CDM_ACCOUNT
+    texts = [customer or "", acct or ""] + [ln.text for ln in lines]
+    if not _blob_mentions_lak_artha(*texts):
+        return acct
+    digits = re.sub(r"\D", "", acct or "")
+    if digits == known:
+        return known
+    if len(digits) >= 6 and digits in known:
+        return known
+    # 扫描碎片行（0109696 / 00109696）
+    for ln in lines:
+        d = re.sub(r"\D", "", ln.text)
+        if len(d) >= 6 and d in known:
+            return known
+    return acct
+
+
+def _account_candidate_score(acct: str, conf: float = 0.0) -> tuple:
+    """更长、非 00 截断、高置信优先。"""
+    weak = 1 if (len(acct) < 10 or acct.startswith("00")) else 0
+    return (-weak, len(acct), conf)
 
 
 def _recover_cdm_account_number(lines) -> Optional[str]:
@@ -3287,25 +3364,26 @@ def _recover_cdm_account_number(lines) -> Optional[str]:
     best = None
     for ln in ordered:
         cy = _line_center_y(ln.box)
-        if y0 is not None and cy < y0 - 20:
-            continue
-        if y1 is not None and cy > y1 + 20:
-            continue
-        # 同行或整行账号
+        # 竖排时 TRANSACTION/NARRATION 的 y 几乎重叠，放宽带状过滤
+        if y0 is not None and y1 is not None and abs(y1 - y0) > 80:
+            if cy < min(y0, y1) - 40 or cy > max(y0, y1) + 40:
+                continue
+        conf = float(getattr(ln, "confidence", 0.0) or 0.0)
         for m in re.finditer(r"(?<!\d)(\d{8,14})(?!\d)", ln.text):
             acct = m.group(1)
-            # 排除面额/金额碎片
             if acct in {"500000", "100000", "200000", "1000000"}:
                 continue
-            conf = float(getattr(ln, "confidence", 0.0) or 0.0)
-            if best is None or conf > best[0]:
-                best = (conf, acct)
+            score = _account_candidate_score(acct, conf)
+            if best is None or score > best[0]:
+                best = (score, acct)
         if re.search(r"(?i)account", ln.text):
             tok = _account_token(_value_after_label(ln.text, "account number") or "")
             if not tok:
                 tok = _account_token(ln.text)
-            if tok and (best is None or len(tok) >= 8):
-                return tok
+            if tok and re.fullmatch(r"\d{8,14}", tok):
+                score = _account_candidate_score(tok, conf + 0.05)
+                if best is None or score > best[0]:
+                    best = (score, tok)
     return best[1] if best else None
 
 
@@ -3396,6 +3474,30 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
             # 标签漏读时：全卡扫描，TIME/TRACE 取置信度最高者
             best = None
             for ln in ordered:
+                low = ln.text.lower()
+                if key == "TRACE":
+                    # 面额表/金额带噪点（8888、18.88）不当 TRACE
+                    if any(
+                        k in low
+                        for k in (
+                            "notes",
+                            "value",
+                            "amount",
+                            "deposit",
+                            "mount",
+                            "galaxy",
+                            "spam",
+                            "truecaller",
+                        )
+                    ):
+                        continue
+                    if re.search(r"[.,]\d{2}", ln.text) or re.fullmatch(
+                        r"\s*[08]{3,6}\s*", ln.text
+                    ):
+                        continue
+                    conf = float(getattr(ln, "confidence", 0.0) or 0.0)
+                    if conf < 0.85:
+                        continue
                 extracted = _extract_cdm_typed_substring(key, ln.text)
                 if extracted and _is_plausible_cdm_field_value(key, extracted):
                     conf = float(getattr(ln, "confidence", 0.0) or 0.0)
@@ -3409,6 +3511,20 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
             fields[key] = found
         elif key in fields and not _is_plausible_cdm_field_value(key, fields[key]):
             fields.pop(key, None)
+    # ACCOUNT：弱截断号时用更长候选 / Lak Artha 入账号补全覆盖
+    cur_acct = fields.get("ACCOUNT NUMBER")
+    recovered = _recover_cdm_account_number(lines)
+    if recovered and (
+        not cur_acct
+        or _account_candidate_score(recovered)
+        > _account_candidate_score(re.sub(r"\D", "", str(cur_acct)))
+    ):
+        fields["ACCOUNT NUMBER"] = recovered
+    completed = _maybe_complete_lak_artha_account(
+        fields.get("ACCOUNT NUMBER"), fields.get("CUSTOMER NAME"), lines
+    )
+    if completed:
+        fields["ACCOUNT NUMBER"] = completed
     # 空字段 OCR 残片：NARRATION/MOBILE 读成 IARRATION: / IOBILE NO.: 时清空
     for blank_key in ("NARRATION", "MOBILE NO.", "SOURCE OF FUNDS", "CUSTOMER NAME"):
         val = fields.get(blank_key)
@@ -3416,9 +3532,49 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
             continue
         if _looks_like_label_text(val) or not _clean(val) or _clean(val) in {":", "-", "–", "—"}:
             fields.pop(blank_key, None)
+    # NARRATION 被交易类型串位；MOBILE 被账号串位
+    narr = fields.get("NARRATION")
+    txn = fields.get("TRANSACTION") or ""
+    if narr and (
+        re.search(r"(?i)cardless\s*deposit|cash\s*deposit", narr)
+        or _norm_label(narr) == _norm_label(txn)
+    ):
+        fields.pop("NARRATION", None)
+    mob = fields.get("MOBILE NO.")
+    acct = re.sub(r"\D", "", str(fields.get("ACCOUNT NUMBER") or ""))
+    if mob:
+        mob_digits = re.sub(r"\D", "", mob)
+        if acct and mob_digits == acct:
+            fields.pop("MOBILE NO.", None)
+        elif not _is_plausible_cdm_field_value("MOBILE NO.", mob):
+            fields.pop("MOBILE NO.", None)
     rem = fields.get("Remarks")
-    if rem and _looks_like_label_text(rem):
+    if rem and (
+        _looks_like_label_text(rem)
+        or re.search(r"(?i)cardless\s*deposit", rem)
+        or (narr and _norm_label(rem) == _norm_label(narr))
+    ):
         fields.pop("Remarks", None)
+    # TRACE：仅出现在日期残片里则丢弃
+    tr = fields.get("TRACE")
+    if tr and re.match(r"^\d{3,6}$", str(tr)):
+        in_clean = False
+        in_date_junk = False
+        for ln in lines:
+            if str(tr) not in ln.text:
+                continue
+            if re.search(r"\d{1,2}[/.\-]\d{1,2}", ln.text) or re.search(
+                r"(?i)d\d{3,4}/\d{2}", ln.text
+            ):
+                in_date_junk = True
+            elif re.fullmatch(r"\s*\d{3,6}\s*", ln.text):
+                in_clean = True
+            elif re.search(rf"(?<!\d){re.escape(str(tr))}(?!\d)", ln.text) and not re.search(
+                r"[A-Za-z]{3,}", ln.text
+            ):
+                in_clean = True
+        if in_date_junk and not in_clean:
+            fields.pop("TRACE", None)
     # DEPOSIT AMOUNT：仅丢掉「账号当金额」这类明显错值，不从面额表臆造总额
     dep = fields.get("DEPOSIT AMOUNT")
     if dep:
@@ -3697,16 +3853,26 @@ def _build_peoples_pay_fields(lines, payer, payee) -> dict:
 _BRANCH_RE = re.compile(r"(?i)^[a-z0-9][a-z0-9\-./ ]*\bbr\b$")
 
 
+def _branch_quality(text: str, conf: float = 0.0) -> tuple:
+    """网点名质量：少数字串位（KAI U1ARA）、高置信优先。"""
+    t = text.strip()
+    digit_hits = len(re.findall(r"\d", re.sub(r"(?i)crm\s*\d+", "", t)))
+    return (-digit_hits, conf, len(t))
+
+
 def _extract_branch(lines) -> Optional[str]:
     """存款凭条网点：通常以 "BR"（branch）结尾，如 "BANDARAG-CRM2 BR"。
 
     OCR 常把 "EKALA-CRM1 BR" 拆成同行的 "EKALA-CRM1" + "BR"，需拼接。
+    多候选时偏好无字母位数字串位者（KALUTARA 优于 KAI U1ARA）。
     """
     ordered = _sorted_by_y(lines)
+    candidates = []
     for ln in ordered:
         t = ln.text.strip()
         if _BRANCH_RE.fullmatch(t):
-            return t
+            conf = float(getattr(ln, "confidence", 0.0) or 0.0)
+            candidates.append((_branch_quality(t, conf), t))
     for ln in ordered:
         if ln.text.strip().upper() != "BR":
             continue
@@ -3727,10 +3893,16 @@ def _extract_branch(lines) -> Optional[str]:
             if text.upper() in {"DATE", "TIME", "TRACE", "NOTES", "VALUE", "AMOUNT", "LKR", "BANK"}:
                 continue
             gap = br_left - other_right
-            if best is None or gap < best[0]:
-                best = (gap, f"{text} BR")
+            conf = float(getattr(other, "confidence", 0.0) or 0.0)
+            cand = f"{text} BR"
+            score = (_branch_quality(cand, conf), -gap)
+            if best is None or score > best[0]:
+                best = (score, cand)
         if best:
-            return best[1]
+            candidates.append((_branch_quality(best[1]), best[1]))
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
     return _match_label_value(lines, ["branch", "branch name"])
 
 
@@ -4002,9 +4174,15 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             recovered_acct = _recover_cdm_account_number(lines)
             if recovered_acct:
                 fields["ACCOUNT NUMBER"] = recovered_acct
-                if not payee.account:
-                    payee.account = recovered_acct
-                    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+        # Lak Artha 截断账号再补一次（repair 后仍可能缺户名锚点）
+        completed_acct = _maybe_complete_lak_artha_account(
+            fields.get("ACCOUNT NUMBER"), fields.get("CUSTOMER NAME"), lines
+        )
+        if completed_acct:
+            fields["ACCOUNT NUMBER"] = completed_acct
+        if fields.get("ACCOUNT NUMBER"):
+            payee.account = fields["ACCOUNT NUMBER"]
+            payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
         if not fields.get("CUSTOMER NAME"):
             recovered_name = _recover_cdm_customer_name(lines)
             if recovered_name:
@@ -4012,7 +4190,10 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
                 if not payee.name:
                     payee.name = recovered_name
         if branch:
-            fields.setdefault("BRANCH", branch)
+            # 多候选时 _extract_branch 已优选；覆盖 OCR 串位网点
+            cur_br = fields.get("BRANCH")
+            if not cur_br or _branch_quality(branch) > _branch_quality(str(cur_br)):
+                fields["BRANCH"] = branch
         if not fields.get("DEPOSIT AMOUNT") and amount is not None:
             fields["DEPOSIT AMOUNT"] = f"{amount:,.2f}"
         # fields 已有 DEPOSIT AMOUNT 但结构化 amount 仍空时回填（如 OCR 标签拼写损坏）
@@ -4071,13 +4252,21 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         and not any("remark" in k.lower() for k in fields)
     ):
         fields["Remarks"] = references.remarks
-    # CDM 空 NARRATION 常被写成 Remarks；标签残片不得作为备注
-    if fields.get("NARRATION") and _looks_like_label_text(fields["NARRATION"]):
+    # CDM 空 NARRATION 常被写成 Remarks；标签残片/交易类型不得作为备注
+    if fields.get("NARRATION") and (
+        _looks_like_label_text(fields["NARRATION"])
+        or re.search(r"(?i)cardless\s*deposit|cash\s*deposit", fields["NARRATION"])
+    ):
         fields.pop("NARRATION", None)
-    if fields.get("Remarks") and _looks_like_label_text(fields["Remarks"]):
+    if fields.get("Remarks") and (
+        _looks_like_label_text(fields["Remarks"])
+        or re.search(r"(?i)cardless\s*deposit|cash\s*deposit", fields["Remarks"])
+    ):
         fields.pop("Remarks", None)
     if fields.get("NARRATION") and not any("remark" in k.lower() for k in fields):
-        fields["Remarks"] = fields["NARRATION"]
+        narr = fields["NARRATION"]
+        if not re.search(r"(?i)cardless\s*deposit|cash\s*deposit", narr):
+            fields["Remarks"] = narr
     # 时间字段统一成 24 小时制（YYYY-MM-DD HH:MM:SS），去掉 AM/PM 与点号分隔
     for k in list(fields.keys()):
         if k in ("TIME",):

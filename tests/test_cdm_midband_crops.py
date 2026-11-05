@@ -4,7 +4,12 @@ from __future__ import annotations
 import numpy as np
 
 from app.ocr_engine import OcrLine
-from repayment_slip_ocr.main import _anchor_scale_y, _prepare_cdm_band_crops
+from repayment_slip_ocr.main import (
+    _anchor_scale_y,
+    _cdm_account_digits_weak,
+    _prepare_cdm_amount_band_crops,
+    _prepare_cdm_band_crops,
+)
 
 
 def _lr(text: str, x0, y0, x1, y1) -> OcrLine:
@@ -38,6 +43,34 @@ def test_ekala_party_band_covers_account_rows():
     assert crops
     # 至少一个窗口覆盖账号行中心 ~1600
     assert any(top <= 1600 <= top + crop.shape[0] for crop, top, _ in crops)
-    # 首窗不应落到 NOTES 表（~2500+）
-    first_top = crops[0][1]
-    assert first_top < 2000
+    # 锚点并集窗可能先于固定比例；固定比例首窗仍应在 NOTES 之上
+    ratio_tops = [top for crop, top, left in crops if left <= 30]
+    assert ratio_tops
+    assert min(ratio_tops) < 2000
+
+
+def test_kalutara_rotated_roi_covers_account_digits():
+    """竖排合成图：锚点并集裁剪须覆盖 ACCOUNT 数字列（约 x=730,y=1340）。"""
+    lines = [
+        _lr("ACCOUNT NUMBER:", 721, 1170, 753, 1295),
+        _lr("00109696", 730, 1306, 753, 1370),
+        _lr("CUSTOMER NAME LAK ARTHA SERVICES", 686, 1167, 730, 1436),
+        _lr("CARDLESS DEPOSIT", 744, 1276, 791, 1432),
+        _lr("NARRATION:", 646, 1175, 675, 1261),
+        _lr("DEPUSIT", 415, 1183, 438, 1236),
+        _lr("MOUNT", 537, 1425, 557, 1464),
+    ]
+    img = np.zeros((1500, 1200, 3), dtype=np.uint8)
+    crops = _prepare_cdm_band_crops(img, lines)
+    assert crops
+    assert any(
+        top <= 1340 <= top + crop.shape[0] and left <= 740 <= left + crop.shape[1]
+        for crop, top, left in crops
+    )
+    amt_crops = _prepare_cdm_amount_band_crops(img, lines)
+    assert amt_crops
+    assert any(
+        top <= 1440 <= top + crop.shape[0] for crop, top, _ in amt_crops
+    )
+    assert _cdm_account_digits_weak("00109696")
+    assert not _cdm_account_digits_weak("1001096962")

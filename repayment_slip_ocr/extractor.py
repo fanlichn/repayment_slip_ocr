@@ -2645,13 +2645,25 @@ def _build_label_fields(lines, labels, same_row: bool = False) -> dict:
             if not same_row:
                 value = _accept_below_value(key, _value_below(i, ordered, ln) or "")
         elif tall:
-            # 竖拍：先左侧（DATE/TIME/TERMINAL），再正下方（TRACE/STATUS），右侧银行名最后
+            # 竖拍：先左侧（DATE/TIME/TERMINAL）。TIME 同带右侧真值须先于正下方，
+            # 否则 DATE 列误读（01:11.26）会抢走 19:11。TRACE/STATUS 仍可走下方。
             left = _value_line_to_left(i, ordered, ln)
             if left is not None and _norm_label(left.text) not in wanted:
                 value = _accept_side_value(key, ln, left)
+            prefer_right_before_below = _norm_label(key) == "time"
+            if value is None and not same_row and prefer_right_before_below:
+                for cand in (
+                    _value_line_to_right(i, ordered, ln),
+                    _right_column_line(i, ordered, ln),
+                ):
+                    if cand is None or _norm_label(cand.text) in wanted:
+                        continue
+                    value = _accept_side_value(key, ln, cand)
+                    if value:
+                        break
             if value is None and not same_row:
                 value = _accept_below_value(key, _value_below(i, ordered, ln) or "")
-            if value is None and not same_row:
+            if value is None and not same_row and not prefer_right_before_below:
                 for cand in (
                     _value_line_to_right(i, ordered, ln),
                     _right_column_line(i, ordered, ln),
@@ -2787,6 +2799,22 @@ def _looks_like_terminal_id_value(value: str) -> bool:
     return bool(re.match(r"(?i)^R?[A-Z]{3,}\d*[A-Z]*HT$", compact))
 
 
+def _normalize_cdm_time(value: str) -> Optional[str]:
+    """归一化 CDM TIME：19.11 / 19:11 → 19:11；拒绝日期误读 01:11.26 / 01/11/26。"""
+    v = _clean(value or "")
+    if not v:
+        return None
+    # 日期或「时:分.年片段」不能当时间
+    if re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", v):
+        return None
+    if re.search(r"\d{1,2}:\d{2}\.\d{2}", v):
+        return None
+    m = re.match(r"^\s*([01]?\d|2[0-3])[.:\- ]([0-5]\d)\s*$", v)
+    if not m:
+        return None
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
 def _is_plausible_cdm_field_value(key: str, value: str) -> bool:
     """CDM 强类型字段取值校验，拒绝银行名/邻字段串位。"""
     v = _clean(value or "")
@@ -2798,7 +2826,7 @@ def _is_plausible_cdm_field_value(key: str, value: str) -> bool:
             r"(?i)bank|commercial|trace|terminal", v
         )
     if kn == "time":
-        return bool(re.match(r"^\s*([01]?\d|2[0-3])[:.\- ][0-5]\d\s*$", v))
+        return _normalize_cdm_time(v) is not None
     if kn == "terminalid":
         return _looks_like_terminal_id_value(v)
     if kn == "trace":
@@ -2807,6 +2835,23 @@ def _is_plausible_cdm_field_value(key: str, value: str) -> bool:
         if re.search(r"(?i)source\s*of\s*funds|unknown", v):
             return False
         return bool(re.search(r"(?i)\b(successful|success|failed|fail|rejected)\b", v))
+    if kn == "accountnumber":
+        return bool(re.fullmatch(r"\d{8,14}", re.sub(r"\s+", "", v)))
+    if kn == "transaction":
+        if re.search(r"(?i)commercial\s*bank|union\s*bank|\(il\)|deposit\s*amount|source\s*of", v):
+            return False
+        # 仅接受交易类型，拒绝单独的 AMOUNT / 面额表头
+        return bool(re.search(r"(?i)cardless\s*deposit|cash\s*deposit", v)) or bool(
+            re.fullmatch(r"(?i)deposit", v)
+        )
+    if kn == "customername":
+        if re.search(r"(?i)narration|mobile|account|bank|source", v):
+            return False
+        return len(re.findall(r"[A-Za-z]", v)) >= 6
+    if kn == "mobileno":
+        if re.search(r"(?i)narration|account|customer|bank", v):
+            return False
+        return bool(re.search(r"\d{7,}", v)) or v in {"-", "–", "—"}
     if kn == "depositamount":
         amt = _parse_money(v)
         # 账号常被误解析成超大金额；面额表张数等纯小整数也不当存款额
@@ -2825,8 +2870,7 @@ def _extract_cdm_typed_substring(key: str, text: str) -> Optional[str]:
         m = re.search(r"\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}", text)
         return m.group(0) if m else None
     if kn == "time":
-        m = re.search(r"\b([01]?\d|2[0-3])[:.\- ][0-5]\d\b", text)
-        return m.group(0).replace(".", ":").replace("-", ":").replace(" ", ":") if m else None
+        return _normalize_cdm_time(text)
     if kn == "terminalid":
         for tok in re.findall(r"[A-Za-z0-9]{6,}", text):
             if _looks_like_terminal_id_value(tok):
@@ -2838,11 +2882,27 @@ def _extract_cdm_typed_substring(key: str, text: str) -> Optional[str]:
     if kn == "transactionstatus":
         m = re.search(r"(?i)\b(successful|success|failed|fail|rejected)\b", text)
         return m.group(0).upper() if m else None
+    if kn == "accountnumber":
+        m = re.search(r"(?<!\d)(\d{8,14})(?!\d)", text)
+        return m.group(1) if m else None
+    if kn == "transaction":
+        m = re.search(r"(?i)cardless\s*deposit", text)
+        return "CARDLESS DEPOSIT" if m else None
+    if kn == "customername":
+        if re.search(r"(?i)narration|mobile|account", text):
+            return None
+        name = _clean_person_or_org_name(text)
+        return name
     return None
 
 
 def _pick_cdm_typed_near(idx: int, ordered, label_line, key: str) -> Optional[str]:
-    """在标签附近按左/下/右优先级挑选通过类型校验的值（竖拍优先左侧）。"""
+    """在标签附近按左/同带右/下优先级挑选通过类型校验的值。
+
+    TIME 在竖拍时值与标签同行，须优先 y 重叠的左右候选，避免下方日期误读
+    （01:11.26）抢走 19:11。
+    """
+    kn = _norm_label(key)
     label_cx = _line_center_x(label_line.box)
     label_cy = _line_center_y(label_line.box)
     label_left = min(p[0] for p in label_line.box)
@@ -2863,6 +2923,11 @@ def _pick_cdm_typed_near(idx: int, ordered, label_line, key: str) -> Optional[st
             if not extracted or not _is_plausible_cdm_field_value(key, extracted):
                 continue
             text = extracted
+        if kn == "time":
+            norm_t = _normalize_cdm_time(text)
+            if not norm_t:
+                continue
+            text = norm_t
         ox0 = min(p[0] for p in other.box)
         ox1 = max(p[0] for p in other.box)
         oy0 = min(p[1] for p in other.box)
@@ -2870,48 +2935,85 @@ def _pick_cdm_typed_near(idx: int, ordered, label_line, key: str) -> Optional[st
         ocx = _line_center_x(other.box)
         ocy = _line_center_y(other.box)
         y_overlap = max(0.0, min(ly1, oy1) - max(ly0, oy0))
+        conf = -float(getattr(other, "confidence", 0.0) or 0.0)
         if ox1 <= label_left + 30 and y_overlap > 0:
-            score = (0, -y_overlap, label_left - ox1)
-        elif oy0 >= label_bottom - 20 and abs(ocx - label_cx) < 180:
-            score = (1, max(0.0, oy0 - label_bottom), abs(ocx - label_cx))
+            score = (0, conf, -y_overlap, label_left - ox1)
         elif ox0 >= label_right - 20 and y_overlap > 0:
-            score = (2, -y_overlap, ox0 - label_right)
+            # 同带右侧：TIME 竖拍真值常在这里，优先于「下方」
+            score = (0, conf, -y_overlap, ox0 - label_right)
+        elif oy0 >= label_bottom - 20 and abs(ocx - label_cx) < 180:
+            # TIME 的正下方常是 DATE 列误读，降权
+            tier = 2 if kn == "time" else 1
+            score = (tier, conf, max(0.0, oy0 - label_bottom), abs(ocx - label_cx))
         else:
             dist = abs(ocx - label_cx) + abs(ocy - label_cy)
             if dist > 450:
                 continue
-            score = (3, dist, 0)
+            score = (3, conf, dist, 0)
         if best is None or score < best[0]:
             best = (score, _clean(text))
     return best[1] if best else None
 
 
 def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
-    """纠正竖拍/串列导致的 CDM DATE/TIME/TERMINAL/TRACE/STATUS 错绑。"""
-    typed_keys = ("DATE", "TIME", "TERMINAL ID", "TRACE", "TRANSACTION STATUS")
+    """纠正竖拍/串列导致的 CDM DATE/TIME/TERMINAL/TRACE/ACCOUNT 等错绑。"""
+    typed_keys = (
+        "DATE",
+        "TIME",
+        "TERMINAL ID",
+        "TRACE",
+        "TRANSACTION STATUS",
+        "ACCOUNT NUMBER",
+        "TRANSACTION",
+        "CUSTOMER NAME",
+        "MOBILE NO.",
+    )
     ordered = _sorted_by_y(lines)
     for key in typed_keys:
         cur = fields.get(key)
-        if cur and _is_plausible_cdm_field_value(key, cur):
+        # TIME/TRACE：即使当前值形态合法，也按几何+置信度重选（避免 01:11 日期误读、6359 低置信噪点）
+        force = key in {"TIME", "TRACE"} or (
+            cur is not None and not _is_plausible_cdm_field_value(key, cur)
+        )
+        if cur and _is_plausible_cdm_field_value(key, cur) and not force:
             continue
         label_i = None
         label_ln = None
         target = _norm_label(key)
         for i, ln in enumerate(ordered):
-            if _norm_label(ln.text) == target:
+            # TERMINAL / ERMINAL 等残缺标签
+            norm = _norm_label(ln.text)
+            if norm == target or (
+                key == "TERMINAL ID" and norm in {"terminal", "erminal", "terminalid"}
+            ):
+                label_i, label_ln = i, ln
+                break
+            if key == "TRANSACTION" and norm == "ransaction":
                 label_i, label_ln = i, ln
                 break
         found = None
         if label_ln is not None:
             found = _pick_cdm_typed_near(label_i, ordered, label_ln, key)
-        if found is None:
-            # 标签漏读时：全卡扫描符合类型的候选（TIME/TRACE/TERMINAL）
+        if found is None and key in (
+            "TIME",
+            "TRACE",
+            "TERMINAL ID",
+            "ACCOUNT NUMBER",
+            "TRANSACTION",
+        ):
+            # 标签漏读时：全卡扫描，TIME/TRACE 取置信度最高者
+            best = None
             for ln in ordered:
                 extracted = _extract_cdm_typed_substring(key, ln.text)
                 if extracted and _is_plausible_cdm_field_value(key, extracted):
-                    found = extracted
-                    break
+                    conf = float(getattr(ln, "confidence", 0.0) or 0.0)
+                    if best is None or conf > best[0]:
+                        best = (conf, extracted)
+            if best:
+                found = best[1]
         if found:
+            if key == "TIME":
+                found = _normalize_cdm_time(found) or found
             fields[key] = found
         elif key in fields and not _is_plausible_cdm_field_value(key, fields[key]):
             fields.pop(key, None)
@@ -3027,20 +3129,17 @@ def _synthesize_cdm_datetime_fields(fields: dict) -> dict:
     if time_v and _looks_like_terminal_id_value(time_v):
         fields.pop("TIME", None)
         time_v = None
-    if time_v and not re.match(r"^\s*([01]?\d|2[0-3])[:.\- ][0-5]\d\s*$", time_v):
-        # 非 HH:MM，避免合成错误时间
-        time_v = None
+    if time_v:
+        time_v = _normalize_cdm_time(time_v)
+        if time_v:
+            fields["TIME"] = time_v
+        else:
+            fields.pop("TIME", None)
     date_part = str(date_v).split()[0]
     if time_v:
-        t = time_v.strip().replace(".", ":").replace("-", ":").replace(" ", ":")
-        parts = t.split(":")
-        if len(parts) >= 2:
-            hh, mm = parts[0].zfill(2), parts[1].zfill(2)
-            ss = parts[2].zfill(2) if len(parts) > 2 else "00"
-            combined = f"{date_part} {hh}:{mm}:{ss}"
-            fields.setdefault("Date & Time", combined)
-            fields.setdefault("Transaction Date/Time", combined)
-            fields["TIME"] = f"{hh}:{mm}" if len(parts) == 2 else f"{hh}:{mm}:{ss}"
+        combined = f"{date_part} {time_v}:00"
+        fields.setdefault("Date & Time", combined)
+        fields.setdefault("Transaction Date/Time", combined)
     else:
         fields.setdefault("Date & Time", date_part if " " in str(date_v) else f"{date_part} 00:00:00")
     return fields

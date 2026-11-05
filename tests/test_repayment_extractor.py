@@ -460,6 +460,46 @@ def test_cdm_rotated_photo_values_left_of_tall_labels():
     assert r.fields["ACCOUNT NUMBER"] == "1001096962"
 
 
+def test_cdm_rotated_time_not_stolen_from_date_ocr():
+    """竖拍 Commercial CARDLESS：TIME 同带右侧 19:11/19.11，不得被 DATE 列 01:11.26 抢走；
+    TRACE 取高置信 6399 而非噪点 6359；ACCOUNT/TRANSACTION 不得绑银行名。"""
+    lines = [
+        _lr("6399", 2032, 1613, 2110, 1768, 0.999),
+        _lr("19.11", 1915, 1600, 1976, 1751, 0.999),
+        _lr("1001096962", 2339, 1273, 2417, 1625, 0.999),
+        _lr("TRACE", 2045, 1977, 2110, 2158),
+        _lr("DATE", 1855, 2003, 1915, 2172),
+        _lr("01/11/26", 1907, 1870, 1985, 2167, 0.996),
+        _lr("TIME", 1850, 1618, 1920, 1755, 0.992),
+        _lr("19:11", 1911, 1609, 1976, 1751, 0.923),
+        _lr("CARDLESS DEPOSIT", 2196, 1092, 2283, 1633),
+        _lr("TRANSACTION", 2223, 1760, 2301, 2144),
+        _lr("ORBUSNE1HT", 1893, 1065, 1954, 1395),
+        _lr("TERMINAL", 1823, 1097, 1888, 1389),
+        _lr("ACCOUNT NUMBER", 2339, 1646, 2426, 2165),
+        _lr("COMMERCIAL BANK OF CEYLON PLC", 1512, 1104, 1599, 2078),
+        _lr("(IL) COMMERCIAL BANK", 1278, 962, 1426, 2132, 0.916),
+        _lr("NARRATION AWA5JG", 2669, 1601, 2743, 2161),
+        _lr("01:11.26", 1911, 1870, 1985, 2167, 0.929),
+        _lr("11:61", 1911, 1609, 1976, 1751, 0.794),
+        _lr("6359", 2037, 1626, 2102, 1764, 0.547),
+        _lr("LKR 5,000.00", 3344, 1404, 3435, 1862),
+        _lr("SUCCESSFUL", 3631, 966, 3709, 1325),
+    ]
+    r = extract(lines)
+
+    assert r.fields["TIME"] == "19:11"
+    assert r.fields["TRACE"] == "6399"
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+    assert r.fields["TRANSACTION"] == "CARDLESS DEPOSIT"
+    assert r.fields["TERMINAL ID"] == "ORBUSNE1HT"
+    assert r.fields["NARRATION"] == "AWA5JG"
+    assert r.fields.get("MOBILE NO.") in (None, "", "-", "–", "—")
+    assert r.fields["Date & Time"] == "2026-11-01 19:11:00"
+    assert r.datetime == "2026-11-01T19:11:00"
+    assert r.amount == 5000.0
+
+
 def test_cdm_without_cardless_keyword_still_extracts_headers():
     """OCR 漏读 CARDLESS DEPOSIT 时，凭 DATE/TIME/TERMINAL/DEPOSIT AMOUNT 仍应按 CDM 提取。"""
     lines = [

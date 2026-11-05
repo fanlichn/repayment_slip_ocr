@@ -69,8 +69,10 @@ def build_variants(img: np.ndarray) -> list[dict]:
         denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15
     )
 
+    # color_raw：不纠偏。手持小票拇指/背景易把 skew 估歪，纠偏后中间账号行反而消失。
     return [
         {"name": "color", "img": color},
+        {"name": "color_raw", "img": img},
         {"name": "enhanced", "img": enhanced},
         {"name": "binarized", "img": binarized},
     ]

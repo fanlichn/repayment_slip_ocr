@@ -3197,11 +3197,39 @@ _BRANCH_RE = re.compile(r"(?i)^[a-z0-9][a-z0-9\-./ ]*\bbr\b$")
 
 
 def _extract_branch(lines) -> Optional[str]:
-    """存款凭条网点：通常以 "BR"（branch）结尾，如 "BANDARAG-CRM2 BR"。"""
-    for ln in _sorted_by_y(lines):
+    """存款凭条网点：通常以 "BR"（branch）结尾，如 "BANDARAG-CRM2 BR"。
+
+    OCR 常把 "EKALA-CRM1 BR" 拆成同行的 "EKALA-CRM1" + "BR"，需拼接。
+    """
+    ordered = _sorted_by_y(lines)
+    for ln in ordered:
         t = ln.text.strip()
         if _BRANCH_RE.fullmatch(t):
             return t
+    for ln in ordered:
+        if ln.text.strip().upper() != "BR":
+            continue
+        br_y = _line_center_y(ln.box)
+        br_left = min(p[0] for p in ln.box)
+        best = None
+        for other in ordered:
+            if other is ln:
+                continue
+            if abs(_line_center_y(other.box) - br_y) > 45:
+                continue
+            other_right = max(p[0] for p in other.box)
+            if other_right > br_left + 15:
+                continue
+            text = other.text.strip()
+            if not re.match(r"(?i)^[A-Z0-9][A-Z0-9\-./]{2,}$", text):
+                continue
+            if text.upper() in {"DATE", "TIME", "TRACE", "NOTES", "VALUE", "AMOUNT", "LKR", "BANK"}:
+                continue
+            gap = br_left - other_right
+            if best is None or gap < best[0]:
+                best = (gap, f"{text} BR")
+        if best:
+            return best[1]
     return _match_label_value(lines, ["branch", "branch name"])
 
 
@@ -3417,6 +3445,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             fields["ACCOUNT NUMBER"] = payee.account
         if not fields.get("CUSTOMER NAME") and payee.name:
             fields["CUSTOMER NAME"] = payee.name
+        if branch:
+            fields.setdefault("BRANCH", branch)
         if not fields.get("DEPOSIT AMOUNT") and amount is not None:
             fields["DEPOSIT AMOUNT"] = f"{amount:,.2f}"
         # fields 已有 DEPOSIT AMOUNT 但结构化 amount 仍空时回填（如 OCR 标签拼写损坏）

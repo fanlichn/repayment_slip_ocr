@@ -9,14 +9,14 @@ import base64
 import binascii
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from app.config import get_settings
 from app.logging_setup import setup_logging
-from app.ocr_engine import create_engine
+from app.ocr_engine import OcrLine, create_engine
 from app.preprocessing import build_variants, load_image
 from app.url_fetch import UrlFetchError, fetch_image_bytes
 
@@ -79,19 +79,86 @@ def _structured_fallback(result) -> Dict[str, Any]:
     }
 
 
+def _line_center_y(box) -> float:
+    return sum(p[1] for p in box) / len(box)
+
+
+def _cdm_missing_party_fields(result) -> bool:
+    """CDM 已识别但缺少账号/户名时，需要对中间带复检。"""
+    fields = result.fields or {}
+    is_cdm = (
+        result.doc_type == "cash_deposit_slip"
+        or str(fields.get("TRANSACTION", "")).upper().find("CARDLESS") >= 0
+        or bool(fields.get("TERMINAL ID") and fields.get("DEPOSIT AMOUNT"))
+    )
+    if not is_cdm:
+        return False
+    return not fields.get("ACCOUNT NUMBER") or not fields.get("CUSTOMER NAME")
+
+
+def _anchor_y(lines: List[OcrLine], patterns: List[str]) -> Optional[float]:
+    for ln in lines:
+        low = ln.text.lower()
+        if any(p in low for p in patterns):
+            return _line_center_y(ln.box)
+    return None
+
+
+def _offset_ocr_lines(lines: List[OcrLine], dy: float, dx: float = 0.0) -> List[OcrLine]:
+    out: List[OcrLine] = []
+    for ln in lines:
+        box = [[p[0] + dx, p[1] + dy] for p in ln.box]
+        out.append(OcrLine(text=ln.text, confidence=ln.confidence, box=box))
+    return out
+
+
+def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
+    """对 CDM 的 TRANSACTION~NARRATION/NOTES 中间带二次 OCR，补账号/户名。"""
+    h, w = img.shape[:2]
+    y0 = _anchor_y(lines, ["cardless", "transaction"])
+    y1 = _anchor_y(lines, ["narration", "mobile", "source of funds", "notes", "value"])
+    if y0 is None or y1 is None or y1 <= y0 + 60:
+        y0 = h * 0.30
+        y1 = h * 0.58
+    pad = int(h * 0.02)
+    top = max(0, int(y0) - pad)
+    bottom = min(h, int(y1) + pad)
+    if bottom - top < 50:
+        return []
+    # 左手拇指常挡左侧标签，右半+中间更易读出账号/户名
+    left = int(w * 0.05)
+    crop = img[top:bottom, left:w]
+    if crop.size == 0:
+        return []
+    raw = engine.recognize(crop)
+    return _offset_ocr_lines(raw, dy=float(top), dx=float(left))
+
+
 def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     settings = get_settings()
     if len(buf) > settings.max_upload_bytes:
         raise HTTPException(status_code=413, detail="文件过大")
     t0 = time.perf_counter()
     img = load_image(buf)
-    lines = []
-    for variant in build_variants(img):
+    variants = build_variants(img)
+    lines: List[OcrLine] = []
+    for variant in variants:
         lines.extend(_engine.recognize(variant["img"]))
 
     unique = dedup_lines(lines)
 
-    result = extract(unique, include_lines=include_lines)
+    result = extract(unique, include_lines=False)
+    # CDM 中间段（ACCOUNT/CUSTOMER）易被拇指/倾角漏检：对中间带复检一次
+    if _cdm_missing_party_fields(result):
+        extra = _ocr_cdm_party_band(_engine, variants[0]["img"], unique)
+        if extra:
+            unique = dedup_lines(unique + extra)
+            result = extract(unique, include_lines=include_lines)
+        elif include_lines:
+            result = extract(unique, include_lines=True)
+    elif include_lines:
+        result = extract(unique, include_lines=True)
+
     result.elapsed_ms = (time.perf_counter() - t0) * 1000
     out: Dict[str, Any] = {"success": result.success}
     out.update(result.fields if result.fields else _structured_fallback(result))

@@ -564,29 +564,95 @@ def _recover_cdm_deposit_amount_from_notes_band(lines) -> Optional[float]:
         return None
     counts = Counter(round(c[0], 2) for c in cands)
     non = [c for c in cands if not c[3]]
+    picked = None
     if non:
         max_val = max(c[0] for c in non)
         # 行 AMOUNT + DEPOSIT 总额重复出现 → 可信
         if counts[round(max_val, 2)] >= 2:
             top = [c for c in non if abs(c[0] - max_val) < 0.01]
             top.sort(key=lambda c: (-c[2], -c[1]))
-            return top[0][0]
-        others = [c[0] for c in cands if abs(c[0] - max_val) > 0.01]
-        # 多行面额表时：候选必须严格大于带内其它金额，否则只是某一行小计（如 400）
-        if others and max_val <= max(others) + 0.01:
-            return None
-        if qty_like >= 2 and not others:
-            # 只有一个非面额金额且多行张数 → 更像行小计，缺总额
-            return None
-        top = [c for c in non if abs(c[0] - max_val) < 0.01]
-        top.sort(key=lambda c: (-c[2], -c[1]))
-        return top[0][0]
-    # 仅有面额面值时：同一金额至少出现两次（行 AMOUNT + DEPOSIT 总额）才采纳，
-    # 避免不完整面额表把单个 500.00 当成存款总额。
-    dups = [v for v, n in counts.items() if n >= 2]
-    if not dups:
+            picked = top[0][0]
+        else:
+            others = [c[0] for c in cands if abs(c[0] - max_val) > 0.01]
+            # 多行面额表时：候选必须严格大于带内其它金额，否则只是某一行小计（如 400）
+            if not (others and max_val <= max(others) + 0.01) and not (
+                qty_like >= 2 and not others
+            ):
+                top = [c for c in non if abs(c[0] - max_val) < 0.01]
+                top.sort(key=lambda c: (-c[2], -c[1]))
+                picked = top[0][0]
+    if picked is None:
+        # 仅有面额面值时：同一金额至少出现两次（行 AMOUNT + DEPOSIT 总额）才采纳
+        dups = [v for v, n in counts.items() if n >= 2]
+        if dups:
+            picked = max(dups)
+    if picked is None:
+        # VALUE 列漏读时：NOTES 张数行与 AMOUNT 列行数一致则加总行小计
+        picked = _sum_cdm_notes_amount_column(lines)
+    return picked
+
+
+def _sum_cdm_notes_amount_column(lines) -> Optional[float]:
+    """NOTES/VALUE/AMOUNT 表：张数行与 AMOUNT 列一一对应时加总为存款额。
+
+    折痕常漏 VALUE 的 5,000，但仍可能认出 AMOUNT 的 10,000.00；
+    此时 400+1000+10000=11400 比放弃更可靠。
+    """
+    if not _has_notes_value_table(lines):
         return None
-    return max(dups)
+    ordered = _sorted_by_y(lines)
+    headers: dict = {}
+    for ln in ordered:
+        t = ln.text.strip().lower().rstrip(":.")
+        if _looks_like_notes_header(t):
+            t = "notes"
+        if t in ("notes", "value", "amount") and t not in headers:
+            headers[t] = (ln, _line_center_x(ln.box), _line_center_y(ln.box))
+    if not ("notes" in headers and "amount" in headers):
+        return None
+    notes_cx = headers["notes"][1]
+    amount_cx = headers["amount"][1]
+    value_cx = headers["value"][1] if "value" in headers else (notes_cx + amount_cx) / 2
+    if not (notes_cx < value_cx < amount_cx or notes_cx < amount_cx):
+        return None
+    b_amt = (value_cx + amount_cx) / 2 if "value" in headers else (notes_cx + amount_cx) / 2
+    header_y = min(headers[k][2] for k in headers)
+    qty_rows: list = []
+    amount_rows: list = []
+    for ln in ordered:
+        y = _line_center_y(ln.box)
+        if y <= header_y + 2:
+            continue
+        t = ln.text.strip()
+        low = t.lower().rstrip(":.")
+        if low in ("notes", "value", "amount") or "deposit" in low:
+            continue
+        cx = _line_center_x(ln.box)
+        if cx < b_amt and re.fullmatch(r"\d{1,3}", t):
+            conf = float(getattr(ln, "confidence", 0.0) or 0.0)
+            if qty_rows and abs(y - qty_rows[-1][0]) < 15:
+                if conf > qty_rows[-1][2]:
+                    qty_rows[-1] = (y, int(t), conf)
+            else:
+                qty_rows.append((y, int(t), conf))
+        elif cx >= b_amt:
+            val = _parse_money(t)
+            if val is None or val < 100 or val >= 50_000_000:
+                continue
+            if amount_rows and abs(y - amount_rows[-1][0]) < 15:
+                if val > amount_rows[-1][1]:
+                    amount_rows[-1] = (y, val)
+            else:
+                amount_rows.append((y, val))
+    if len(qty_rows) < 2 or len(qty_rows) != len(amount_rows):
+        return None
+    total = sum(v for _, v in amount_rows)
+    if total < 100:
+        return None
+    # 加总必须严格大于任一单行（否则只是重复识别同一行）
+    if total <= max(v for _, v in amount_rows) + 0.01:
+        return None
+    return total
 
 
 def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optional[float]:
@@ -3400,6 +3466,10 @@ def _repair_cdm_date_ocr(text: str) -> Optional[str]:
     m = re.search(r"\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}", text)
     if m:
         return m.group(0)
+    # 02711/20 → 02/11/20
+    m = re.search(r"(?<!\d)(\d{2})(\d{2})[/.\-](\d{2,4})(?!\d)", text)
+    if m and 1 <= int(m.group(2)) <= 12:
+        return f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
     repaired = (
         text.replace("l", "0")
         .replace("I", "1")
@@ -3416,6 +3486,49 @@ def _repair_cdm_date_ocr(text: str) -> Optional[str]:
     if not (1 <= d <= 31 and 1 <= mo <= 12):
         return None
     return f"{d:02d}/{mo:02d}/{y}"
+
+
+def _cdm_date_year(raw: str) -> Optional[int]:
+    """从 CDM 日期串取出四位年份。"""
+    if not raw:
+        return None
+    iso = _parse_datetime(raw.strip())
+    if iso:
+        try:
+            return datetime.fromisoformat(iso).year
+        except ValueError:
+            pass
+    m = re.search(r"[/.\-](\d{2,4})\s*$", raw.strip())
+    if not m:
+        return None
+    y = m.group(1)
+    if len(y) == 4:
+        return int(y)
+    yi = int(y)
+    return 2000 + yi if yi < 100 else yi
+
+
+def _pick_best_cdm_date(lines) -> Optional[str]:
+    """多日期 OCR 变体时优选：避免 02/11/20（截断）压过 l2 11 26→02/11/26。"""
+    now_y = datetime.now().year
+    best = None
+    for ln in lines:
+        raw = _repair_cdm_date_ocr(ln.text)
+        if not raw or not _is_plausible_cdm_field_value("DATE", raw):
+            continue
+        year = _cdm_date_year(raw)
+        if year is None or year < 2018 or year > now_y + 1:
+            continue
+        conf = float(getattr(ln, "confidence", 0.0) or 0.0)
+        # 年份越接近当前越好；同距时偏好置信度；偏好「…26」完整两位年末位
+        year_gap = abs(year - now_y)
+        yy_token = re.search(r"[/.\-](\d{2,4})\s*$", raw)
+        yy = yy_token.group(1) if yy_token else ""
+        # 惩罚明显截断：高置信 …/20 而同图另有 …/26
+        score = (-year_gap, len(yy), conf, -len(raw))
+        if best is None or score > best[0]:
+            best = (score, raw)
+    return best[1] if best else None
 
 
 def _extract_cdm_typed_substring(key: str, text: str) -> Optional[str]:
@@ -3659,6 +3772,14 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
     ordered = _sorted_by_y(lines)
     for key in typed_keys:
         cur = fields.get(key)
+        # DATE：全卡多候选优选（02/11/20 截断不得压过 l2 11 26）
+        if key == "DATE":
+            best_date = _pick_best_cdm_date(lines)
+            if best_date:
+                fields["DATE"] = best_date
+            elif cur and not _is_plausible_cdm_field_value(key, cur):
+                fields.pop(key, None)
+            continue
         # TIME/TRACE：即使当前值形态合法，也按几何+置信度重选（避免 01:11 日期误读、6359 低置信噪点）
         force = key in {"TIME", "TRACE"} or (
             cur is not None and not _is_plausible_cdm_field_value(key, cur)

@@ -1544,7 +1544,7 @@ def test_kalutara_rotated_sparse_ocr_completes_account_and_scrub():
 
 def test_cdm_crease_sparse_ocr_not_row_amount():
     """NAWALAPI：折痕导致漏读 CARDLESS/账号/总额时，不得把行小计 400 当存款额，
-    仍应识别为 CDM 并抽出 DATE/TIME/TRACE。"""
+    仍应识别为 CDM 并抽出 DATE/TIME/TRACE；日期不得被 02/11/20 截成 2020。"""
     lines = [
         _lr("DATE", 500, 1238, 682, 1320),
         _lr("TIME", 981, 1211, 1157, 1305),
@@ -1552,6 +1552,7 @@ def test_cdm_crease_sparse_ocr_not_row_amount():
         _lr("3528", 999, 1429, 1183, 1523),
         _lr("0803", 984, 1282, 1194, 1376, 0.99),
         _lr("08:03", 983, 1287, 1193, 1381, 0.92),
+        _lr("02/11/20", 511, 1338, 841, 1393, 0.90),
         _lr("l2 11 26", 504, 1319, 843, 1397, 0.79),
         _lr("NOTES", 604, 2874, 831, 2972),
         _lr("VALUE", 979, 2843, 1198, 2937),
@@ -1572,12 +1573,40 @@ def test_cdm_crease_sparse_ocr_not_row_amount():
     assert r.fields.get("TRANSACTION") == "CARDLESS DEPOSIT"
     assert r.fields.get("TRACE") == "3528"
     assert r.fields.get("TIME") == "08:03"
-    assert "2026-11-02" in str(r.fields.get("DATE") or "") or "02/11/26" in str(
-        r.fields.get("DATE") or ""
-    )
+    assert "2026-11-02" in str(r.fields.get("DATE") or "")
+    assert "2020" not in str(r.fields.get("DATE") or "")
     # 不得把 4×100 的行小计当成存款总额
     assert r.amount != 400.0
     assert r.fields.get("DEPOSIT AMOUNT") != "400.00"
+
+
+def test_cdm_sum_amount_column_when_value_col_missing():
+    """VALUE 列漏 5000 但 AMOUNT 列有 400+1000+10000 时，加总得 11400。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 16, x1, y + 16)
+    lines = [
+        L("DATE", 500, 682, 1280),
+        L("02/11/26", 500, 843, 1360),
+        L("TIME", 981, 1157, 1260),
+        L("08:03", 983, 1193, 1340),
+        L("TRACE", 513, 734, 1500),
+        L("3528", 999, 1183, 1480),
+        L("TRANSACTION", 533, 997, 1720),
+        L("CARDLESS DEPOSIT", 1148, 1866, 1720),
+        L("NOTES", 604, 831, 2880),
+        L("VALUE", 979, 1198, 2860),
+        L("AMOUNT", 1873, 2131, 2800),
+        L("4", 829, 881, 3040),
+        L("100.00", 1238, 1493, 3020),
+        L("400.00", 1888, 2156, 2980),
+        L("1", 833, 890, 3130),
+        L("1,000.00", 1813, 2160, 3070),
+        L("2", 847, 890, 3230),
+        L("10,000.00", 1813, 2160, 3170),
+        L("LKR", 1413, 1561, 3350),
+    ]
+    r = extract(lines)
+    assert r.amount == 11400.0
+    assert "11,400.00" in str(r.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
 
 
 def test_cdm_deposit_label_must_not_take_nearest_row_amount():

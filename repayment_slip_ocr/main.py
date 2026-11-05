@@ -445,6 +445,7 @@ def _prepare_cdm_amount_band_crops(img: np.ndarray, lines: List[OcrLine]) -> Lis
             "amount",
             "mount",
             "notes",
+            "hotes",
             "value",
             "lkr",
             "successful",
@@ -452,16 +453,33 @@ def _prepare_cdm_amount_band_crops(img: np.ndarray, lines: List[OcrLine]) -> Lis
         ],
     )
     if amt_boxes:
-        roi = _roi_from_boxes(img, amt_boxes, pad_x=0.08, pad_y=0.06)
+        roi = _roi_from_boxes(img, amt_boxes, pad_x=0.10, pad_y=0.10)
         if roi:
             _add(*roi)
-    # 正拍：下部金额带；合成图：右下/底部收据区
-    left = max(0, int(w * 0.01))
+        # 细横条：专打 DEPOSIT AMOUNT / 底部 LKR 旁总额（折痕时宽幅裁易漏）
+        ys = [_line_center_y(b) for b in amt_boxes]
+        y_mid = sum(ys) / len(ys)
+        y_max = max(ys)
+        for y_a, y_b, x_a in (
+            (y_max - h * 0.02, min(h, y_max + h * 0.12), 0.35),
+            (y_mid, min(h, y_max + h * 0.18), 0.40),
+            (max(0, y_max - h * 0.05), min(h, y_max + h * 0.08), 0.45),
+        ):
+            top = max(0, int(y_a))
+            bottom = min(h, int(y_b))
+            x0 = max(0, int(w * x_a))
+            if bottom - top < 28:
+                continue
+            _add(img[top:bottom, x0:w], float(top), float(x0))
+    # 正拍：下部金额带；右下专攻总额列；合成图底部收据区
     for y_a, y_b, x_a in (
         (h * 0.55, h * 0.92, 0.01),
         (h * 0.65, h * 0.98, 0.01),
         (h * 0.70, h * 0.99, 0.20),
+        (h * 0.75, h * 0.99, 0.40),
+        (h * 0.80, h * 1.00, 0.35),
         (h * 0.45, h * 0.85, 0.25),
+        (h * 0.58, h * 0.88, 0.50),
     ):
         top = max(0, int(y_a))
         bottom = min(h, int(y_b))
@@ -545,8 +563,10 @@ def _ocr_cdm_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
         return _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
 
     for crop, top, left in _prepare_cdm_amount_band_crops(img, lines):
+        thin = crop.shape[0] < 180
+        scales = (2.0, 2.5, 3.0, 3.5) if thin else (1.5, 2.0, 2.5, 3.0)
         for prep in _cdm_band_prep_variants(crop):
-            for scale in (1.0, 2.0, 2.5):
+            for scale in scales:
                 found = dedup_lines(found + _run(prep, top, left, scale))
                 if _has_cdm_deposit_amount_text(found):
                     return found

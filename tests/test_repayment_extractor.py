@@ -421,6 +421,45 @@ def test_cdm_trace_value_under_time_column_not_stolen():
     assert r.datetime == "2026-11-02T19:28:00"
 
 
+def test_cdm_rotated_photo_values_left_of_tall_labels():
+    """竖拍 CDM：DATE/TIME/TERMINAL 为竖排高框、值在左侧；右侧银行名不得抢占 TIME。"""
+    lines = [
+        _lr("3760", 2512, 961, 2584, 1128),
+        _lr("02/11/26", 2640, 592, 2724, 874),
+        _lr("TERMINAL ID", 2704, 1342, 2780, 1728),
+        _lr("TRACE", 2516, 588, 2588, 766),
+        _lr("DATE", 2716, 592, 2776, 735),
+        _lr("TIME", 2712, 981, 2772, 1132),
+        _lr("14:13", 2640, 985, 2712, 1159),
+        _lr("COMMERCIAL BANK OF CEYLON PLC", 3024, 683, 3104, 1668),
+        _lr("CUSTOMER NAME :LAK ARTHA SERVICES", 2035, 559, 2153, 1684),
+        _lr(" SOURCE OF FUNDS: UNKNOWN", 1531, 539, 1633, 1331),
+        _lr("SUCCESSFUL", 911, 1289, 1017, 1693),
+        _lr("TRANSACTION : CARDLESS DEPOSIT", 2308, 576, 2400, 1648),
+        _lr("TRANSACTION STATUS", 940, 639, 1020, 1267),
+        _lr("ACCOUNT NUMBER: 1001096962", 2180, 571, 2272, 1450),
+        _lr("RCINNAMTHT", 2627, 1334, 2709, 1684),
+        _lr(" COLOMBO7 CRM1 BR", 2888, 901, 2976, 1469),
+        _lr("CD COMMERCIAL BANK", 3188, 651, 3332, 1811),
+        _lr("DEPOSIT AMOUNT:", 1067, 523, 1165, 1037),
+        _lr("5, 000. 00", 1043, 1492, 1137, 1811),
+        _lr("LKR 5, 000. 00", 1199, 817, 1293, 1263),
+    ]
+    r = extract(lines)
+
+    assert r.fields["DATE"] == "2026-11-02 00:00:00"
+    assert r.fields["TIME"] == "14:13"
+    assert r.fields["TERMINAL ID"] == "RCINNAMTHT"
+    assert r.fields["TRACE"] == "3760"
+    assert r.fields["TRANSACTION STATUS"] == "SUCCESSFUL"
+    assert r.fields["Date & Time"] == "2026-11-02 14:13:00"
+    assert r.datetime == "2026-11-02T14:13:00"
+    assert r.terminal_id == "RCINNAMTHT"
+    assert r.trace_no == "3760"
+    assert r.amount == 5000.0
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+
+
 def test_cdm_without_cardless_keyword_still_extracts_headers():
     """OCR 漏读 CARDLESS DEPOSIT 时，凭 DATE/TIME/TERMINAL/DEPOSIT AMOUNT 仍应按 CDM 提取。"""
     lines = [

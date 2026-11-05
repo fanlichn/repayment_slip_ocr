@@ -123,6 +123,15 @@ def _is_rotated_box(box) -> bool:
     )
 
 
+def _is_tall_box(box) -> bool:
+    """轴对齐但明显竖直的文本框（竖拍凭条上 OCR 读出的竖排标签）。"""
+    xs = [p[0] for p in box]
+    ys = [p[1] for p in box]
+    w = max(xs) - min(xs)
+    h = max(ys) - min(ys)
+    return h > max(60.0, 1.5 * max(w, 1.0))
+
+
 def _sorted_by_y(lines) -> List:
     return sorted(lines, key=lambda l: _line_center_y(l.box))
 
@@ -205,8 +214,11 @@ def _value_below(idx: int, lines, label_line) -> Optional[str]:
     （left-x 仍可能落入旧的 200px 窗口）抢给 DATE/TIME。
     打分优先更近的下一行（dy），再比水平对齐（dx）：TRACE 的值常印在 TIME
     列正下方，若先比 dx 会越过本列的 HH:MM 误取 TRACE 号。
+    竖排高标签以底边起算 dy，否则标签自身高度会把正下方值挤出 160px 窗口。
     """
-    base_y = _line_center_y(label_line.box)
+    tall = _is_tall_box(label_line.box)
+    label_bottom = max(p[1] for p in label_line.box)
+    base_y = label_bottom if tall else _line_center_y(label_line.box)
     label_left = min(p[0] for p in label_line.box)
     label_cx = _line_center_x(label_line.box)
     best = None
@@ -216,12 +228,19 @@ def _value_below(idx: int, lines, label_line) -> Optional[str]:
         text = other.text.strip()
         if not text or _looks_like_label_text(text):
             continue
+        other_top = min(p[1] for p in other.box)
         y = _line_center_y(other.box)
         other_left = min(p[0] for p in other.box)
         other_cx = _line_center_x(other.box)
-        dy = y - base_y
-        if dy <= 2 or dy > 160:
-            continue
+        if tall:
+            dy = other_top - base_y
+            if dy < -15 or dy > 220:
+                continue
+            dy = max(dy, 0.0) + 0.01  # 保持「越近越好」
+        else:
+            dy = y - base_y
+            if dy <= 2 or dy > 160:
+                continue
         # 宽标签（如 Beneficiary Account Number）中心偏右，值往往左对齐；
         # 窄并列表头则中心对齐更稳。取 left/center 较小 dx。
         dx = min(abs(other_left - label_left), abs(other_cx - label_cx))
@@ -261,6 +280,30 @@ def _value_line_to_right(idx: int, lines, label_line):
         overlap = min(ly1, oy1) - max(ly0, oy0)
         if best is None or overlap > best[0]:
             best = (overlap, other)
+    return best[1] if best else None
+
+
+def _value_line_to_left(idx: int, lines, label_line):
+    """返回与标签同一水平带、位于左侧的最佳值行（竖拍 CDM：值在标签左侧）。"""
+    ly0 = min(p[1] for p in label_line.box)
+    ly1 = max(p[1] for p in label_line.box)
+    label_left_x = min(p[0] for p in label_line.box)
+    best = None
+    for j, other in enumerate(lines):
+        if j == idx:
+            continue
+        ox1 = max(p[0] for p in other.box)
+        oy0 = min(p[1] for p in other.box)
+        oy1 = max(p[1] for p in other.box)
+        if ox1 > label_left_x + 25:
+            continue
+        if max(ly0, oy0) >= min(ly1, oy1):
+            continue
+        overlap = min(ly1, oy1) - max(ly0, oy0)
+        gap = label_left_x - ox1
+        score = (-overlap, gap)
+        if best is None or score < best[0]:
+            best = (score, other)
     return best[1] if best else None
 
 
@@ -375,12 +418,21 @@ def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optiona
         dy = abs(oy - ly)
         if dy > max_dy:
             continue
+        if re.search(r"(?i)account\s*number|customer\s*name|source\s*of\s*funds", other.text):
+            continue
         val = _parse_money(other.text)
         if val is None:
             continue
         # 存款金额通常 ≥ 100，< 100 的纯整数多半是 OCR 噪声
         # （如 "000008" 由 "8,000.00" 读坏而来），跳过
         if val < 100 and val == int(val):
+            continue
+        # 账号行数字（8–12 位无小数）或超大整数不是存款金额
+        if val >= 50_000_000 or (
+            val >= 1_000_000
+            and val == int(val)
+            and not re.search(r"(?i)lkr|rs\.?|[.,]\d{2}", other.text)
+        ):
             continue
         # DEPOSIT AMOUNT 上方面额表 VALUE 列的单位面额（500/1000）不能当存款总额；
         # 5000/10000 本身也常是存款总额，不可一律跳过。
@@ -2292,40 +2344,107 @@ def _build_label_fields(lines, labels, same_row: bool = False) -> dict:
                 continue  # 同列上下堆叠，不是并排表头
             header_row_labels.add(id(a))
             header_row_labels.add(id(b))
+    def _accept_amountish(key: str, value: str) -> Optional[str]:
+        """金额类标签拒绝邻字段/账号串，必要时改找近旁金额。"""
+        if "amount" not in _norm_label(key):
+            return value
+        if re.search(r"(?i)source\s*of\s*funds|account\s*number|customer\s*name|terminal|trace", value):
+            return None
+        if _norm_label(value) == "lkr":
+            return None
+        amt = _parse_money(value)
+        if amt is None or amt >= 50_000_000:
+            return None
+        if amt < 100 and amt == int(amt) and not re.search(r"[.,]\d{2}", value):
+            return None
+        return value
+
+    def _accept_side_value(key: str, label_ln, side_line) -> Optional[str]:
+        side_value = _collect_column_block(ordered, side_line)
+        if not side_value or _looks_like_label_text(side_value):
+            return None
+        if _norm_label(side_value) == "lkr" and "amount" in _norm_label(key):
+            money = _money_near_label_right(ordered, label_ln)
+            if money is not None:
+                return f"{money:,.2f}"
+            return None
+        return _accept_amountish(key, side_value)
+
+    def _accept_below_value(key: str, below: str) -> Optional[str]:
+        if not below or _looks_like_label_text(below):
+            return None
+        below_norm = _norm_label(below)
+        # 下方是另一个标签（或标签+值，如空值字段 "NARRATION:" 下接 "MOBILE NO. :"），
+        # 不应作为当前字段的值
+        if below_norm in wanted or any(below_norm.startswith(n) for n in wanted):
+            return None
+        return _accept_amountish(key, below)
+
     # 两栏：左标签、右值 / 下方取值（标签独占一行）
     for i, ln in enumerate(ordered):
         key = wanted.get(_norm_label(ln.text))
         if key is None or key in fields:
             continue
         adjacent_header = id(ln) in header_row_labels
-        side_line = None
-        if not adjacent_header:
-            side_line = _value_line_to_right(i, ordered, ln)
-            if side_line is not None and _norm_label(side_line.text) in wanted:
-                side_line = None  # 右侧是相邻标签，非值
-            if side_line is None and not same_row:
-                side_line = _right_column_line(i, ordered, ln)
-                if side_line is not None and _norm_label(side_line.text) in wanted:
-                    side_line = None
-        if side_line is not None:
-            side_value = _collect_column_block(ordered, side_line)
-            # 跳过标签词（如面额表表头 "AMOUNT"）
-            if side_value and not _looks_like_label_text(side_value):
-                # 金额字段右侧若是纯币种词 LKR（值被 OCR 拆成 "LKR" + 金额），改找金额数字
-                if _norm_label(side_value) == "lkr" and "amount" in _norm_label(key):
-                    money = _money_near_label_right(ordered, ln)
-                    if money is not None:
-                        fields[key] = f"{money:,.2f}"
+        tall = _is_tall_box(ln.box)
+        value = None
+        if adjacent_header:
+            if not same_row:
+                value = _accept_below_value(key, _value_below(i, ordered, ln) or "")
+        elif tall:
+            # 竖拍：先左侧（DATE/TIME/TERMINAL），再正下方（TRACE/STATUS），右侧银行名最后
+            left = _value_line_to_left(i, ordered, ln)
+            if left is not None and _norm_label(left.text) not in wanted:
+                value = _accept_side_value(key, ln, left)
+            if value is None and not same_row:
+                value = _accept_below_value(key, _value_below(i, ordered, ln) or "")
+            if value is None and not same_row:
+                for cand in (
+                    _value_line_to_right(i, ordered, ln),
+                    _right_column_line(i, ordered, ln),
+                ):
+                    if cand is None or _norm_label(cand.text) in wanted:
+                        continue
+                    value = _accept_side_value(key, ln, cand)
+                    if value:
+                        break
+            # 竖排 DEPOSIT AMOUNT：下方金额可能超出默认 dy，或右侧被 SOURCE OF FUNDS 挡住
+            if value is None and "amount" in _norm_label(key):
+                money = _money_near_label_right(ordered, ln)
+                if money is None:
+                    label_bottom = max(p[1] for p in ln.box)
+                    label_cx = _line_center_x(ln.box)
+                    best_m = None
+                    for other in ordered:
+                        oy0 = min(p[1] for p in other.box)
+                        if oy0 < label_bottom - 10 or oy0 - label_bottom > 550:
+                            continue
+                        if abs(_line_center_x(other.box) - label_cx) > 200:
+                            continue
+                        mval = _parse_money(other.text)
+                        if mval is None or mval < 100 or mval >= 50_000_000:
+                            continue
+                        score = (oy0 - label_bottom, abs(_line_center_x(other.box) - label_cx))
+                        if best_m is None or score < best_m[0]:
+                            best_m = (score, _clean(other.text))
+                    if best_m:
+                        value = best_m[1]
                 else:
-                    fields[key] = side_value
-        elif not same_row:
-            below = _value_below(i, ordered, ln)
-            if below and not _looks_like_label_text(below):
-                below_norm = _norm_label(below)
-                # 下方是另一个标签（或标签+值，如空值字段 "NARRATION:" 下接 "MOBILE NO. :"），
-                # 不应作为当前字段的值
-                if below_norm not in wanted and not any(below_norm.startswith(n) for n in wanted):
-                    fields[key] = below
+                    value = f"{money:,.2f}"
+        else:
+            for cand in (
+                _value_line_to_right(i, ordered, ln),
+                _right_column_line(i, ordered, ln) if not same_row else None,
+            ):
+                if cand is None or _norm_label(cand.text) in wanted:
+                    continue
+                value = _accept_side_value(key, ln, cand)
+                if value:
+                    break
+            if value is None and not same_row:
+                value = _accept_below_value(key, _value_below(i, ordered, ln) or "")
+        if value:
+            fields[key] = value
     # 单栏：标签与值在同一行
     for ln in ordered:
         for lbl in labels:
@@ -2410,7 +2529,146 @@ def _looks_like_terminal_id_value(value: str) -> bool:
     compact = re.sub(r"\s+", "", value or "")
     if re.search(r"\d{1,2}:\d{2}", compact):
         return False
+    if re.search(r"(?i)bank|commercial|ceylon|deposit", compact):
+        return False
     return bool(re.match(r"(?i)^R?[A-Z]{3,}\d*[A-Z]*HT$", compact))
+
+
+def _is_plausible_cdm_field_value(key: str, value: str) -> bool:
+    """CDM 强类型字段取值校验，拒绝银行名/邻字段串位。"""
+    v = _clean(value or "")
+    if not v or _looks_like_label_text(v):
+        return False
+    kn = _norm_label(key)
+    if kn == "date":
+        return bool(re.search(r"\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}", v)) and not re.search(
+            r"(?i)bank|commercial|trace|terminal", v
+        )
+    if kn == "time":
+        return bool(re.match(r"^\s*([01]?\d|2[0-3])[:.\- ][0-5]\d\s*$", v))
+    if kn == "terminalid":
+        return _looks_like_terminal_id_value(v)
+    if kn == "trace":
+        return bool(re.match(r"^\d{3,6}$", v))
+    if kn == "transactionstatus":
+        if re.search(r"(?i)source\s*of\s*funds|unknown", v):
+            return False
+        return bool(re.search(r"(?i)\b(successful|success|failed|fail|rejected)\b", v))
+    if kn == "depositamount":
+        amt = _parse_money(v)
+        # 账号常被误解析成超大金额；面额表张数等纯小整数也不当存款额
+        if amt is None or not (0 < amt < 50_000_000):
+            return False
+        if amt < 100 and amt == int(amt) and not re.search(r"[.,]\d{2}", v):
+            return False
+        return bool(re.search(r"(?i)lkr|rs\.?|[.,]\d{2}", v) or amt >= 100)
+    return True
+
+
+def _extract_cdm_typed_substring(key: str, text: str) -> Optional[str]:
+    """从一行 OCR 文本中抠出符合 CDM 字段类型的子串。"""
+    kn = _norm_label(key)
+    if kn == "date":
+        m = re.search(r"\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}", text)
+        return m.group(0) if m else None
+    if kn == "time":
+        m = re.search(r"\b([01]?\d|2[0-3])[:.\- ][0-5]\d\b", text)
+        return m.group(0).replace(".", ":").replace("-", ":").replace(" ", ":") if m else None
+    if kn == "terminalid":
+        for tok in re.findall(r"[A-Za-z0-9]{6,}", text):
+            if _looks_like_terminal_id_value(tok):
+                return tok.upper()
+        return None
+    if kn == "trace":
+        m = re.search(r"(?<!\d)(\d{3,6})(?!\d)", text)
+        return m.group(1) if m else None
+    if kn == "transactionstatus":
+        m = re.search(r"(?i)\b(successful|success|failed|fail|rejected)\b", text)
+        return m.group(0).upper() if m else None
+    return None
+
+
+def _pick_cdm_typed_near(idx: int, ordered, label_line, key: str) -> Optional[str]:
+    """在标签附近按左/下/右优先级挑选通过类型校验的值（竖拍优先左侧）。"""
+    label_cx = _line_center_x(label_line.box)
+    label_cy = _line_center_y(label_line.box)
+    label_left = min(p[0] for p in label_line.box)
+    label_right = max(p[0] for p in label_line.box)
+    label_bottom = max(p[1] for p in label_line.box)
+    ly0 = min(p[1] for p in label_line.box)
+    ly1 = max(p[1] for p in label_line.box)
+    best = None
+    for j, other in enumerate(ordered):
+        if j == idx:
+            continue
+        raw = other.text.strip()
+        if not raw:
+            continue
+        text = raw
+        if not _is_plausible_cdm_field_value(key, text):
+            extracted = _extract_cdm_typed_substring(key, raw)
+            if not extracted or not _is_plausible_cdm_field_value(key, extracted):
+                continue
+            text = extracted
+        ox0 = min(p[0] for p in other.box)
+        ox1 = max(p[0] for p in other.box)
+        oy0 = min(p[1] for p in other.box)
+        oy1 = max(p[1] for p in other.box)
+        ocx = _line_center_x(other.box)
+        ocy = _line_center_y(other.box)
+        y_overlap = max(0.0, min(ly1, oy1) - max(ly0, oy0))
+        if ox1 <= label_left + 30 and y_overlap > 0:
+            score = (0, -y_overlap, label_left - ox1)
+        elif oy0 >= label_bottom - 20 and abs(ocx - label_cx) < 180:
+            score = (1, max(0.0, oy0 - label_bottom), abs(ocx - label_cx))
+        elif ox0 >= label_right - 20 and y_overlap > 0:
+            score = (2, -y_overlap, ox0 - label_right)
+        else:
+            dist = abs(ocx - label_cx) + abs(ocy - label_cy)
+            if dist > 450:
+                continue
+            score = (3, dist, 0)
+        if best is None or score < best[0]:
+            best = (score, _clean(text))
+    return best[1] if best else None
+
+
+def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
+    """纠正竖拍/串列导致的 CDM DATE/TIME/TERMINAL/TRACE/STATUS 错绑。"""
+    typed_keys = ("DATE", "TIME", "TERMINAL ID", "TRACE", "TRANSACTION STATUS")
+    ordered = _sorted_by_y(lines)
+    for key in typed_keys:
+        cur = fields.get(key)
+        if cur and _is_plausible_cdm_field_value(key, cur):
+            continue
+        label_i = None
+        label_ln = None
+        target = _norm_label(key)
+        for i, ln in enumerate(ordered):
+            if _norm_label(ln.text) == target:
+                label_i, label_ln = i, ln
+                break
+        found = None
+        if label_ln is not None:
+            found = _pick_cdm_typed_near(label_i, ordered, label_ln, key)
+        if found is None:
+            # 标签漏读时：全卡扫描符合类型的候选（TIME/TRACE/TERMINAL）
+            for ln in ordered:
+                extracted = _extract_cdm_typed_substring(key, ln.text)
+                if extracted and _is_plausible_cdm_field_value(key, extracted):
+                    found = extracted
+                    break
+        if found:
+            fields[key] = found
+        elif key in fields and not _is_plausible_cdm_field_value(key, fields[key]):
+            fields.pop(key, None)
+    # DEPOSIT AMOUNT：仅丢掉「账号当金额」这类明显错值，不从面额表臆造总额
+    dep = fields.get("DEPOSIT AMOUNT")
+    if dep:
+        amt = _parse_money(dep)
+        if amt is not None and amt >= 50_000_000:
+            fields.pop("DEPOSIT AMOUNT", None)
+    return fields
 
 
 def _is_plausible_reference(value: str) -> bool:
@@ -2798,6 +3056,7 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     # 金额小数点被 OCR 误读为冒号时还原（如 "2,500:00" → "2,500.00"）
     fields = _normalize_money_fields(fields)
     if _is_cash_deposit(lines) or (bank == "commercial_bank" and fields.get("DATE")):
+        fields = _repair_cdm_typed_fields(fields, lines)
         fields = _synthesize_cdm_datetime_fields(fields)
         # OCR 常漏读 CARDLESS DEPOSIT / 账号 / 存款总额行，用已识别结构化结果回填
         if not fields.get("TRANSACTION") and _is_cash_deposit(lines):
@@ -2809,16 +3068,27 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         if not fields.get("DEPOSIT AMOUNT") and amount is not None:
             fields["DEPOSIT AMOUNT"] = f"{amount:,.2f}"
         # fields 已有 DEPOSIT AMOUNT 但结构化 amount 仍空时回填（如 OCR 标签拼写损坏）
-        if amount is None and fields.get("DEPOSIT AMOUNT"):
+        if fields.get("DEPOSIT AMOUNT"):
             parsed_amt = _parse_money(fields["DEPOSIT AMOUNT"])
-            if parsed_amt is not None:
+            if parsed_amt is not None and (amount is None or amount >= 50_000_000):
                 amount = parsed_amt
-                if total is None:
-                    total = parsed_amt
+                total = parsed_amt if total is None or (total is not None and total >= 50_000_000) else total
         if not fields.get("TRANSACTION STATUS") and status == "success":
             # 仅当 OCR 原文能佐证成功时填写，避免无 Status 行时硬造
             if re.search(r"(?i)success", full_text):
                 fields["TRANSACTION STATUS"] = "SUCCESSFUL"
+        # 竖拍串位后，结构化 terminal/trace 也常被右侧银行名污染，以修复后的扁平字段为准
+        if fields.get("TERMINAL ID") and _looks_like_terminal_id_value(fields["TERMINAL ID"]):
+            terminal_id = fields["TERMINAL ID"]
+        if fields.get("TRACE") and re.match(r"^\d{3,6}$", str(fields["TRACE"])):
+            trace_no = fields["TRACE"]
+        # Date & Time 合成后回写结构化 datetime
+        for dt_key in ("Date & Time", "Transaction Date/Time"):
+            if fields.get(dt_key):
+                parsed_dt = _parse_datetime(fields[dt_key])
+                if parsed_dt:
+                    dt = parsed_dt
+                    break
         # 回填 amount 后刷新 success；CDM 仅表头完整时也视为识别成功
         if amount is not None or payee.account is not None or payee.name is not None:
             success = True

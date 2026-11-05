@@ -43,8 +43,15 @@ def test_ekala_party_band_covers_account_rows():
     assert crops
     # 至少一个窗口覆盖账号行中心 ~1600
     assert any(top <= 1600 <= top + crop.shape[0] for crop, top, _ in crops)
-    # 锚点并集窗可能先于固定比例；固定比例首窗仍应在 NOTES 之上
-    ratio_tops = [top for crop, top, left in crops if left <= 30]
+    # 细条带须优先且覆盖 ACCOUNT(~1560)/CUSTOMER(~1680)，高<220
+    thin = [(crop, top) for crop, top, _ in crops if crop.shape[0] < 220]
+    assert thin, "TRANSACTION~NARRATION 细条带缺失"
+    assert any(top <= 1560 <= top + crop.shape[0] for crop, top in thin)
+    assert any(top <= 1680 <= top + crop.shape[0] for crop, top in thin)
+    # 队首应为细条，避免宽幅热敏区先跑导致整段漏读
+    assert crops[0][0].shape[0] < 220
+    # 固定比例窗仍应在 NOTES 之上
+    ratio_tops = [top for crop, top, left in crops if left <= 30 and crop.shape[0] >= 220]
     assert ratio_tops
     assert min(ratio_tops) < 2000
 

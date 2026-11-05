@@ -315,6 +315,50 @@ def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple
     elif y1_hits:
         y1 = min(y1_hits) * scale_y
 
+    left = max(0, int(w * 0.01))
+    # 细条带优先：宽幅中间带 Paddle 常整段漏读 ACCOUNT/CUSTOMER，单行高裁更稳（EKALA）
+    strip_windows: List[tuple] = []
+    if y0 is not None and y1 is not None and y1 > y0 + 80:
+        gap0 = y0 + 25
+        gap1 = y1 - 15
+        strip_h = max(100.0, min(160.0, (gap1 - gap0) / 5.0))
+        step = strip_h * 0.55
+        y = gap0
+        while y < gap1 - 50:
+            strip_windows.append((y, min(gap1, y + strip_h)))
+            y += step
+        # 再加两档稍高的账号带（ACCOUNT+CUSTOMER 两行）
+        mid = (gap0 + gap1) / 2.0
+        strip_windows.append((mid - 120, mid + 140))
+        strip_windows.append((gap0 + (gap1 - gap0) * 0.2, gap0 + (gap1 - gap0) * 0.75))
+    else:
+        # 无锚点时按整页比例切细条（EKALA 账号约 0.36–0.43）
+        for ya, yb in (
+            (h * 0.36, h * 0.40),
+            (h * 0.38, h * 0.42),
+            (h * 0.40, h * 0.44),
+            (h * 0.35, h * 0.43),
+            (h * 0.37, h * 0.45),
+        ):
+            strip_windows.append((ya, yb))
+
+    # 细条插入队首，先于宽幅 ROI 复检
+    strip_out: List[tuple] = []
+    strip_seen = set()
+    for y_a, y_b in strip_windows:
+        top = max(0, int(y_a))
+        bottom = min(h, int(y_b))
+        if bottom - top < 50:
+            continue
+        key = (top // 10, bottom // 10)
+        if key in strip_seen:
+            continue
+        strip_seen.add(key)
+        crop = img[top:bottom, left:w]
+        if crop.size:
+            strip_out.append((crop, float(top), float(left)))
+    out = strip_out + out
+
     windows: List[tuple] = []
     # 固定比例：正拍整页 CDM，EKALA 账号约在 0.34–0.45
     windows.extend(
@@ -334,7 +378,6 @@ def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple
         windows.append((y0 + span * 0.15, y1 - span * 0.10))
         windows.append((y0 + 20, y1 - 10))
 
-    left = max(0, int(w * 0.01))
     for y_a, y_b in windows:
         top = max(0, int(y_a))
         bottom = min(h, int(y_b))
@@ -403,12 +446,19 @@ def _cdm_band_prep_variants(crop_img: np.ndarray) -> List[np.ndarray]:
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     out.append(enhanced)
+    # 锐化：热敏点阵在细条带上更易出框
+    blur = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
+    sharp = cv2.addWeighted(enhanced, 1.6, blur, -0.6, 0)
+    out.append(sharp)
     binary = cv2.adaptiveThreshold(
         enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
     )
     out.append(binary)
+    _, otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    out.append(otsu)
     kernel = np.ones((2, 2), np.uint8)
     out.append(cv2.dilate(binary, kernel, iterations=1))
+    out.append(cv2.dilate(otsu, kernel, iterations=1))
     out.append(cv2.bitwise_not(binary))
     return out
 
@@ -416,7 +466,7 @@ def _cdm_band_prep_variants(crop_img: np.ndarray) -> List[np.ndarray]:
 def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     """对 CDM 的 TRANSACTION~NARRATION 中间带二次 OCR，补账号/户名。
 
-    多窗口 + CLAHE/二值/加粗 + 放大：热敏字细、首轮常漏 ACCOUNT 行。
+    细条带优先 + CLAHE/锐化/二值/加粗 + 放大：热敏字细、宽幅裁常整段漏 ACCOUNT 行。
     """
     found: List[OcrLine] = []
 
@@ -433,9 +483,13 @@ def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
         raw = engine.recognize(work)
         return _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
 
-    for crop, top, left in _prepare_cdm_band_crops(img, lines):
+    crops = _prepare_cdm_band_crops(img, lines)
+    for crop, top, left in crops:
+        # 细条（高<220）优先用更大倍率
+        thin = crop.shape[0] < 220
+        scales = (2.0, 2.5, 3.0, 3.5) if thin else (1.0, 2.0, 2.5, 3.0)
         for prep in _cdm_band_prep_variants(crop):
-            for scale in (1.0, 2.0, 2.5):
+            for scale in scales:
                 found = dedup_lines(found + _run(prep, top, left, scale))
                 if _has_strong_cdm_account(found):
                     return found

@@ -2152,6 +2152,45 @@ def test_commercial_bank_to_only_transfer_successful():
     assert r.payee.account == "1001096962"
     assert r.payee.bank == "Commercial Bank PLC"
     assert r.references.txn_ref == "416444/154352389"
+    assert r.fields["Beneficiary Name"] == "Lak Artha (Pvt) Ltd"
+    assert r.fields["Beneficiary Account Number"] == "1001096962"
+    assert r.fields["Beneficiary Bank"] == "Commercial Bank PLC"
+    assert r.fields["Status"] == "Beneficiary Notified"
+
+
+def test_commercial_bank_to_only_lk_loan_nickname():
+    """ComBank Transfer Successful：收款昵称 LK loan；Transaction reference 标签与值分行。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 18, x1, y + 18)
+    lines = [
+        L("Transfer Successful!", 251, 946, 911),
+        L("LKR 1,000.00", 334, 824, 1016),
+        L("To", 554, 612, 1142),
+        L("LK loan", 506, 693, 1266),
+        L("1001096962", 456, 738, 1340),
+        L("Commercial Bank PLC", 381, 819, 1562),
+        L("Receiver Reference -lakcach", 320, 865, 1686),
+        L("Transaction reference", 384, 799, 1771),
+        L("-1391031/158604737", 390, 791, 1816),
+        L("Date/Time -03/11/2026 : 10.07 AM", 303, 949, 1902),
+        L("Beneficiary Notified", 412, 788, 2038),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "commercial_bank"
+    assert r.amount == 1000.0
+    assert r.payee.name == "LK loan"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank PLC"
+    assert r.fields["Beneficiary Name"] == "LK loan"
+    assert r.fields["To"] == "LK loan"
+    assert r.fields["Beneficiary Account Number"] == "1001096962"
+    assert r.fields["Account Number"] == "1001096962"
+    assert r.fields["Beneficiary Bank"] == "Commercial Bank PLC"
+    assert r.fields["Amount"] == "LKR 1,000.00"
+    assert r.fields["Receiver Reference"] == "lakcach"
+    assert r.fields["Payment Reference"] == "1391031/158604737"
+    assert r.fields["Date/Time"] == "2026-11-03 10:07:00"
+    assert r.fields["Status"] == "Beneficiary Notified"
 
 
 def test_lb_finance_fund_transfer_acknowledgement():

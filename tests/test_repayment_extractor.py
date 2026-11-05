@@ -1499,6 +1499,38 @@ def test_kalutara_rotated_sparse_ocr_completes_account_and_scrub():
     assert "7,600.00" in str(r2.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
 
 
+def test_cdm_missing_deposit_label_recovers_notes_band_amount():
+    """MAHARAGA：OCR 漏掉 DEPOSIT AMOUNT 标签，但仍有 NOTES 表与 15.000.00。"""
+    lines = [
+        _lr("DATE", 549, 1103, 743, 1190),
+        _lr("30/10/26", 552, 1186, 909, 1289),
+        _lr("TIME", 1057, 1117, 1236, 1208),
+        _lr("17:19", 1060, 1195, 1271, 1284),
+        _lr("TERMINAL ID", 1500, 1125, 1943, 1200),
+        _lr("RMAHARA3HT", 1499, 1205, 1906, 1288),
+        _lr("TRACE", 566, 1352, 781, 1437),
+        _lr("5253", 1057, 1354, 1244, 1446),
+        _lr("TRANSACTION", 575, 1600, 1044, 1671),
+        _lr(": CARDLESS DEPOSIT", 1120, 1604, 1866, 1675),
+        _lr("ACC0UNT NUMBER: 1001096962", 575, 1763, 1628, 1834),
+        _lr("CUSTOMER NAME :LAK ARTHA SERVICES", 575, 1913, 1914, 1996),
+        _lr("MAHARAGA-CRM3 BR", 973, 879, 1620, 976),
+        _lr("NOTES", 600, 2770, 850, 2860),
+        _lr("VALUE", 964, 2777, 1192, 2869),
+        _lr("AMOUNT", 1831, 2716, 2085, 2814),
+        _lr("3", 810, 2967, 878, 3058),
+        _lr("LKR", 1360, 3052, 1509, 3137),
+        _lr("15.000.00", 1723, 2866, 2085, 2963, 0.989),
+        _lr("15.000.00", 1728, 3020, 2081, 3109, 0.990),
+        _lr("COMMERCIAL BANK OF CEYLON PLC", 683, 708, 1859, 813),
+    ]
+    r = extract(lines)
+    assert r.amount == 15000.0
+    assert "15,000.00" in str(r.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+    assert r.fields["BRANCH"] == "MAHARAGA-CRM3 BR"
+
+
 def test_cdm_rotated_deposit_amount_not_denom_face():
     """竖排 KANDANA CDM：DEPOSIT AMOUNT 总额 10,200，不得误取面额表 5,000。"""
     lines = [

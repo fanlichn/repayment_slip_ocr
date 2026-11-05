@@ -8,6 +8,7 @@ Pan Asia Bank / BOC Flex / Commercial Bank）标签措辞不同，故使用多�
 from __future__ import annotations
 
 import re
+from collections import Counter
 from datetime import datetime
 from typing import List, Optional
 
@@ -497,6 +498,72 @@ def _has_notes_value_table(lines) -> bool:
     return any("notes" == t or t.startswith("notes") for t in texts) and any(
         "value" == t or t.startswith("value") for t in texts
     )
+
+
+def _recover_cdm_deposit_amount_from_notes_band(lines) -> Optional[float]:
+    """CDM 漏读 DEPOSIT AMOUNT 标签时：从 NOTES/VALUE/AMOUNT 带回收总额。
+
+    典型：表头 + 行金额/存款总额均为 15.000.00，标签被拇指挡住。
+    """
+    if not lines:
+        return None
+    anchor_ys = []
+    for ln in lines:
+        low = " ".join(ln.text.lower().split())
+        if low in {"notes", "value", "amount"} or low.startswith(
+            ("notes", "value", "deposit amount", "depositamount")
+        ):
+            anchor_ys.append(_line_center_y(ln.box))
+        elif re.search(r"(?i)\blkr\b", ln.text) and _parse_money(ln.text) is None:
+            # 单独 LKR 常在总额旁
+            anchor_ys.append(_line_center_y(ln.box))
+    if anchor_ys:
+        y_min = min(anchor_ys) - 80
+    else:
+        ys = [_line_center_y(ln.box) for ln in lines if ln.box]
+        if not ys:
+            return None
+        y_min = max(ys) * 0.55
+
+    cands: list = []
+    for ln in lines:
+        if not ln.box:
+            continue
+        cy = _line_center_y(ln.box)
+        if cy < y_min:
+            continue
+        text = ln.text.strip()
+        if re.fullmatch(r"\d{1,2}", text):
+            continue  # 张数
+        if _is_denomination_label_line(text):
+            continue
+        if _looks_like_label_text(text):
+            continue
+        val = _parse_money(text)
+        if val is None or val < 100 or val >= 50_000_000:
+            continue
+        # 无小数形态的超长整数多半是账号
+        if val >= 1_000_000 and val == int(val) and not re.search(
+            r"(?i)lkr|rs\.?|[.,]\d{2}", text
+        ):
+            continue
+        conf = float(getattr(ln, "confidence", 0.0) or 0.0)
+        cands.append((val, cy, conf, val in _COMMON_DENOMS))
+    if not cands:
+        return None
+    non = [c for c in cands if not c[3]]
+    if non:
+        max_val = max(c[0] for c in non)
+        top = [c for c in non if abs(c[0] - max_val) < 0.01]
+        top.sort(key=lambda c: (-c[2], -c[1]))
+        return top[0][0]
+    # 仅有面额面值时：同一金额至少出现两次（行 AMOUNT + DEPOSIT 总额）才采纳，
+    # 避免不完整面额表把单个 500.00 当成存款总额。
+    counts = Counter(round(c[0], 2) for c in cands)
+    dups = [v for v, n in counts.items() if n >= 2]
+    if not dups:
+        return None
+    return max(dups)
 
 
 def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optional[float]:
@@ -1107,12 +1174,16 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
     # 现金存款：TOTAL 行即存款总额，优先采用（面额表的 TOTAL 比散点金额更可靠）
     if amount is None and total is not None:
         amount = total
+    # CDM 漏读 DEPOSIT AMOUNT 标签：从 NOTES/AMOUNT 带回收（如仅有 15.000.00）
+    low_all = "\n".join(ln.text.lower() for ln in lines)
+    is_cdm_amt = "cardless" in low_all or "deposit" in low_all or _has_notes_value_table(lines)
+    if amount is None and is_cdm_amt and fee is None:
+        amount = _recover_cdm_deposit_amount_from_notes_band(lines)
     # 现金存款（CDM）无 TOTAL 行，DEPOSIT AMOUNT 即总额。
     # 注意：若已识别到 fee（转账收据），不应把 total 设为 amount，
     # 否则 amount+fee != total 会产生误报。
     if total is None and amount is not None and fee is None:
-        low_all = "\n".join(ln.text.lower() for ln in lines)
-        if "deposit" in low_all or "cardless" in low_all:
+        if "deposit" in low_all or "cardless" in low_all or _has_notes_value_table(lines):
             total = amount
     return amount, fee, total
 

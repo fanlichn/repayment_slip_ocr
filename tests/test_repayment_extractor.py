@@ -393,6 +393,170 @@ def test_cdm_header_right_column_should_not_steal_terminal():
     assert r.fields["TERMINAL ID"] == "RWELAWA2HT"
     assert r.datetime == "2026-11-03T10:49:00"
     assert r.fields["TRACE"] == "762"
+    assert r.fields["Date & Time"] == "2026-11-03 10:49:00"
+    assert r.fields["Transaction Date/Time"] == "2026-11-03 10:49:00"
+
+
+def test_cdm_trace_value_under_time_column_not_stolen():
+    """CDM：TRACE 值印在 TIME 列正下方时，TIME 仍应取 HH:MM，不能取 TRACE 号。"""
+    lines = [
+        _lr("DATE", 183, 751, 262, 785),
+        _lr("TIME", 399, 747, 481, 787),
+        _lr("TERMINAL ID", 600, 745, 801, 785),
+        _lr("02/11/26", 181, 785, 335, 822),
+        _lr("19:28", 404, 785, 496, 818),
+        _lr("RMATCIT2HT", 600, 785, 781, 816),
+        _lr("TRACE", 181, 851, 280, 891),
+        _lr("2197", 400, 849, 480, 889),
+        _lr("TRANSACTION CARDLESS DEPOSIT", 180, 950, 700, 990),
+        _lr("ACCOUNT NUMBER 1001096962", 180, 1020, 700, 1060),
+        _lr("DEPOSIT AMOUNT LKR 4,000.00", 180, 1200, 700, 1240),
+        _lr("TRANSACTION STATUS SUCCESSFUL", 180, 1300, 700, 1340),
+    ]
+    r = extract(lines)
+    assert r.fields["DATE"] == "2026-11-02 00:00:00"
+    assert r.fields["TIME"] == "19:28"
+    assert r.fields["TERMINAL ID"] == "RMATCIT2HT"
+    assert r.fields["TRACE"] == "2197"
+    assert r.datetime == "2026-11-02T19:28:00"
+
+
+def test_cdm_without_cardless_keyword_still_extracts_headers():
+    """OCR 漏读 CARDLESS DEPOSIT 时，凭 DATE/TIME/TERMINAL/DEPOSIT AMOUNT 仍应按 CDM 提取。"""
+    lines = [
+        _lr("DATE", 432, 1687, 500, 1720),
+        _lr("TIME", 750, 1668, 820, 1700),
+        _lr("TERMINAL ID", 1100, 1636, 1300, 1680),
+        _lr("30/10/26", 430, 1740, 560, 1780),
+        _lr("16:37", 760, 1723, 850, 1760),
+        _lr("RVEYANG1HT", 1100, 1700, 1280, 1740),
+        _lr("TRACE", 430, 1800, 520, 1840),
+        _lr("1677", 760, 1800, 850, 1840),
+        _lr("DEPOSIT AMOUNT", 430, 2000, 700, 2040),
+        _lr("6,000.00", 900, 2000, 1100, 2040),
+        _lr("TRANSACTION STATUS SUCCESSFUL", 430, 2200, 900, 2240),
+    ]
+    r = extract(lines)
+    assert r.bank == "commercial_bank"
+    assert r.fields["DATE"] == "2026-10-30 00:00:00"
+    assert r.fields["TIME"] == "16:37"
+    assert r.fields["TERMINAL ID"] == "RVEYANG1HT"
+    assert r.fields["DEPOSIT AMOUNT"] == "6,000.00"
+
+
+def test_ipay_preferred_over_peoples_bank_marker():
+    """iPay 回执正文含 People's Bank 付款来源时，应识别为 ipay 并抽出 Amount。"""
+    rows = [
+        ("Transaction Summary", 40),
+        ("iPay", 60),
+        ("Type Fund Transfer", 100),
+        ("Transaction Date 2026-11-03 10:42:56", 140),
+        ("Transaction ID 2026110305125500001", 180),
+        ("From People's Bank **0867", 220),
+        ("To Commercial Bank PLC", 260),
+        ("1001096962", 300),
+        ("Recipient Lak Artha service", 340),
+        ("Rs.17,420.00", 380),
+        ("Status SUCCESS", 420),
+        ("Remarks 6XT74B", 460),
+        ("For more information, visit www.ipay.lk", 500),
+    ]
+    r = extract(_make(rows))
+    assert r.bank == "ipay"
+    assert r.fields["Amount"] == "Rs.17,420.00"
+    assert r.fields["Payment Reference"] == "2026110305125500001"
+    assert r.amount == 17420.0
+
+
+def test_vishwa_beneficiary_account_without_no_suffix():
+    """Vishwa：标签为 Beneficiary Account :（无 No.）也应抽出收款账号。"""
+    lines = [
+        _lr("Status :", 40, 100, 120, 130),
+        _lr("Success", 200, 100, 300, 130),
+        _lr("Transaction ID :", 40, 150, 200, 180),
+        _lr("92228514", 250, 150, 400, 180),
+        _lr("Date & Time :", 40, 200, 180, 230),
+        _lr("02/11/2026 03:26 PM", 250, 200, 500, 230),
+        _lr("Amount :", 40, 250, 140, 280),
+        _lr("LKR 5,000.00", 250, 250, 420, 280),
+        _lr("Beneficiary Account :", 40, 300, 240, 330),
+        _lr("1001096962", 250, 300, 420, 330),
+        _lr("Beneficiary Remarks :", 40, 350, 240, 380),
+        _lr("AjE858", 250, 350, 360, 380),
+        _lr("VISHWA", 40, 50, 140, 80),
+    ]
+    r = extract(lines)
+    assert r.bank == "vishwa"
+    assert r.fields["Beneficiary Account"] == "1001096962"
+    assert r.fields.get("Payment Reference") != "e"
+
+
+def test_hnb_app_transaction_reference_dash_fields():
+    """HNB App：Transaction Reference -xxxx 同行写法，并补 Payment Reference 别名。"""
+    rows = [
+        ("Fund Transfer Receipt", 40),
+        ("This is an auto generated receipt", 80),
+        ("HNB", 100),
+        ("Transaction Reference -1233928/158560281", 140),
+        ("Date/ Time -02/11/2026 : 10.27 PM", 180),
+        ("LKR 5,850.00", 220),
+        ("To", 260),
+        ("Lak Cash - 1001096962", 300),
+        ("Commercial Bank PLC", 340),
+        ("Receiver reference -G4ws43", 380),
+    ]
+    r = extract(_make(rows))
+    assert r.bank == "hnb"
+    assert r.fields["Transaction Reference"] == "1233928/158560281"
+    assert r.fields["Payment Reference"] == "1233928/158560281"
+    assert r.fields["Amount"] == "LKR 5,850.00"
+
+
+def test_nsb_mobile_payment_colon_fields():
+    """NSB Online Payment Mobile：冒号分隔字段应完整提取。"""
+    rows = [
+        ("NSB Online Payment - Mobile", 40),
+        ("Transaction ID : 1568907733", 80),
+        ("Transaction Date/Time : 31/10/2026 09:21 AM", 120),
+        ("Transaction Type : Fund Transfer", 160),
+        ("Transaction Amount : LKR 8,800.00", 200),
+        ("Bank Charges : LKR 25.00", 240),
+        ("Status : Success", 280),
+        ("Sender's Name : Ruwan Nalaka", 320),
+        ("Source Bank Name : National Savings Bank", 360),
+        ("Source Bank Account Number : ****3075", 400),
+        ("Beneficiary Name : lakartha(pvt)ltd.", 440),
+        ("Destination Bank : Commercial Bank PLC", 480),
+        ("Destination Account No. : 1001096962", 520),
+        ("Remarks : ruwan nalaka", 560),
+    ]
+    r = extract(_make(rows))
+    assert r.bank == "nsb"
+    assert r.fields["Transaction ID"] == "1568907733"
+    assert r.fields["Transaction Date/Time"] == "2026-10-31 09:21:00"
+    assert r.fields["Destination Account No."] == "1001096962"
+    assert r.amount == 8800.0
+
+
+def test_boc_flex_ocr_typo_date_1t():
+    """BOC Flex：日期 OCR 把 11 读成 1t 时应仍能解析。"""
+    rows = [
+        ("Flex Online Banking", 40),
+        ("Fund Transfer", 60),
+        ("Transaction Amount : LKR 3,000.00", 100),
+        ("Transaction Date & Time : 02-1t-2026 04:41 PM", 140),
+        ("Transaction ID : FX11843998900000", 180),
+        ("Charges & Fee : LKR 25.00", 220),
+        ("Transaction Status : SUCCESS", 260),
+        ("Account Number : **6975", 300),
+        ("Sender's Name : MS WM PERERA", 340),
+        ("Sender's Bank : Bank of Ceylon", 380),
+        ("Account No : 1001096962", 420),
+        ("Beneficiary Name : lak Artha services", 460),
+    ]
+    r = extract(_make(rows))
+    assert r.fields["Transaction Date & Time"] == "2026-11-02 16:41:00"
+    assert r.datetime == "2026-11-02T16:41:00"
 
 
 def test_cdm_amount_with_notes_header():

@@ -132,11 +132,36 @@ def _cdm_missing_deposit_amount(result) -> bool:
     if not _is_cdm_result(result):
         return False
     fields = result.fields or {}
-    if fields.get("DEPOSIT AMOUNT") and result.amount is not None:
+    amt = result.amount
+    dep = fields.get("DEPOSIT AMOUNT")
+    # 行小计（如 400=4×100）被当成总额时仍须复检
+    if amt is not None and _looks_like_row_subtotal_deposit(amt, fields):
+        return True
+    if dep:
+        parsed = _parse_money(str(dep))
+        if parsed is not None and _looks_like_row_subtotal_deposit(parsed, fields):
+            return True
+    if dep and amt is not None:
         return False
-    if result.amount is not None and result.amount >= 100:
+    if amt is not None and amt >= 100:
         return False
     return True
+
+
+def _looks_like_row_subtotal_deposit(amount: float, fields: dict) -> bool:
+    """无可靠大额时，偏小的「存款额」更像面额表行 AMOUNT。"""
+    if amount < 100:
+        return False
+    # 典型行小计：等于常见面额×张数且总额偏小；真正万元级存款很少只有几百
+    if amount >= 5000:
+        return False
+    for denom in (100.0, 500.0, 1000.0, 2000.0, 5000.0):
+        if denom > amount:
+            continue
+        qty = amount / denom
+        if abs(qty - round(qty)) < 0.01 and 2 <= round(qty) <= 50:
+            return True
+    return False
 
 
 def _anchor_ys(lines: List[OcrLine], patterns: List[str]) -> List[float]:
@@ -195,24 +220,33 @@ def _has_cdm_party_text(lines: List[OcrLine]) -> bool:
 
 
 def _has_cdm_deposit_amount_text(lines: List[OcrLine]) -> bool:
+    """金额带早停：须看到 DEPOSIT 标签，或明显大于面额面值的总额（如 11,400）。"""
+    blob = " ".join(ln.text.lower() for ln in lines)
+    if "deposit" in blob and "amount" in blob:
+        return True
+    vals = []
     for ln in lines:
         low = ln.text.lower()
         if "fee" in low or "charge" in low:
             continue
         if re.search(r"(?i)\bnotes\b|\bvalue\b", low) and "deposit" not in low:
-            # 面额表头本身不算
             if not re.search(r"\d", ln.text):
                 continue
         val = _parse_money(ln.text)
-        if val is None or val < 100:
+        if val is None or val < 100 or val >= 50_000_000:
             continue
-        if val in {20, 50, 100, 200, 500, 1000, 2000, 5000} and not re.search(
-            r"(?i)lkr|rs\.?|[.,]\d{2}", ln.text
-        ):
-            continue
-        if re.search(r"(?i)lkr|rs\.?|[.,]\d{2}", ln.text) or val >= 100:
-            return True
-    return False
+        vals.append(val)
+    if not vals:
+        return False
+    max_v = max(vals)
+    # 仅有行小计/面额（≤5000 且像张数×面额）不算读到总额
+    if max_v <= 5000 and any(
+        abs(max_v / d - round(max_v / d)) < 0.01 and 2 <= round(max_v / d) <= 50
+        for d in (100.0, 500.0, 1000.0, 2000.0, 5000.0)
+        if d <= max_v
+    ):
+        return False
+    return max_v >= 1000
 
 
 def _anchor_scale_y(img_h: float, lines: List[OcrLine]) -> float:

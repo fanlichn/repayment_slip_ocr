@@ -643,17 +643,26 @@ def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optiona
         cands.append((score, val, val in _COMMON_DENOMS))
     if not cands:
         return None
-    # 有面额表时：仅当存在「大于最大面额面值」的非面额候选（如 10,200 > 5,000）才优先它；
-    # 真总额恰好等于面额（如只存一张 5000）时仍保留面额候选。
+    # 有面额表时：DEPOSIT AMOUNT 取「大于最大面额」的最大非面额额（如 11,400），
+    # 切勿取几何最近的行小计（400=4×100）。真总额恰等于面额时仍可回退面额候选。
     if skip_denoms:
         non_denom = [c for c in cands if not c[2]]
         denom_vals = [c[1] for c in cands if c[2]]
-        if non_denom and denom_vals:
-            best_non = min(non_denom, key=lambda c: c[0])
-            if best_non[1] > max(denom_vals) + 0.01:
-                cands = non_denom
-        elif non_denom and not denom_vals:
-            cands = non_denom
+        max_denom = max(denom_vals) if denom_vals else 0.0
+        big_non = [c for c in non_denom if c[1] > max_denom + 0.01]
+        if big_non:
+            return max(big_non, key=lambda c: c[1])[1]
+        if non_denom and not denom_vals:
+            # 仅有行小计（400、1000）时不要把最近的当总额
+            max_non = max(c[1] for c in non_denom)
+            others = [c[1] for c in non_denom if abs(c[1] - max_non) > 0.01]
+            if others and max_non > max(others) + 0.01:
+                return max_non
+            return None
+        # 非面额都不超过面额面值：可能真存一张 5000；取最大面额候选
+        if denom_vals and not big_non:
+            return max(denom_vals)
+        return None
     cands.sort(key=lambda c: c[0])
     return cands[0][1]
 
@@ -3784,13 +3793,40 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
                 in_clean = True
         if in_date_junk and not in_clean:
             fields.pop("TRACE", None)
-    # DEPOSIT AMOUNT：仅丢掉「账号当金额」这类明显错值，不从面额表臆造总额
+    # DEPOSIT AMOUNT：丢掉账号误读；面额表行小计（如 400）不得充当总额
     dep = fields.get("DEPOSIT AMOUNT")
     if dep:
         amt = _parse_money(dep)
         if amt is not None and amt >= 50_000_000:
             fields.pop("DEPOSIT AMOUNT", None)
+        elif amt is not None and _looks_like_cdm_notes_row_amount(amt, lines):
+            fields.pop("DEPOSIT AMOUNT", None)
     return fields
+
+
+def _looks_like_cdm_notes_row_amount(amount: float, lines) -> bool:
+    """判断金额是否为 NOTES 表某一行小计，而非 DEPOSIT AMOUNT 总额。
+
+    规则：面额表有多行张数，且带内存在严格更大的金额时，当前额更像行 AMOUNT。
+    """
+    if not _has_notes_value_table(lines):
+        return False
+    moneys: list = []
+    qty_like = 0
+    for ln in lines:
+        t = ln.text.strip()
+        if re.fullmatch(r"\d{1,3}", t):
+            qty_like += 1
+            continue
+        if _looks_like_label_text(t) or _looks_like_notes_header(t):
+            continue
+        val = _parse_money(t)
+        if val is None or val < 100 or val >= 50_000_000:
+            continue
+        moneys.append(val)
+    if qty_like < 2 or not moneys:
+        return False
+    return any(m > amount + 0.01 for m in moneys)
 
 
 def _is_plausible_reference(value: str) -> bool:
@@ -4679,6 +4715,11 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             cur_br = fields.get("BRANCH")
             if not cur_br or _branch_quality(branch) > _branch_quality(str(cur_br)):
                 fields["BRANCH"] = branch
+        # 行小计（400）不得写入 DEPOSIT AMOUNT / 结构化金额
+        if amount is not None and _looks_like_cdm_notes_row_amount(amount, lines):
+            amount = None
+            total = None
+            fields.pop("DEPOSIT AMOUNT", None)
         # DEPOSIT AMOUNT：结构化总额优先；面额表面值（5000）被误填时用 10,200 覆盖
         if amount is not None:
             dep_amt = _parse_money(fields["DEPOSIT AMOUNT"]) if fields.get("DEPOSIT AMOUNT") else None
@@ -4692,7 +4733,9 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
                 total = amount
         elif fields.get("DEPOSIT AMOUNT"):
             parsed_amt = _parse_money(fields["DEPOSIT AMOUNT"])
-            if parsed_amt is not None and (amount is None or amount >= 50_000_000):
+            if parsed_amt is not None and _looks_like_cdm_notes_row_amount(parsed_amt, lines):
+                fields.pop("DEPOSIT AMOUNT", None)
+            elif parsed_amt is not None and (amount is None or amount >= 50_000_000):
                 amount = parsed_amt
                 total = parsed_amt if total is None or (total is not None and total >= 50_000_000) else total
         # TRANSACTION / STATUS 串了邻行时收束

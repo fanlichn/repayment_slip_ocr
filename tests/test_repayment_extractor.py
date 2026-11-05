@@ -1580,6 +1580,51 @@ def test_cdm_crease_sparse_ocr_not_row_amount():
     assert r.fields.get("DEPOSIT AMOUNT") != "400.00"
 
 
+def test_cdm_deposit_label_must_not_take_nearest_row_amount():
+    """DEPOSIT AMOUNT 标签右侧若最近是行小计 400，应改取更大的 11,400。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 16, x1, y + 16)
+    lines = [
+        L("DATE", 500, 682, 1280),
+        L("02/11/26", 500, 843, 1360),
+        L("TIME", 981, 1157, 1260),
+        L("08:03", 983, 1193, 1340),
+        L("TERMINAL ID", 1500, 1940, 1260),
+        L("RNAWLPI1HT", 1500, 1900, 1340),
+        L("TRACE", 513, 734, 1500),
+        L("3528", 999, 1183, 1480),
+        L("TRANSACTION", 575, 1044, 1650),
+        L("CARDLESS DEPOSIT", 1120, 1866, 1650),
+        L("ACCOUNT NUMBER: 1001096962", 575, 1628, 1800),
+        L("CUSTOMER NAME :LAK ARTHA SERVICES", 575, 1914, 1950),
+        L("NOTES", 604, 831, 2900),
+        L("VALUE", 979, 1198, 2880),
+        L("AMOUNT", 1873, 2131, 2820),
+        L("4", 829, 881, 3060),
+        L("LKR 100.00", 989, 1493, 3040),
+        L("400.00", 1888, 2156, 2980),
+        L("1", 833, 890, 3150),
+        L("LKR 1,000.00", 989, 1493, 3130),
+        L("1,000.00", 1813, 2160, 3070),
+        L("2", 847, 890, 3230),
+        L("LKR 5,000.00", 989, 1493, 3210),
+        L("10,000.00", 1813, 2160, 3150),
+        L("DEPOSIT AMOUNT", 600, 1100, 3350),
+        L("LKR", 1200, 1350, 3350),
+        _lr("400.00", 1400, 3334, 1650, 3366, 0.95),  # 近邻误读
+        _lr("11,400.00", 1700, 3344, 2100, 3376, 0.99),
+        L("TRANSACTION STATUS", 600, 1100, 3500),
+        L("SUCCESSFUL", 1200, 1600, 3500),
+        L("NAWALAPI-CRM1 BR", 900, 1600, 900),
+        L("COMMERCIAL BANK OF CEYLON PLC", 600, 1800, 750),
+    ]
+    r = extract(lines)
+
+    assert r.amount == 11400.0
+    assert "11,400.00" in str(r.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
+    assert r.fields.get("ACCOUNT NUMBER") == "1001096962"
+    assert r.payee.account == "1001096962"
+
+
 def test_cdm_missing_deposit_label_recovers_notes_band_amount():
     """MAHARAGA：OCR 漏掉 DEPOSIT AMOUNT 标签，但仍有 NOTES 表与 15.000.00。"""
     lines = [

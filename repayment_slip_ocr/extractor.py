@@ -200,7 +200,11 @@ def _value_after_label(line_text: str, label: str) -> Optional[str]:
     pattern = re.escape(label)
     pattern = re.sub(r"[Oo0]", "[O0]", pattern)
     pattern = re.sub(r"[Ii1]", "[I1]", pattern)
-    m = re.search(r"\b" + pattern + r"\b\s*[:：]?\s*(.+)", line_text, re.IGNORECASE)
+    # 短标签 "Bank" 必须在行首，否则 "Commercial Bank PLC" 会被截成 "PLC"
+    if label.lower() in {"bank", "name"}:
+        m = re.search(r"^\s*" + pattern + r"\b\s*[:：]?\s*(.+)", line_text, re.IGNORECASE)
+    else:
+        m = re.search(r"\b" + pattern + r"\b\s*[:：]?\s*(.+)", line_text, re.IGNORECASE)
     if not m:
         return None
     value = _clean(m.group(1))
@@ -1833,6 +1837,145 @@ def _first_account_line(zone) -> Optional[str]:
     return None
 
 
+def _clean_person_or_org_name(text: str) -> Optional[str]:
+    """从 OCR 行抠出付款/收款人姓名（去掉行首 O/0 噪点）。"""
+    t = re.sub(r"^[O0\s]+", "", (text or "").strip()).strip(" .")
+    if len(t) < 5:
+        return None
+    if re.search(r"(?i)\bbank\b|lkr|receipt|amount|trace|status", t):
+        return None
+    if not re.search(r"[A-Za-z]{2,}", t):
+        return None
+    if len(re.findall(r"[A-Za-z]", t)) < 6:
+        return None
+    return _clean(t)
+
+
+def _masked_or_digit_account(text: str) -> Optional[str]:
+    """People's Pay 账号：纯数字或带 x/* 掩码（如 149200xxxxxxx84）。"""
+    t = (text or "").strip()
+    if re.fullmatch(r"\d{8,14}", t):
+        return t
+    if re.fullmatch(r"[\d*xX]{8,20}", t):
+        return t
+    return _account_token(t)
+
+
+def _is_peoples_pay_sinhala_layout(lines) -> bool:
+    """僧伽罗语 People's Pay：无英文 Pay from/to，但有 People's Bank + Commercial Bank + 金额。"""
+    full = " ".join(ln.text for ln in lines).lower()
+    if "people's bank" not in full and "peoples bank" not in full:
+        return False
+    if "commercial bank" not in full:
+        return False
+    # 排除 One Time Transfer / 英文 People's Pay
+    if any(
+        m in full
+        for m in ("acknowledgement", "one time transfer", "pay from", "pay to", "trace no")
+    ):
+        return False
+    if any(ln.text.strip().lower() in {"pay from", "pay to"} for ln in lines):
+        return False
+    has_acct = any(_masked_or_digit_account(ln.text) for ln in lines)
+    has_money = any(
+        (_parse_money(ln.text) or 0) >= 20
+        for ln in lines
+        if re.search(r"\d+[.,]\d{2}", ln.text)
+    )
+    return has_acct and has_money
+
+
+def _extract_peoples_pay_positional(lines) -> tuple[PartyOut, PartyOut, dict]:
+    """英文标签缺失时，按 People's Bank / Commercial Bank 锚点与右列金额位置兜底。"""
+    payer, payee = PartyOut(), PartyOut()
+    fields: dict = {}
+    ordered = _sorted_by_y(lines)
+
+    peoples_ln = None
+    commercial_ln = None
+    for ln in ordered:
+        t = ln.text.strip()
+        if peoples_ln is None and re.search(r"(?i)people'?s\s*bank", t):
+            peoples_ln = ln
+            payer.bank = "People's Bank"
+            fields["Payer Bank"] = payer.bank
+        elif commercial_ln is None and re.search(r"(?i)commercial\s*bank", t):
+            commercial_ln = ln
+            payee.bank = re.sub(r"\s+", " ", t).strip(" .")
+            fields["Payee Bank"] = payee.bank
+
+    if peoples_ln is not None:
+        py = _line_center_y(peoples_ln.box)
+        for ln in reversed([x for x in ordered if _line_center_y(x.box) < py - 5]):
+            name = _clean_person_or_org_name(ln.text)
+            if name:
+                payer.name = name
+                fields["Payer Name"] = name
+                break
+        limit_y = _line_center_y(commercial_ln.box) if commercial_ln is not None else py + 500
+        for ln in ordered:
+            y = _line_center_y(ln.box)
+            if y <= py + 5 or y >= limit_y:
+                continue
+            acc = _masked_or_digit_account(ln.text)
+            if acc and not payer.account:
+                payer.account = acc
+                fields["Payer Account No"] = acc
+            if ln.text.strip().upper() == "LKR":
+                fields["Account Currency"] = "LKR"
+
+    if commercial_ln is not None:
+        cy = _line_center_y(commercial_ln.box)
+        floor = _line_center_y(peoples_ln.box) if peoples_ln is not None else 0.0
+        for ln in reversed([x for x in ordered if floor + 30 < _line_center_y(x.box) < cy - 5]):
+            name = _clean_person_or_org_name(ln.text)
+            if name:
+                payee.name = name
+                fields["Payee Name"] = name
+                break
+        for ln in ordered:
+            y = _line_center_y(ln.box)
+            if y <= cy + 5:
+                continue
+            acc = _masked_or_digit_account(ln.text)
+            if acc and re.fullmatch(r"\d{8,14}", acc):
+                payee.account = acc
+                fields["Payee Account No"] = acc
+                break
+
+    # 金额：优先短行（纯金额），按 y 依次为 Amount / Fee / Total
+    money_rows = []
+    for ln in ordered:
+        if not re.search(r"\d+[.,]\d{2}", ln.text):
+            continue
+        amt = _parse_money(ln.text)
+        if amt is None or amt < 20:
+            continue
+        non_num = re.sub(r"[\d,.\sLKRRkrs]", "", ln.text)
+        score = 0 if len(non_num) <= 4 else 1
+        money_rows.append((score, _line_center_y(ln.box), amt))
+    money_rows.sort()
+    # 同 y 去重后按出现顺序
+    picked = []
+    for _, y, amt in money_rows:
+        if picked and abs(y - picked[-1][0]) < 40 and abs(amt - picked[-1][1]) < 0.01:
+            continue
+        picked.append((y, amt))
+    picked.sort(key=lambda t: t[0])
+    if picked:
+        fields["Amount (LKR)"] = f"{picked[0][1]:,.2f}"
+    if len(picked) >= 2:
+        fields["Fee Amount (LKR)"] = f"{picked[1][1]:,.2f}"
+    if len(picked) >= 3:
+        fields["Total debit amount (LKR)"] = f"{picked[2][1]:,.2f}"
+    elif len(picked) >= 2:
+        fields["Total debit amount (LKR)"] = f"{picked[0][1] + picked[1][1]:,.2f}"
+
+    payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+    return payer, payee, fields
+
+
 def _extract_peoples_bank_parties(lines) -> tuple[PartyOut, PartyOut]:
     """People's Bank 回执：兼容两栏（People's Pay 左标右值）与单栏（标签+值同行）。"""
     payer, payee = PartyOut(), PartyOut()
@@ -1865,6 +2008,22 @@ def _extract_peoples_bank_parties(lines) -> tuple[PartyOut, PartyOut]:
         payee.name = _first_alpha_value(payee_zone)
     if not payee.account:
         payee.account = _first_account_line(payee_zone)
+
+    # 僧伽罗语版：英文分区/标签缺失时按锚点位置兜底（勿污染 OTP 等其它 People's 版式）
+    if _is_peoples_pay_sinhala_layout(lines):
+        pos_payer, pos_payee, _ = _extract_peoples_pay_positional(lines)
+        if not payer.name:
+            payer.name = pos_payer.name
+        if not payer.account:
+            payer.account = pos_payer.account
+        if not payer.bank or payer.bank.upper() in {"PLC", "BANK"}:
+            payer.bank = pos_payer.bank or payer.bank
+        if not payee.name:
+            payee.name = pos_payee.name
+        if not payee.account:
+            payee.account = pos_payee.account
+        if not payee.bank:
+            payee.bank = pos_payee.bank
 
     payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
     payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
@@ -2980,33 +3139,56 @@ def _build_peoples_pay_fields(lines, payer, payee) -> dict:
 
     页面有多个同名字段（Name / Bank / Account No），按分区归属分别标记；
     标签漏识别时用结构化字段（payer/payee）兜底。
+    僧伽罗语版英文标签缺失时，按 People's Bank / Commercial Bank 锚点位置兜底。
     """
-    payer_zone, payee_zone, _ = _split_zones(lines)
+    payer_zone, payee_zone, has_anchor = _split_zones(lines)
 
     fields = _build_label_fields(
         lines,
         ("Amount (LKR)", "Fee Amount (LKR)", "Total debit amount (LKR)", "Date & Time", "Trace No"),
     )
 
+    # 有分区锚点时只用分区；否则不要把全卡丢给 "Bank" 标签（会误截 Commercial Bank PLC）
+    payer_src = payer_zone if has_anchor else []
+    payee_src = payee_zone if has_anchor else []
+
     # Pay from 区 -> Payer 别名
-    payer_fields = _build_label_fields(payer_zone or lines, ("Name", "Bank", "Account No", "Account Currency"))
-    if payer_fields.get("Name") or payer.name:
-        fields["Payer Name"] = payer_fields.get("Name") or payer.name
-    if payer_fields.get("Bank") or payer.bank:
-        fields["Payer Bank"] = payer_fields.get("Bank") or payer.bank
-    if payer_fields.get("Account No") or payer.account:
-        fields["Payer Account No"] = payer_fields.get("Account No") or payer.account
+    payer_fields = _build_label_fields(payer_src, ("Name", "Bank", "Account No", "Account Currency")) if payer_src else {}
+    if payer.name or payer_fields.get("Name"):
+        fields["Payer Name"] = payer.name or payer_fields.get("Name")
+    if payer.bank or payer_fields.get("Bank"):
+        bank_v = payer.bank or payer_fields.get("Bank")
+        if bank_v and bank_v.upper() not in {"PLC", "BANK", "LTD"}:
+            fields["Payer Bank"] = bank_v
+    if payer.account or payer_fields.get("Account No"):
+        fields["Payer Account No"] = payer.account or payer_fields.get("Account No")
     if payer_fields.get("Account Currency"):
         fields["Account Currency"] = payer_fields["Account Currency"]
 
     # Pay to 区 -> Payee 别名（结构化 payee 已经过 Lak Artha 等归一化，优先采用）
-    payee_fields = _build_label_fields(payee_zone or lines, ("Name", "Bank Name", "Account No"))
+    payee_fields = _build_label_fields(payee_src, ("Name", "Bank Name", "Account No")) if payee_src else {}
     if payee.name or payee_fields.get("Name"):
         fields["Payee Name"] = payee.name or payee_fields.get("Name")
     if payee.bank or payee_fields.get("Bank Name"):
         fields["Payee Bank"] = payee.bank or payee_fields.get("Bank Name")
     if payee.account or payee_fields.get("Account No"):
         fields["Payee Account No"] = payee.account or payee_fields.get("Account No")
+
+    sparse = not fields.get("Payer Account No") or not fields.get("Payee Account No") or not fields.get(
+        "Amount (LKR)"
+    )
+    if sparse or _is_peoples_pay_sinhala_layout(lines):
+        _, _, pos_fields = _extract_peoples_pay_positional(lines)
+        for k, v in pos_fields.items():
+            if k == "Payer Bank" and fields.get("Payer Bank") and fields["Payer Bank"].upper() not in {
+                "PLC",
+                "BANK",
+                "LTD",
+            }:
+                continue
+            fields.setdefault(k, v)
+            if k == "Payer Bank" and fields.get("Payer Bank", "").upper() in {"PLC", "BANK", "LTD"}:
+                fields["Payer Bank"] = v
 
     return fields
 
@@ -3178,6 +3360,25 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             success = True
     elif bank == "peoples_bank":
         fields = _build_peoples_pay_fields(lines, payer, payee)
+        # 僧伽罗语等标签缺失时，结构化金额常被状态栏噪点带偏，用扁平金额回填
+        for src_key, setter in (
+            ("Amount (LKR)", "amount"),
+            ("Fee Amount (LKR)", "fee"),
+            ("Total debit amount (LKR)", "total"),
+        ):
+            parsed = _parse_money(fields.get(src_key) or "")
+            if parsed is None:
+                continue
+            if setter == "amount" and (amount is None or amount < 100):
+                amount = parsed
+            elif setter == "fee" and (fee is None or fee < 1):
+                fee = parsed
+            elif setter == "total" and (total is None or total < 100):
+                total = parsed
+        if total is None and amount is not None and fee is not None:
+            total = amount + fee
+        if amount is not None or payee.account is not None or fields.get("Payer Account No"):
+            success = True
     elif doc_type == "e_receipt":
         fields = _build_ereceipt_fields(lines)
     elif bank == "nsb" and "nsb online banking" in full_text.lower():

@@ -1319,6 +1319,47 @@ def test_nsb_online_banking():
     assert r.fields["Benefi. Account Type"] == "Savings Account"
 
 
+def test_peoples_pay_sinhala_positional_fields():
+    """僧伽罗语 People's Pay：英文 Pay from/to 标签缺失，按 People's Bank/Commercial Bank 锚点提取。"""
+    lines = [
+        _lr("O MM CHANDIKA BANDARA WIJERATHNA", 110, 464, 1088, 509),
+        _lr("People's Bank", 788, 557, 1093, 602),
+        _lr("149200xxxxxxx84", 713, 638, 1093, 697),
+        _lr("LKR", 996, 731, 1096, 784),
+        _lr("CeG9 CGQ@9", 107, 990, 576, 1045),
+        _lr("LAK ARTHA SCVICE. PVT LTD", 402, 1124, 1087, 1169),
+        _lr("Commercial Bank PLC", 613, 1216, 1090, 1261),
+        _lr("1001096962", 793, 1306, 1090, 1359),
+        _lr("9gC(LKR)", 104, 1570, 414, 1636),
+        _lr("5,050.00", 876, 1575, 1090, 1623),
+        _lr("Ges", 115, 1815, 225, 1863),
+        _lr("GeD (LKR)", 105, 1920, 445, 1987),
+        _lr("25.00", 962, 1931, 1096, 1979),
+        _lr("G3y6Osi qQ3o ge @cC(LKR) 5,075.00", 107, 2010, 1096, 2077),
+        _lr("Eocs a gSea", 115, 2248, 525, 2311),
+        _lr("2026-10-30 14:17:13", 646, 2256, 1090, 2301),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "peoples_bank"
+    assert r.payer.name == "MM CHANDIKA BANDARA WIJERATHNA"
+    assert r.payer.bank == "People's Bank"
+    assert r.payer.account == "149200xxxxxxx84"
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.bank == "Commercial Bank PLC"
+    assert r.payee.account == "1001096962"
+    assert r.amount == 5050.0
+    assert r.fee == 25.0
+    assert r.total_debit == 5075.0
+    assert r.datetime == "2026-10-30T14:17:13"
+    assert r.fields["Payer Bank"] == "People's Bank"
+    assert r.fields["Payer Bank"] != "PLC"
+    assert r.fields["Amount (LKR)"] == "5,050.00"
+    assert r.fields["Fee Amount (LKR)"] == "25.00"
+    assert r.fields["Total debit amount (LKR)"] == "5,075.00"
+    assert r.fields["Date & Time"] == "2026-10-30 14:17:13"
+
+
 def test_union_ubgo_fund_transfer_receipt():
     """Union Bank UBgo FUND TRANSFER RECEIPT：冒号字段 + Amount 上下 + 收款行居中。"""
     lines = [

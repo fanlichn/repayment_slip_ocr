@@ -2116,18 +2116,40 @@ def _build_label_fields(lines, labels, same_row: bool = False) -> dict:
     wanted = {_norm_label(lbl): lbl for lbl in labels}
     fields: dict = {}
     ordered = _sorted_by_y(lines)
+    # 几乎同行且横向分开的 ≥2 个白名单标签（如 CDM 的 DATE/TIME/TERMINAL ID）
+    # 为并排表头，值在各自正下方；此时禁用右侧取值，否则更右一列的值会因垂直重叠
+    # 更大被 _value_line_to_right / _right_column_line 抢给左侧标签。
+    # y/x 阈值须收紧：纵向两栏版式（LB Finance / NSB）相邻标签 dy 常约 40–50px，
+    # 不能把它们误判成并排表头。
+    header_row_labels = set()
+    wanted_label_lines = [
+        ln for ln in ordered if wanted.get(_norm_label(ln.text)) is not None
+    ]
+    for a_i, a in enumerate(wanted_label_lines):
+        ay = _line_center_y(a.box)
+        ax = _line_center_x(a.box)
+        for b in wanted_label_lines[a_i + 1 :]:
+            if abs(_line_center_y(b.box) - ay) > 30.0:
+                continue
+            if abs(_line_center_x(b.box) - ax) < 80.0:
+                continue  # 同列上下堆叠，不是并排表头
+            header_row_labels.add(id(a))
+            header_row_labels.add(id(b))
     # 两栏：左标签、右值 / 下方取值（标签独占一行）
     for i, ln in enumerate(ordered):
         key = wanted.get(_norm_label(ln.text))
         if key is None or key in fields:
             continue
-        side_line = _value_line_to_right(i, ordered, ln)
-        if side_line is not None and _norm_label(side_line.text) in wanted:
-            side_line = None  # 右侧是相邻标签（如 DATE/TIME/TERMINAL ID 表头），非值
-        if side_line is None and not same_row:
-            side_line = _right_column_line(i, ordered, ln)
+        adjacent_header = id(ln) in header_row_labels
+        side_line = None
+        if not adjacent_header:
+            side_line = _value_line_to_right(i, ordered, ln)
             if side_line is not None and _norm_label(side_line.text) in wanted:
-                side_line = None
+                side_line = None  # 右侧是相邻标签，非值
+            if side_line is None and not same_row:
+                side_line = _right_column_line(i, ordered, ln)
+                if side_line is not None and _norm_label(side_line.text) in wanted:
+                    side_line = None
         if side_line is not None:
             side_value = _collect_column_block(ordered, side_line)
             # 跳过标签词（如面额表表头 "AMOUNT"）

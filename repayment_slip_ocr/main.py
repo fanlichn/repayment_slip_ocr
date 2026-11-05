@@ -130,15 +130,25 @@ def _has_cdm_party_text(lines: List[OcrLine]) -> bool:
     return re.search(r"(?<!\d)\d{8,14}(?!\d)", blob) is not None
 
 
+def _anchor_scale_y(img_h: float, lines: List[OcrLine]) -> float:
+    """仅当行框明显超出当前图高（来自更大 variant）时才缩小；禁止把空白底边当成缩放。
+
+    旧逻辑用 h/max_line_y：收据未铺满画布时 max_line_y < h，会把 TRANSACTION~NARRATION
+    错映射到下方 NOTES 表，账号行永远裁不到。
+    """
+    ref = _line_max_y(lines)
+    if ref > img_h * 1.05:
+        return img_h / ref
+    return 1.0
+
+
 def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
     """生成若干中间带裁剪：(crop, top, left)。
 
-    行框可能来自纠偏后的其它 variant，需按当前图高做比例映射；
-    并收紧到 TRANSACTION 与 NARRATION 之间，避免只读到 CARDLESS 就停。
+    优先 TRANSACTION~NARRATION 原坐标窗口；再辅以固定比例窗口。
     """
     h, w = img.shape[:2]
-    ref_h = max(_line_max_y(lines), float(h))
-    scale_y = h / ref_h
+    scale_y = _anchor_scale_y(float(h), lines)
 
     y0_hits = _anchor_ys(lines, ["cardless", "transaction"])
     y1_hits = _anchor_ys(lines, ["narration", "mobile", "source of funds", "notes", "value"])
@@ -151,19 +161,20 @@ def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple
         y1 = min(y1_hits) * scale_y
 
     windows: List[tuple] = []
+    # 固定比例优先：不依赖可能串 variant 的绝对坐标，EKALA 账号约在 0.34–0.45
+    windows.extend(
+        [
+            (h * 0.34, h * 0.47),
+            (h * 0.32, h * 0.50),
+            (h * 0.30, h * 0.52),
+            (h * 0.28, h * 0.55),
+        ]
+    )
     if y0 is not None and y1 is not None and y1 > y0 + 60:
         # 略缩进：跳过 TRANSACTION 行本身，聚焦 ACCOUNT/CUSTOMER
         span = y1 - y0
-        windows.append((y0 + span * 0.12, y1 - span * 0.08))
-        windows.append((y0 - h * 0.01, y1 + h * 0.01))
-    # 固定比例兜底（手持 CDM 账号常在中上部）
-    windows.extend(
-        [
-            (h * 0.32, h * 0.50),
-            (h * 0.28, h * 0.55),
-            (h * 0.35, h * 0.48),
-        ]
-    )
+        windows.append((y0 + span * 0.15, y1 - span * 0.10))
+        windows.append((y0 + 20, y1 - 10))
 
     left = max(0, int(w * 0.01))
     out: List[tuple] = []
@@ -173,7 +184,7 @@ def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple
         bottom = min(h, int(y_b))
         if bottom - top < 40:
             continue
-        key = (top // 20, bottom // 20)
+        key = (top // 15, bottom // 15)
         if key in seen:
             continue
         seen.add(key)
@@ -187,7 +198,7 @@ def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple
 def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     """对 CDM 的 TRANSACTION~NARRATION 中间带二次 OCR，补账号/户名。
 
-    多窗口 + CLAHE/放大：首轮常只能读到 CARDLESS，必须在未见账号数字时继续加强。
+    多窗口 + CLAHE/二值/加粗 + 放大：热敏字细、首轮常漏 ACCOUNT 行。
     """
     found: List[OcrLine] = []
 
@@ -210,23 +221,26 @@ def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
             gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
         else:
             gray = crop_img
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
         out.append(enhanced)
         binary = cv2.adaptiveThreshold(
             enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
         )
         out.append(binary)
+        # 热敏点阵加粗，提升检测召回
+        kernel = np.ones((2, 2), np.uint8)
+        out.append(cv2.dilate(binary, kernel, iterations=1))
+        # 反色有时更易出框
+        out.append(cv2.bitwise_not(binary))
         return out
 
     for crop, top, left in _prepare_cdm_band_crops(img, lines):
         for prep in _variants(crop):
-            found = dedup_lines(found + _run(prep, top, left, 1.0))
-            if _has_cdm_party_text(found):
-                return found
-            found = dedup_lines(found + _run(prep, top, left, 2.0))
-            if _has_cdm_party_text(found):
-                return found
+            for scale in (1.0, 2.0, 2.5):
+                found = dedup_lines(found + _run(prep, top, left, scale))
+                if _has_cdm_party_text(found):
+                    return found
     return found
 
 
@@ -273,8 +287,7 @@ def _has_boc_hero_amount_text(lines: List[OcrLine], fee_hint: Optional[float] = 
 def _ocr_boc_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     """复检 BOC Transaction Details 顶部大额（标题 ~ Receiver's Account 之间）。"""
     h, w = img.shape[:2]
-    ref_h = max(_line_max_y(lines), float(h))
-    scale_y = h / ref_h
+    scale_y = _anchor_scale_y(float(h), lines)
     y0 = h * 0.04
     y1 = h * 0.32
     for ln in lines:

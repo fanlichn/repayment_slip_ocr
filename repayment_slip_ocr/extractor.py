@@ -3653,6 +3653,166 @@ def _build_union_ubgo_fields(lines) -> dict:
     return fields
 
 
+def _is_ntb_watermark_text(text: str) -> bool:
+    """Nations Trust 斜向水印及其 OCR 残片。"""
+    compact = re.sub(r"[^a-z]", "", (text or "").lower())
+    if not compact or len(compact) < 4:
+        return False
+    if compact in {
+        "nations",
+        "nation",
+        "trustbank",
+        "trust",
+        "tbank",
+        "stbank",
+        "ustbank",
+        "rustbank",
+        "nsbank",
+        "tionstrustbank",
+        "nationstrustbank",
+        "nationstrust",
+        "nationstrus",
+        "nationstru",
+        "verifiedby",
+    }:
+        return True
+    if "nationstrustbank" in compact and len(compact) <= len("pnationstrustbank") + 2:
+        return True
+    if compact.endswith("trustbank") and len(compact) <= 20:
+        return True
+    # DescriptiontBank / Success 粘水印等
+    if re.fullmatch(r"(description|status|success|amount)?n?ations?trustbank.*", compact):
+        return True
+    if compact.endswith("tbank") and any(
+        k in compact for k in ("description", "status", "success", "amount", "nations", "trust")
+    ):
+        return True
+    return False
+
+
+def _is_ntb_ocr_junk_token(text: str) -> bool:
+    """水印叠字产生的乱码：PU8QAW、含数字的短大写串（非纯参考号）。"""
+    t = (text or "").strip()
+    if not t:
+        return True
+    if re.fullmatch(r"\d{6,}", t):
+        return False
+    if re.fullmatch(r"[A-Z0-9]{4,12}", t) and re.search(r"\d", t) and re.search(r"[A-Z]", t):
+        return True
+    return False
+
+
+def _scrub_ntb_watermark_glue(value: str) -> str:
+    """剥掉 Description/Remarks 上粘连的 NationsTrust 水印与乱码后缀。
+
+    例：NatiPU8QAW → Nati；NationsTrustBankNatali → Natali。
+    """
+    v = _clean(value or "")
+    if not v:
+        return ""
+    # 整段水印
+    if _is_ntb_watermark_text(v):
+        return ""
+    # 去掉粘连的水印子串
+    v = re.sub(
+        r"(?i)(?:nations?\s*trust\s*bank|nationstrustbank|tionstrustbank|trustbank)",
+        "",
+        v,
+    )
+    v = re.sub(r"\s+", " ", v).strip(" .-:")
+    if not v or _is_ntb_watermark_text(v):
+        return ""
+    # NatiPU8QAW：名字前缀 + 含数字的大写乱码尾
+    m = re.match(r"^([A-Z][a-z]{2,20})([A-Z]{2,}\d[A-Z0-9]{1,}|\d[A-Z0-9]{3,})$", v)
+    if m and not _is_ntb_ocr_junk_token(m.group(1)):
+        return m.group(1)
+    if _is_ntb_ocr_junk_token(v):
+        return ""
+    return v
+
+
+def _filter_ntb_watermark_lines(lines):
+    return [ln for ln in lines if not _is_ntb_watermark_text(ln.text)]
+
+
+def _pick_ntb_description(lines, label_line) -> Optional[str]:
+    """Description 右列多候选：跳过水印/乱码，取清洗后的人名式值。"""
+    ly0 = min(p[1] for p in label_line.box)
+    ly1 = max(p[1] for p in label_line.box)
+    label_right = max(p[0] for p in label_line.box)
+    best = None
+    for ln in lines:
+        if _is_ntb_watermark_text(ln.text):
+            continue
+        ox0 = min(p[0] for p in ln.box)
+        if ox0 < label_right - 20:
+            continue
+        oy0 = min(p[1] for p in ln.box)
+        oy1 = max(p[1] for p in ln.box)
+        overlap = min(ly1, oy1) - max(ly0, oy0)
+        if overlap <= 0:
+            continue
+        scrubbed = _scrub_ntb_watermark_glue(ln.text)
+        if not scrubbed or _looks_like_label_text(scrubbed):
+            continue
+        conf = float(getattr(ln, "confidence", 0.0) or 0.0)
+        # 更长人名、更大重叠、更高置信
+        score = (len(scrubbed), overlap, conf)
+        if best is None or score > best[0]:
+            best = (score, scrubbed)
+    return best[1] if best else None
+
+
+def _scrub_ntb_text_fields(fields: dict, lines) -> dict:
+    """NTB：清洗 Description/Remarks，并在标签旁重选未被水印污染的描述。"""
+    for key in ("Description", "Remarks", "Status", "To account name", "Bank"):
+        if key not in fields or not fields[key]:
+            continue
+        cleaned = _scrub_ntb_watermark_glue(str(fields[key]))
+        if cleaned:
+            fields[key] = cleaned
+        else:
+            fields.pop(key, None)
+    # 右列重选：优先更长的干净人名（Natali 优于 NatiPU8QAW 剥尾后的 Nati）
+    picked = None
+    for ln in lines:
+        if _norm_label(ln.text) == "description":
+            picked = _pick_ntb_description(lines, ln)
+            break
+    cur = fields.get("Description") or ""
+    if picked and (
+        not cur
+        or len(picked) > len(cur)
+        or _ntb_description_contaminated(cur)
+        or _is_ntb_ocr_junk_token(cur)
+    ):
+        fields["Description"] = picked
+    if fields.get("Description"):
+        fields["Remarks"] = fields["Description"]
+    elif "Remarks" in fields and (
+        _is_ntb_ocr_junk_token(str(fields["Remarks"]))
+        or not _scrub_ntb_watermark_glue(str(fields["Remarks"]))
+    ):
+        fields.pop("Remarks", None)
+    return fields
+
+
+def _ntb_description_contaminated(desc: Optional[str]) -> bool:
+    """Description 仍含水印乱码或空，需行带复检。"""
+    if not desc or not str(desc).strip():
+        return True
+    d = str(desc).strip()
+    if _is_ntb_watermark_text(d) or _is_ntb_ocr_junk_token(d):
+        return True
+    if re.search(r"[a-z][A-Z]{2,}\d|[A-Z]{2,}\d[A-Z]", d):
+        return True
+    if re.search(r"\d", d) and re.search(r"[A-Za-z]", d) and not re.search(
+        r"(?i)lkr|rs\.?", d
+    ):
+        return True
+    return False
+
+
 def _enrich_reference_aliases(fields: dict, references: ReferencesOut) -> dict:
     """下游常用 Payment Reference / Transaction Reference 别名补齐。"""
     candidates = [
@@ -4155,6 +4315,11 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         dash = _build_dash_label_fields(lines, _BOC_SMARTPAY_LABELS)
         for k, v in dash.items():
             fields.setdefault(k, v)
+    elif bank == "ntb":
+        # 斜向 NationsTrustBank 水印极多，先滤掉再抽字段，避免粘进 Description
+        ntb_lines = _filter_ntb_watermark_lines(lines)
+        fields = _build_label_fields(ntb_lines, field_labels)
+        fields = _scrub_ntb_text_fields(fields, ntb_lines)
     else:
         fields = _build_label_fields(lines, field_labels)
     # 金额小数点被 OCR 误读为冒号时还原（如 "2,500:00" → "2,500.00"）
@@ -4238,6 +4403,16 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         # Reference number 里的水印前缀已在 alias 里剥掉；同步写回
         if fields.get("Payment Reference") and "Reference number" in fields:
             fields["Reference number"] = fields["Payment Reference"]
+        # 再次清洗（Remarks 兜底可能在后面写入前先对齐 Description）
+        fields = _scrub_ntb_text_fields(fields, _filter_ntb_watermark_lines(lines))
+        if fields.get("Description") and not fields.get("Remarks"):
+            fields["Remarks"] = fields["Description"]
+        elif fields.get("Remarks"):
+            rem = _scrub_ntb_watermark_glue(str(fields["Remarks"]))
+            if rem:
+                fields["Remarks"] = rem
+            else:
+                fields.pop("Remarks", None)
     # 时间无标签（如 BOC App 独立的 "10.08.2026 , 06:45 PM" 行）时，从 OCR 原文补 Date & Time
     if not any("date" in k.lower() or "time" in k.lower() for k in fields):
         raw_dt = _find_datetime_raw(lines)
@@ -4267,6 +4442,18 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         narr = fields["NARRATION"]
         if not re.search(r"(?i)cardless\s*deposit|cash\s*deposit", narr):
             fields["Remarks"] = narr
+    # NTB：Remarks/Description 兜底写入后再剥一次水印乱码（如 NatiPU8QAW）
+    if bank == "ntb":
+        for key in ("Description", "Remarks"):
+            if not fields.get(key):
+                continue
+            cleaned = _scrub_ntb_watermark_glue(str(fields[key]))
+            if cleaned:
+                fields[key] = cleaned
+            else:
+                fields.pop(key, None)
+        if fields.get("Description") and not fields.get("Remarks"):
+            fields["Remarks"] = fields["Description"]
     # 时间字段统一成 24 小时制（YYYY-MM-DD HH:MM:SS），去掉 AM/PM 与点号分隔
     for k in list(fields.keys()):
         if k in ("TIME",):

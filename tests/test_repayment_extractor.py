@@ -1499,6 +1499,51 @@ def test_kalutara_rotated_sparse_ocr_completes_account_and_scrub():
     assert "7,600.00" in str(r2.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
 
 
+def test_ntb_description_strips_watermark_junk():
+    """NTB Transaction summary：Description 被水印粘成 NatiPU8QAW / PU8QAW 时剥掉乱码；
+    复检补到 Natali 时应优选取完整人名。"""
+    lines = [
+        _lr("Transaction summary", 379, 196, 818, 237),
+        _lr("LKR 6,600.00", 482, 364, 716, 398),
+        _lr("Fund transfer", 493, 415, 709, 444),
+        _lr("From account", 58, 531, 285, 560),
+        _lr("XXXXXXXX9246", 902, 531, 1142, 560),
+        _lr("To account", 58, 598, 242, 627),
+        _lr("1001096962", 960, 596, 1142, 625),
+        _lr("To account name", 58, 662, 344, 693),
+        _lr("Lak Artha services", 852, 661, 1140, 690),
+        _lr("Bank", 56, 724, 143, 761),
+        _lr("Commercial Bank PLC", 788, 727, 1139, 756),
+        _lr("Service charge", 58, 789, 298, 828),
+        _lr("LKR 25.00", 992, 789, 1144, 825),
+        _lr("Date", 56, 850, 139, 892),
+        _lr("30-Oct-2026", 934, 855, 1142, 884),
+        _lr("Time", 55, 919, 141, 956),
+        _lr("18:55", 1062, 920, 1144, 953),
+        _lr("Reference number.", 60, 989, 356, 1018),
+        _lr("2630306102752552", 842, 989, 1140, 1012),
+        _lr("Status", 56, 1048, 164, 1090),
+        _lr("Success", 1009, 1053, 1144, 1084),
+        _lr("Description", 58, 1117, 242, 1152),
+        _lr("PU8QAW", 1002, 1118, 1144, 1149, 0.999),
+        _lr("NatiPU8QAW", 919, 1113, 1146, 1154, 0.996),
+        _lr("NationsTrustBank", 642, 1117, 867, 1146, 0.991),
+        _lr("NationsTrustBank", 361, 1117, 588, 1146, 0.986),
+    ]
+    r = extract(lines)
+    assert r.bank == "ntb"
+    assert "PU8QAW" not in str(r.fields.get("Description") or "")
+    assert "PU8QAW" not in str(r.fields.get("Remarks") or "")
+    assert r.fields.get("Description") == "Nati"
+    assert r.fields.get("Remarks") == "Nati"
+    assert r.fields["To account"] == "1001096962"
+    assert r.amount == 6600.0
+    # 描述行复检读到完整 Natali
+    r2 = extract(lines + [_lr("Natali", 980, 1115, 1140, 1150, 0.99)])
+    assert r2.fields["Description"] == "Natali"
+    assert r2.fields["Remarks"] == "Natali"
+
+
 def test_peoples_pay_sinhala_positional_fields():
     """僧伽罗语 People's Pay：英文 Pay from/to 标签缺失，按 People's Bank/Commercial Bank 锚点提取。"""
     lines = [

@@ -23,7 +23,15 @@ from app.ocr_engine import OcrLine, create_engine
 from app.preprocessing import build_variants, load_image
 from app.url_fetch import UrlFetchError, fetch_image_bytes
 
-from .extractor import _parse_money, dedup_lines, extract
+from .extractor import (
+    _is_ntb_ocr_junk_token,
+    _is_ntb_watermark_text,
+    _ntb_description_contaminated,
+    _parse_money,
+    _scrub_ntb_watermark_glue,
+    dedup_lines,
+    extract,
+)
 
 setup_logging("repayment_ocr")
 
@@ -591,6 +599,115 @@ def _ocr_boc_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     return found
 
 
+def _ntb_needs_description_band(result, lines: List[OcrLine]) -> bool:
+    """NTB Description 被水印粘成 NatiPU8QAW / 仅有乱码时复检描述行。"""
+    if (result.bank or "").lower() != "ntb":
+        return False
+    desc = (result.fields or {}).get("Description") or ""
+    # 已有干净且足够长的描述则跳过
+    if desc and not _ntb_description_contaminated(desc) and len(str(desc).strip()) >= 5:
+        return False
+    if _ntb_description_contaminated(desc):
+        return True
+    for ln in lines:
+        t = ln.text.strip()
+        if _is_ntb_ocr_junk_token(t):
+            return True
+        if re.match(r"^[A-Z][a-z]{2,}[A-Z]{2,}\d", t):
+            return True
+    return False
+
+
+def _has_clean_ntb_description(lines: List[OcrLine]) -> bool:
+    for ln in lines:
+        if _is_ntb_watermark_text(ln.text) or _is_ntb_ocr_junk_token(ln.text):
+            continue
+        scrubbed = _scrub_ntb_watermark_glue(ln.text)
+        if not scrubbed or _ntb_description_contaminated(scrubbed):
+            continue
+        # 干净人名：纯字母、无数字；长度≥5 避免 NatiPU8QAW 剥尾后的残片早停
+        if re.fullmatch(r"[A-Za-z][A-Za-z\s.'-]{1,40}", scrubbed) and len(scrubbed) >= 5:
+            if scrubbed.lower() not in {"description", "success", "status", "bank"}:
+                return True
+    return False
+
+
+def _prepare_ntb_description_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    h, w = img.shape[:2]
+    y0, y1 = h * 0.62, h * 0.78
+    for ln in lines:
+        if "description" in ln.text.lower():
+            cy = sum(p[1] for p in ln.box) / 4.0
+            y0 = max(0.0, cy - h * 0.03)
+            y1 = min(float(h), cy + h * 0.04)
+            break
+    windows = [
+        (y0, y1, w * 0.45, w * 0.98),
+        (y0, y1, w * 0.55, w * 0.99),
+        (y0 - h * 0.01, y1 + h * 0.01, w * 0.40, w * 0.99),
+    ]
+    out = []
+    seen = set()
+    for ya, yb, xa, xb in windows:
+        top = max(0, int(ya))
+        bottom = min(h, int(yb))
+        left = max(0, int(xa))
+        right = min(w, int(xb))
+        if bottom - top < 20 or right - left < 40:
+            continue
+        key = (top // 8, bottom // 8, left // 20)
+        if key in seen:
+            continue
+        seen.add(key)
+        crop = img[top:bottom, left:right]
+        if crop.size:
+            out.append((crop, float(top), float(left)))
+    return out
+
+
+def _ntb_desc_prep_variants(crop_img: np.ndarray) -> List[np.ndarray]:
+    """压浅色水印、强化深色正文。"""
+    out = [crop_img]
+    if len(crop_img.shape) == 3:
+        gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = crop_img
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    out.append(enhanced)
+    # 浅灰水印抬亮后二值，保留深字
+    blur = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    out.append(binary)
+    out.append(cv2.bitwise_not(binary))
+    adaptive = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
+    )
+    out.append(adaptive)
+    return out
+
+
+def _ocr_ntb_description_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
+    found: List[OcrLine] = []
+
+    def _run(crop_img: np.ndarray, top: float, left: float, scale: float) -> List[OcrLine]:
+        work = crop_img
+        if scale != 1.0:
+            work = cv2.resize(
+                crop_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+            )
+        raw = engine.recognize(work)
+        return _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
+
+    for crop, top, left in _prepare_ntb_description_crops(img, lines):
+        for prep in _ntb_desc_prep_variants(crop):
+            for scale in (1.5, 2.0, 2.5):
+                found = dedup_lines(found + _run(prep, top, left, scale))
+                if _has_clean_ntb_description(found):
+                    return found
+    return found
+
+
 def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     settings = get_settings()
     if len(buf) > settings.max_upload_bytes:
@@ -653,6 +770,27 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
             if extras:
                 unique = dedup_lines(unique + extras)
                 result = extract(unique, include_lines=False)
+    # NTB：斜向水印粘进 Description（NatiPU8QAW），对描述行复检
+    if _ntb_needs_description_band(result, unique):
+        extras = []
+        for name in ("color_raw", "enhanced", "color"):
+            extras.extend(
+                _ocr_ntb_description_band(_engine, _variant_img(variants, name), unique)
+            )
+            probe = dedup_lines(unique + extras)
+            probe_result = extract(probe, include_lines=False)
+            desc = (probe_result.fields or {}).get("Description")
+            if desc and not _ntb_description_contaminated(desc) and len(str(desc)) >= 4:
+                # 复检得到更完整描述时采用
+                cur = (result.fields or {}).get("Description") or ""
+                if len(str(desc)) >= len(str(cur)):
+                    unique = probe
+                    result = extract(unique, include_lines=include_lines)
+                    break
+        else:
+            if extras:
+                unique = dedup_lines(unique + extras)
+                result = extract(unique, include_lines=include_lines)
     if include_lines and not result.lines:
         result = extract(unique, include_lines=True)
 

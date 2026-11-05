@@ -2126,13 +2126,25 @@ def _is_to_only_receipt(lines) -> bool:
     return any(ln.text.strip().strip(":：. ").lower() == "to" for ln in lines)
 
 
+def _is_ipay_receipt(lines) -> bool:
+    """iPay Transaction Summary：www.ipay.lk / 文件名 ipay_… / 正文 iPay 标识。"""
+    full = " ".join(ln.text for ln in lines).lower()
+    return "www.ipay.lk" in full or "ipay" in full
+
+
 def _is_hnb_app_receipt(lines) -> bool:
     """HNB 手机 App「Fund Transfer Receipt」：居中 From/To，收款方姓名+账号合并一行，
     底部 "This is an auto generated receipt" / "Receiver reference"。"""
     full = " ".join(ln.text for ln in lines).lower()
-    if "this is an auto generated receipt" in full or "hatton national" in full:
+    # iPay 付款行常写 Hatton National Bank，不能据此判成 HNB App
+    if _is_ipay_receipt(lines):
+        return False
+    if "this is an auto generated receipt" in full:
         return True
-    return "fund transfer receipt" in full and "receiver reference" in full
+    if "fund transfer receipt" in full and "receiver reference" in full:
+        return True
+    # 无页脚时：Hatton National + HNB App 标题才认
+    return "hatton national" in full and "fund transfer receipt" in full
 
 
 def _is_peoples_pay_layout(lines) -> bool:
@@ -2173,6 +2185,9 @@ def _detect_bank(lines) -> Optional[str]:
     # 抢在 "people's bank" 之前：该版式底部会显示付款来源银行（如 People's Bank）。
     if _is_boc_smartpay(lines) or _is_boc_app(lines):
         return "boc"
+    # iPay 须抢在 HNB 之前：付款行常含 Hatton National
+    if _is_ipay_receipt(lines):
+        return "ipay"
     if _is_hnb_app_receipt(lines):
         return "hnb"
     for bank, markers in _BANK_MARKERS:
@@ -3222,6 +3237,11 @@ def _right_column_buckets(lines, labels) -> dict:
 def _build_ipay_fields(lines) -> dict:
     buckets = _right_column_buckets(lines, _IPAY_LABELS)
     fields = {k: " ".join(v) for k, v in buckets.items() if v}
+    # Status 只保留成功/失败词，丢掉 logo 碎片 "pay" 等
+    if "Status" in fields:
+        m = re.search(r"(?i)\b(SUCCESSFUL|SUCCESS|FAILED|FAIL|PENDING)\b", fields["Status"])
+        if m:
+            fields["Status"] = m.group(1).upper()
     # Amount 常无标签，仅 "Rs.7,575.00" 独立行
     if not any("amount" in k.lower() for k in fields):
         for ln in _sorted_by_y(lines):

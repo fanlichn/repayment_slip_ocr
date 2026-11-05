@@ -2494,3 +2494,53 @@ def test_ipay_fund_transfer():
     assert r.fields["Remarks"] == "0714362384"
     assert r.fields["Status"] == "SUCCESS"
 
+
+def test_ipay_hnb_payer_not_misclassified_as_hnb_app():
+    """iPay 付款行为 Hatton National 时不得误判成 HNB App，金额/收付款方应齐全。
+
+    真实样本：logo 拆成 "pay"、Recipient 为 "lak artha pvt Itd"。
+    """
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 18, x1, y + 18)
+    lines = [
+        L("ipay_2026103012043...", 153, 822, 190),
+        L("Transaction Summary", 441, 759, 443),
+        L("Rs.1,100.00", 513, 687, 620),
+        L("Transaction Date", 115, 320, 774),
+        L("2026-10-30 17:34:37", 600, 848, 772),
+        L("Transaction ID", 115, 288, 857),
+        L("2026103012043700001", 597, 883, 857),
+        L("Type", 110, 186, 932),
+        L("Fund Transfer", 600, 770, 932),
+        L("From", 112, 186, 1025),
+        L("Jayan", 600, 678, 1002),
+        L("Hatton National Bank PLC ********1172", 597, 1059, 1052),
+        L("To", 112, 156, 1138),
+        L("Commercial Bank PLC", 603, 868, 1111),
+        L("1001096962", 600, 750, 1166),
+        L("Recipient", 115, 231, 1240),
+        L("lak artha pvt Itd", 600, 785, 1226),
+        L(" Remarks", 111, 232, 1334),
+        L("N/A", 597, 658, 1336),
+        L("Status", 115, 197, 1425),
+        L("SUCCESS", 600, 733, 1426),
+        L("This transaction was performed using", 358, 840, 1518),
+        L("pay", 871, 947, 1505),
+        L("For more information, visit www.ipay.lk", 112, 502, 1706),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "ipay"
+    assert r.amount == 1100.0
+    assert r.payer.name == "Jayan"
+    assert r.payer.bank == "Hatton National Bank PLC"
+    assert r.payer.account == "********1172"
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank PLC"
+    assert r.fields["Amount"] == "Rs.1,100.00"
+    assert r.fields["Type"] == "Fund Transfer"
+    assert r.fields["From"] == "Jayan Hatton National Bank PLC ********1172"
+    assert r.fields["To"] == "Commercial Bank PLC 1001096962"
+    assert r.fields["Recipient"] == "lak artha pvt Itd"
+    assert r.fields["Status"] == "SUCCESS"
+    assert r.fields["Transaction ID"] == "2026103012043700001"

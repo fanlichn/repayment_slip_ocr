@@ -3690,42 +3690,67 @@ def _is_ntb_watermark_text(text: str) -> bool:
     return False
 
 
+def _is_ntb_description_code(text: str) -> bool:
+    """NTB Description 常见短码：PU8QAW（字母+数字，非纯账号）。"""
+    t = (text or "").strip()
+    return bool(
+        re.fullmatch(r"[A-Z0-9]{4,12}", t)
+        and re.search(r"[A-Z]", t)
+        and re.search(r"\d", t)
+        and not re.fullmatch(r"\d{6,}", t)
+    )
+
+
 def _is_ntb_ocr_junk_token(text: str) -> bool:
-    """水印叠字产生的乱码：PU8QAW、含数字的短大写串（非纯参考号）。"""
+    """仅水印残片算 junk；PU8QAW 这类描述短码保留。"""
     t = (text or "").strip()
     if not t:
         return True
-    if re.fullmatch(r"\d{6,}", t):
+    if _is_ntb_description_code(t):
         return False
-    if re.fullmatch(r"[A-Z0-9]{4,12}", t) and re.search(r"\d", t) and re.search(r"[A-Z]", t):
-        return True
-    return False
+    return _is_ntb_watermark_text(t)
 
 
 def _scrub_ntb_watermark_glue(value: str) -> str:
-    """剥掉 Description/Remarks 上粘连的 NationsTrust 水印与乱码后缀。
+    """剥掉 Description 上粘连的 NationsTrust 水印前缀，保留真实短码。
 
-    例：NatiPU8QAW → Nati；NationsTrustBankNatali → Natali。
+    例：NatiPU8QAW / 3 Nat PU8QAW → PU8QAW。
     """
     v = _clean(value or "")
     if not v:
         return ""
-    # 整段水印
     if _is_ntb_watermark_text(v):
         return ""
-    # 去掉粘连的水印子串
+    # 去掉整段水印子串
     v = re.sub(
         r"(?i)(?:nations?\s*trust\s*bank|nationstrustbank|tionstrustbank|trustbank)",
-        "",
+        " ",
         v,
     )
     v = re.sub(r"\s+", " ", v).strip(" .-:")
     if not v or _is_ntb_watermark_text(v):
         return ""
-    # NatiPU8QAW：名字前缀 + 含数字的大写乱码尾
-    m = re.match(r"^([A-Z][a-z]{2,20})([A-Z]{2,}\d[A-Z0-9]{1,}|\d[A-Z0-9]{3,})$", v)
-    if m and not _is_ntb_ocr_junk_token(m.group(1)):
-        return m.group(1)
+    # 已是干净短码
+    if _is_ntb_description_code(v):
+        return v
+    # "3 Nat PU8QAW" / "Nat PU8QAW"
+    m = re.match(
+        r"(?i)^(?:\d+\s+)?(?:nations?|nati|nat|tions?)\s+([A-Z0-9]{4,12})$",
+        v,
+    )
+    if m and _is_ntb_description_code(m.group(1)):
+        return m.group(1).upper()
+    # 粘连：NatiPU8QAW / NatPU8QAW / NationsPU8QAW
+    m = re.match(
+        r"(?i)^(?:nations?|nati|nat|tions?)([A-Z0-9]*\d[A-Z0-9]*)$",
+        re.sub(r"\s+", "", v),
+    )
+    if m and _is_ntb_description_code(m.group(1)):
+        return m.group(1).upper()
+    # 尾部短码：任意水印残片 + PU8QAW
+    m = re.search(r"([A-Z]{2,}\d[A-Z0-9]{2,}|\d[A-Z]{3,})$", re.sub(r"\s+", "", v))
+    if m and _is_ntb_description_code(m.group(1)):
+        return m.group(1).upper()
     if _is_ntb_ocr_junk_token(v):
         return ""
     return v
@@ -3736,7 +3761,7 @@ def _filter_ntb_watermark_lines(lines):
 
 
 def _pick_ntb_description(lines, label_line) -> Optional[str]:
-    """Description 右列多候选：跳过水印/乱码，取清洗后的人名式值。"""
+    """Description 右列多候选：剥水印后取短码/正文；偏右、高置信优先。"""
     ly0 = min(p[1] for p in label_line.box)
     ly1 = max(p[1] for p in label_line.box)
     label_right = max(p[0] for p in label_line.box)
@@ -3755,9 +3780,12 @@ def _pick_ntb_description(lines, label_line) -> Optional[str]:
         scrubbed = _scrub_ntb_watermark_glue(ln.text)
         if not scrubbed or _looks_like_label_text(scrubbed):
             continue
+        if _ntb_description_contaminated(scrubbed):
+            continue
         conf = float(getattr(ln, "confidence", 0.0) or 0.0)
-        # 更长人名、更大重叠、更高置信
-        score = (len(scrubbed), overlap, conf)
+        # 短码优先于仍带空格的残片；偏右（值列）、高置信
+        code_bonus = 1 if _is_ntb_description_code(scrubbed) else 0
+        score = (code_bonus, ox0, conf, overlap)
         if best is None or score > best[0]:
             best = (score, scrubbed)
     return best[1] if best else None
@@ -3773,7 +3801,7 @@ def _scrub_ntb_text_fields(fields: dict, lines) -> dict:
             fields[key] = cleaned
         else:
             fields.pop(key, None)
-    # 右列重选：优先更长的干净人名（Natali 优于 NatiPU8QAW 剥尾后的 Nati）
+    # 右列重选：PU8QAW 优于 NatiPU8QAW / 3 Nat PU8QAW
     picked = None
     for ln in lines:
         if _norm_label(ln.text) == "description":
@@ -3782,33 +3810,45 @@ def _scrub_ntb_text_fields(fields: dict, lines) -> dict:
     cur = fields.get("Description") or ""
     if picked and (
         not cur
-        or len(picked) > len(cur)
         or _ntb_description_contaminated(cur)
-        or _is_ntb_ocr_junk_token(cur)
+        or (
+            _is_ntb_description_code(picked)
+            and not _is_ntb_description_code(cur)
+        )
+        or (
+            _is_ntb_description_code(picked)
+            and _is_ntb_description_code(cur)
+            and picked != cur
+            and len(picked) >= len(cur)
+        )
     ):
         fields["Description"] = picked
     if fields.get("Description"):
         fields["Remarks"] = fields["Description"]
-    elif "Remarks" in fields and (
-        _is_ntb_ocr_junk_token(str(fields["Remarks"]))
-        or not _scrub_ntb_watermark_glue(str(fields["Remarks"]))
-    ):
-        fields.pop("Remarks", None)
+    elif "Remarks" in fields:
+        rem = _scrub_ntb_watermark_glue(str(fields["Remarks"]))
+        if rem and not _ntb_description_contaminated(rem):
+            fields["Remarks"] = rem
+        else:
+            fields.pop("Remarks", None)
     return fields
 
 
 def _ntb_description_contaminated(desc: Optional[str]) -> bool:
-    """Description 仍含水印乱码或空，需行带复检。"""
+    """仍粘 Nations 水印前缀 / 空，需复检；纯 PU8QAW 短码视为干净。"""
     if not desc or not str(desc).strip():
         return True
     d = str(desc).strip()
-    if _is_ntb_watermark_text(d) or _is_ntb_ocr_junk_token(d):
+    if _is_ntb_description_code(d):
+        return False
+    if _is_ntb_watermark_text(d):
         return True
-    if re.search(r"[a-z][A-Z]{2,}\d|[A-Z]{2,}\d[A-Z]", d):
+    # 仍含 Nations/Nati/Nat 水印词
+    if re.search(r"(?i)\b(?:nations?|nati|nat|tions?)\b", d):
         return True
-    if re.search(r"\d", d) and re.search(r"[A-Za-z]", d) and not re.search(
-        r"(?i)lkr|rs\.?", d
-    ):
+    if re.match(r"(?i)^(?:\d+\s+)?(?:nations?|nati|nat)", d):
+        return True
+    if re.search(r"(?i)nationstrust|trustbank", d):
         return True
     return False
 

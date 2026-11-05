@@ -24,6 +24,7 @@ from app.preprocessing import build_variants, load_image
 from app.url_fetch import UrlFetchError, fetch_image_bytes
 
 from .extractor import (
+    _is_ntb_description_code,
     _is_ntb_ocr_junk_token,
     _is_ntb_watermark_text,
     _ntb_description_contaminated,
@@ -654,33 +655,32 @@ def _ocr_boc_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
 
 
 def _ntb_needs_description_band(result, lines: List[OcrLine]) -> bool:
-    """NTB Description 被水印粘成 NatiPU8QAW / 仅有乱码时复检描述行。"""
+    """NTB Description 仍粘 Nations 水印（NatiPU8QAW / 3 Nat PU8QAW）时复检。"""
     if (result.bank or "").lower() != "ntb":
         return False
     desc = (result.fields or {}).get("Description") or ""
-    # 已有干净且足够长的描述则跳过
-    if desc and not _ntb_description_contaminated(desc) and len(str(desc).strip()) >= 5:
+    # 已是干净短码（PU8QAW）或无水印正文则跳过
+    if desc and not _ntb_description_contaminated(desc):
         return False
     if _ntb_description_contaminated(desc):
         return True
     for ln in lines:
         t = ln.text.strip()
-        if _is_ntb_ocr_junk_token(t):
-            return True
-        if re.match(r"^[A-Z][a-z]{2,}[A-Z]{2,}\d", t):
+        if re.match(r"(?i)^(?:\d+\s*)?(?:nati|nat|nations?).+\d", t):
             return True
     return False
 
 
 def _has_clean_ntb_description(lines: List[OcrLine]) -> bool:
     for ln in lines:
-        if _is_ntb_watermark_text(ln.text) or _is_ntb_ocr_junk_token(ln.text):
+        if _is_ntb_watermark_text(ln.text):
             continue
         scrubbed = _scrub_ntb_watermark_glue(ln.text)
         if not scrubbed or _ntb_description_contaminated(scrubbed):
             continue
-        # 干净人名：纯字母、无数字；长度≥5 避免 NatiPU8QAW 剥尾后的残片早停
-        if re.fullmatch(r"[A-Za-z][A-Za-z\s.'-]{1,40}", scrubbed) and len(scrubbed) >= 5:
+        if _is_ntb_description_code(scrubbed):
+            return True
+        if re.fullmatch(r"[A-Za-z][A-Za-z\s.'-]{1,40}", scrubbed) and len(scrubbed) >= 4:
             if scrubbed.lower() not in {"description", "success", "status", "bank"}:
                 return True
     return False

@@ -1500,8 +1500,7 @@ def test_kalutara_rotated_sparse_ocr_completes_account_and_scrub():
 
 
 def test_ntb_description_strips_watermark_junk():
-    """NTB Transaction summary：Description 被水印粘成 NatiPU8QAW / PU8QAW 时剥掉乱码；
-    复检补到 Natali 时应优选取完整人名。"""
+    """NTB：水印把 Description 粘成 NatiPU8QAW / 3 Nat PU8QAW 时，应保留短码 PU8QAW。"""
     lines = [
         _lr("Transaction summary", 379, 196, 818, 237),
         _lr("LKR 6,600.00", 482, 364, 716, 398),
@@ -1532,16 +1531,16 @@ def test_ntb_description_strips_watermark_junk():
     ]
     r = extract(lines)
     assert r.bank == "ntb"
-    assert "PU8QAW" not in str(r.fields.get("Description") or "")
-    assert "PU8QAW" not in str(r.fields.get("Remarks") or "")
-    assert r.fields.get("Description") == "Nati"
-    assert r.fields.get("Remarks") == "Nati"
+    assert r.fields.get("Description") == "PU8QAW"
+    assert r.fields.get("Remarks") == "PU8QAW"
+    assert "Nati" not in str(r.fields.get("Description") or "")
+    assert "Nat" not in str(r.fields.get("Description") or "")
     assert r.fields["To account"] == "1001096962"
     assert r.amount == 6600.0
-    # 描述行复检读到完整 Natali
-    r2 = extract(lines + [_lr("Natali", 980, 1115, 1140, 1150, 0.99)])
-    assert r2.fields["Description"] == "Natali"
-    assert r2.fields["Remarks"] == "Natali"
+    # 复检若读成「3 Nat PU8QAW」仍应剥成 PU8QAW
+    r2 = extract(lines + [_lr("3 Nat PU8QAW", 900, 1114, 1145, 1152, 0.95)])
+    assert r2.fields["Description"] == "PU8QAW"
+    assert r2.fields["Remarks"] == "PU8QAW"
 
 
 def test_peoples_pay_sinhala_positional_fields():

@@ -1499,6 +1499,49 @@ def test_kalutara_rotated_sparse_ocr_completes_account_and_scrub():
     assert "7,600.00" in str(r2.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
 
 
+def test_cdm_rotated_deposit_amount_not_denom_face():
+    """竖排 KANDANA CDM：DEPOSIT AMOUNT 总额 10,200，不得误取面额表 5,000。"""
+    lines = [
+        _lr("DATE", 1109, 1309, 1169, 1464),
+        _lr("30/10/26", 1151, 1188, 1238, 1461),
+        _lr("TIME", 1105, 947, 1169, 1084),
+        _lr("18:03", 1165, 924, 1225, 1084),
+        _lr("TERMINAL ID", 1087, 408, 1161, 748),
+        _lr("RKANDAN2HT", 1142, 436, 1230, 762),
+        _lr("TRACE", 1289, 1274, 1348, 1446),
+        _lr("1731", 1280, 955, 1344, 1079),
+        _lr("TRANSACTION", 1455, 1036, 1536, 1451),
+        _lr("CARDLESS DEPOSIT", 1446, 465, 1528, 982),
+        _lr("ACCOUNT NUMBER:1001096962", 1570, 628, 1651, 1451),
+        _lr("CUSTOMER NAME :LAK ARTHA SERVICES", 1676, 425, 1775, 1456),
+        _lr("NARRAT1ON:0784535930", 1873, 823, 1946, 1446),
+        _lr("SOURCE OF FUNDS: UNKNOWN", 2154, 722, 2253, 1447),
+        _lr("NOTES", 2364, 1274, 2428, 1446),
+        _lr("VALUE", 2355, 1004, 2419, 1168),
+        _lr("AMOUNT", 2334, 292, 2411, 495),
+        _lr("100.00", 2475, 787, 2539, 982),
+        _lr("200.00", 2463, 277, 2540, 492),
+        _lr("LKR 5.000.00", 2520, 777, 2612, 1169, 0.941),
+        _lr("10,000.00", 2516, 281, 2604, 572, 0.932),
+        _lr("DEPOSIT AMOUNT:", 2658, 979, 2740, 1451, 0.961),
+        _lr("LKR", 2658, 752, 2722, 858, 0.998),
+        _lr("10.200.00", 2641, 271, 2723, 576, 0.945),
+        _lr("TRANSACTION STATUS", 2773, 745, 2864, 1345),
+        _lr("SUCCESSFUL", 2778, 380, 2837, 712),
+        _lr("THANK YOU FOR BANKING WITH US", 2828, 386, 2928, 1328),
+        _lr("KANDANA-CRM2 BR", 917, 641, 990, 1159),
+        _lr("COMMERCIAL BANK OF CEYLON PLC", 789, 465, 879, 1376),
+    ]
+    r = extract(lines)
+    assert r.amount == 10200.0
+    assert "10,200.00" in str(r.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
+    assert r.fields.get("DEPOSIT AMOUNT") != "5,000.00"
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+    assert r.fields["TRANSACTION"] == "CARDLESS DEPOSIT"
+    assert r.fields["TRANSACTION STATUS"] == "SUCCESSFUL"
+    assert "THANK YOU" not in str(r.fields.get("TRANSACTION STATUS") or "")
+
+
 def test_ntb_description_strips_watermark_junk():
     """NTB：水印把 Description 粘成 NatiPU8QAW / 3 Nat PU8QAW 时，应保留短码 PU8QAW。"""
     lines = [

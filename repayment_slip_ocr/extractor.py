@@ -500,49 +500,72 @@ def _has_notes_value_table(lines) -> bool:
 
 
 def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optional[float]:
-    """取标签右侧（含上下偏移）最近的一条含金额的行，跳过纯货币词 "LKR"。
+    """取 DEPOSIT AMOUNT 旁最近的金额。
 
-    用于 "DEPOSIT AMOUNT:" 这类标签与值不在同一水平带的凭条：值可能出现在标签
-    右上方（如 Commercial Bank CDM），中间还夹杂 "LKR" 币种词。
+    正拍：标签右侧（可略偏上下）；竖排：同列（近 x，值常在标签上方），
+    有 NOTES/VALUE 面额表时优先非面额面值（避免 5,000 抢走 10,200）。
     """
     ly = _line_center_y(label_line.box)
+    label_cx = _line_center_x(label_line.box)
     rx = max(p[0] for p in label_line.box) - 15
-    label_is_deposit = "deposit" in label_line.text.lower() and "amount" in _norm_label(label_line.text)
+    tall = _is_tall_box(label_line.box)
+    label_is_deposit = "deposit" in label_line.text.lower() and "amount" in _norm_label(
+        label_line.text
+    )
     skip_denoms = label_is_deposit and _has_notes_value_table(lines)
-    best = None
+    cands: list = []
     for other in lines:
         if other is label_line:
-            continue
-        ox = min(p[0] for p in other.box)
-        oy = _line_center_y(other.box)
-        if ox < rx:
-            continue
-        dy = abs(oy - ly)
-        if dy > max_dy:
             continue
         if re.search(r"(?i)account\s*number|customer\s*name|source\s*of\s*funds", other.text):
             continue
         val = _parse_money(other.text)
         if val is None:
             continue
-        # 存款金额通常 ≥ 100，< 100 的纯整数多半是 OCR 噪声
-        # （如 "000008" 由 "8,000.00" 读坏而来），跳过
         if val < 100 and val == int(val):
             continue
-        # 账号行数字（8–12 位无小数）或超大整数不是存款金额
         if val >= 50_000_000 or (
             val >= 1_000_000
             and val == int(val)
             and not re.search(r"(?i)lkr|rs\.?|[.,]\d{2}", other.text)
         ):
             continue
-        # DEPOSIT AMOUNT 上方面额表 VALUE 列的单位面额（500/1000）不能当存款总额；
-        # 5000/10000 本身也常是存款总额，不可一律跳过。
-        if skip_denoms and val in {20, 50, 100, 200, 500, 1000, 2000} and dy > 60:
-            continue
-        if best is None or dy < best[0]:
-            best = (dy, val)
-    return best[1] if best else None
+        ox0 = min(p[0] for p in other.box)
+        ocx = _line_center_x(other.box)
+        ocy = _line_center_y(other.box)
+        dy = abs(ocy - ly)
+        dx = abs(ocx - label_cx)
+        if tall:
+            # 竖排同列：允许较大纵向间距（金额在标签上方）
+            if dx > 150:
+                continue
+            if dy > max(max_dy * 3.0, 900.0):
+                continue
+            score = (dx, dy, -val)
+        else:
+            if ox0 < rx:
+                continue
+            if dy > max_dy:
+                continue
+            if skip_denoms and val in {20, 50, 100, 200, 500, 1000, 2000} and dy > 60:
+                continue
+            score = (dy, dx, -val)
+        cands.append((score, val, val in _COMMON_DENOMS))
+    if not cands:
+        return None
+    # 有面额表时：仅当存在「大于最大面额面值」的非面额候选（如 10,200 > 5,000）才优先它；
+    # 真总额恰好等于面额（如只存一张 5000）时仍保留面额候选。
+    if skip_denoms:
+        non_denom = [c for c in cands if not c[2]]
+        denom_vals = [c[1] for c in cands if c[2]]
+        if non_denom and denom_vals:
+            best_non = min(non_denom, key=lambda c: c[0])
+            if best_non[1] > max(denom_vals) + 0.01:
+                cands = non_denom
+        elif non_denom and not denom_vals:
+            cands = non_denom
+    cands.sort(key=lambda c: c[0])
+    return cands[0][1]
 
 
 def _right_column_for(ordered, label_texts) -> Optional[str]:
@@ -1020,8 +1043,33 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
         if ("total" in low and not is_subtotal) or "fee" in low or "charge" in low:
             continue
         if "amount" in low or "deposit" in low or is_subtotal:
-            # 跳过纯表头行（如 "NOTES VALUE AMOUNT"），避免误取右侧/下方的错误值
-            if _looks_like_label_text(ln.text):
+            is_deposit_amt_label = (
+                "deposit amount" in low
+                or _norm_label(ln.text).startswith("depositamount")
+            )
+            # 纯表头 NOTES/AMOUNT 跳过；DEPOSIT AMOUNT: 标签本身要去旁侧找总额
+            if _looks_like_label_text(ln.text) and not is_deposit_amt_label:
+                continue
+            if is_deposit_amt_label:
+                # 同行已带总额（DEPOSIT AMOUNT LKR 7,600.00）先解析；再旁侧同列几何
+                inline = _parse_money_skip_denom(ln.text)
+                near = _money_near_label_right(ordered, ln, max_dy=400.0)
+                cands = [v for v in (inline, near) if v is not None and v >= 100]
+                if cands:
+                    den = [v for v in cands if v in _COMMON_DENOMS]
+                    non = [v for v in cands if v not in _COMMON_DENOMS]
+                    if (
+                        _has_notes_value_table(ordered)
+                        and non
+                        and (not den or max(non) > max(den) + 0.01)
+                    ):
+                        amount = max(non)
+                    elif inline is not None:
+                        amount = inline
+                    else:
+                        amount = near
+                    if amount is not None:
+                        break
                 continue
             amount = _parse_money_skip_denom(ln.text)
             # OCR 常把标签读坏产生小整数噪声（如 "JF11jS11 AMOUNT" → 11），
@@ -1044,11 +1092,6 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
                     amount = _parse_money(side)
                     if amount is not None and amount < 100 and amount == int(amount):
                         amount = None
-            if amount is None and (
-                "deposit amount" in low
-                or _norm_label(ln.text).startswith("depositamount")
-            ):
-                amount = _money_near_label_right(ordered, ln)
             if amount is not None:
                 break
 
@@ -2956,11 +2999,20 @@ def _build_label_fields(lines, labels, same_row: bool = False) -> dict:
             if value is None and not same_row:
                 value = _accept_below_value(key, _value_below(i, ordered, ln) or "")
         elif tall:
+            # 竖排 DEPOSIT AMOUNT：同列金额常在标签上方，优先几何取总额，避免面额 5000 串位
+            if value is None and (
+                _norm_label(key) == "depositamount"
+                or ("deposit" in key.lower() and "amount" in key.lower())
+            ):
+                money = _money_near_label_right(ordered, ln, max_dy=400.0)
+                if money is not None:
+                    value = f"{money:,.2f}"
             # 竖拍：先左侧（CDM DATE/TIME/TERMINAL）。TIME 同带右侧真值须先于正下方。
             # 手机竖拍 UI（BOC Transaction Details）原左值转到标签正上方，above 先于 below。
             left = _value_line_to_left(i, ordered, ln)
             if (
-                left is not None
+                value is None
+                and left is not None
                 and _norm_label(left.text) not in wanted
                 and not _looks_like_label_text(left.text)
             ):
@@ -4399,14 +4451,33 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             cur_br = fields.get("BRANCH")
             if not cur_br or _branch_quality(branch) > _branch_quality(str(cur_br)):
                 fields["BRANCH"] = branch
-        if not fields.get("DEPOSIT AMOUNT") and amount is not None:
-            fields["DEPOSIT AMOUNT"] = f"{amount:,.2f}"
-        # fields 已有 DEPOSIT AMOUNT 但结构化 amount 仍空时回填（如 OCR 标签拼写损坏）
-        if fields.get("DEPOSIT AMOUNT"):
+        # DEPOSIT AMOUNT：结构化总额优先；面额表面值（5000）被误填时用 10,200 覆盖
+        if amount is not None:
+            dep_amt = _parse_money(fields["DEPOSIT AMOUNT"]) if fields.get("DEPOSIT AMOUNT") else None
+            if dep_amt is None or (
+                abs(dep_amt - amount) > 0.01
+                and _has_notes_value_table(lines)
+                and dep_amt in _COMMON_DENOMS
+            ):
+                fields["DEPOSIT AMOUNT"] = f"{amount:,.2f}"
+            if fee is None:
+                total = amount
+        elif fields.get("DEPOSIT AMOUNT"):
             parsed_amt = _parse_money(fields["DEPOSIT AMOUNT"])
             if parsed_amt is not None and (amount is None or amount >= 50_000_000):
                 amount = parsed_amt
                 total = parsed_amt if total is None or (total is not None and total >= 50_000_000) else total
+        # TRANSACTION / STATUS 串了邻行时收束
+        txn = fields.get("TRANSACTION")
+        if txn and re.search(r"(?i)cardless\s*deposit", txn):
+            fields["TRANSACTION"] = "CARDLESS DEPOSIT"
+        st = fields.get("TRANSACTION STATUS")
+        if st:
+            m = re.search(r"(?i)\b(successful|success|failed|fail|rejected)\b", st)
+            if m:
+                fields["TRANSACTION STATUS"] = m.group(0).upper()
+                if fields["TRANSACTION STATUS"] == "SUCCESS":
+                    fields["TRANSACTION STATUS"] = "SUCCESSFUL"
         if not fields.get("TRANSACTION STATUS") and status == "success":
             # 仅当 OCR 原文能佐证成功时填写，避免无 Status 行时硬造
             if re.search(r"(?i)success", full_text):

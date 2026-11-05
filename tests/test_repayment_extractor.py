@@ -1069,18 +1069,61 @@ def test_commercial_bank_e_receipt_two_column():
     assert r.payee.account == "1001096962"
     assert r.amount == 5000.0
     assert r.datetime == "2026-10-08T11:44:00"
-    assert r.references.bank_reference_number == "0600069434117"
+    # OCR 把首字母 O 读成 0 时应还原为 O6000…
+    assert r.references.bank_reference_number == "O600069434117"
     assert r.references.e_receipt_reference == "855D-1263-BAE1-F237"
     assert r.references.remarks == "yhbbn"
 
     # 扁平字段：key 用单据原始英文字段名，value 为原文
-    assert r.fields["Bank Reference Number"] == "0600069434117"
+    assert r.fields["Bank Reference Number"] == "O600069434117"
+    assert r.fields["Payment Reference"] == "O600069434117"
     assert r.fields["Sender's Account Number"] == "81******36"
     assert r.fields["Sender's Name"] == "MRS ABDUL CARDER FATHIMA SIMAYA"
     assert r.fields["Transfer Amount"] == "5,000.00"
     assert r.fields["Beneficiary Account Number"] == "1001096962"
     assert r.fields["Beneficiary's Account Narration"] == "yhbbn"
     assert r.fields["Status"] == "Completed"
+
+
+def test_commercial_bank_eref_leading_o_not_zero():
+    """ComBank e-Receipt：Bank Reference 首字母是 O；OCR 成 0 且粘 logo「COMMERAL BANK」时应还原。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 14, x1, y + 14)
+    lines = [
+        L("e-Receipt", 133, 231, 390),
+        L("Transfer within ComBank", 352, 802, 400),
+        L("COMMERAL BANK", 820, 1080, 420),
+        L("Bank Reference Number", 41, 326, 446),
+        L("0600069688024", 588, 800, 446),
+        L("Sender's Account Number", 40, 349, 496),
+        L("81******48", 587, 730, 496),
+        L("Sender's Name", 40, 219, 535),
+        L("MR MOHAMED NAZEER MOHAMED MURSHID", 588, 1044, 535),
+        L("Transfer Amount", 43, 251, 574),
+        L("5,300.00", 588, 704, 574),
+        L("Transfer Currency", 41, 263, 610),
+        L("LKR", 586, 640, 610),
+        L("Beneficiary Name", 41, 251, 649),
+        L("LAK ARTHA SERVICES (PVT) LTD", 588, 963, 649),
+        L("Beneficiary Account Number", 40, 384, 730),
+        L("1001096962", 588, 747, 730),
+        L("Beneficiary's Account Narration", 43, 418, 772),
+        L("199005101337", 588, 672, 772),
+        L("Transaction Date/Time", 41, 320, 805),
+        L("09/10/2026 10:36 AM", 588, 865, 805),
+        L("Payment Date", 43, 213, 847),
+        L("09-10-26", 584, 708, 847),
+        L("Status", 43, 124, 884),
+        L("Completed", 591, 727, 884),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "commercial_bank"
+    assert r.fields["Bank Reference Number"] == "O600069688024"
+    assert r.fields["Payment Reference"] == "O600069688024"
+    assert r.fields["Transaction Reference"] == "O600069688024"
+    assert r.references.bank_reference_number == "O600069688024"
+    assert r.amount == 5300.0
+    assert r.payee.account == "1001096962"
 
 
 def test_commercial_bank_e_receipt_ocr_colon_amount():

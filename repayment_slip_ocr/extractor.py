@@ -1473,7 +1473,11 @@ def _extract_references(lines) -> ReferencesOut:
     refs.transaction_id = values.get("transaction_id")
     refs.txn_ref = values.get("txn_ref")
     refs.retrieval_ref = values.get("retrieval_ref")
-    refs.bank_reference_number = values.get("bank_reference_number")
+    raw_bank_ref = values.get("bank_reference_number")
+    if raw_bank_ref:
+        refs.bank_reference_number = (
+            _normalize_combank_bank_reference(raw_bank_ref) or raw_bank_ref
+        )
     refs.e_receipt_reference = values.get("e_receipt_reference")
     refs.my_ref = values.get("my_ref")
     refs.receiver_ref = values.get("receiver_ref")
@@ -3999,6 +4003,7 @@ def _ntb_description_contaminated(desc: Optional[str]) -> bool:
 def _enrich_reference_aliases(fields: dict, references: ReferencesOut) -> dict:
     """下游常用 Payment Reference / Transaction Reference 别名补齐。"""
     candidates = [
+        fields.get("Bank Reference Number"),
         fields.get("Payment Reference"),
         fields.get("Transaction Reference"),
         fields.get("Transaction reference"),
@@ -4014,6 +4019,10 @@ def _enrich_reference_aliases(fields: dict, references: ReferencesOut) -> dict:
     ref = _clean(str(ref))
     # 去掉 OCR 粘上的银行水印前缀
     ref = re.sub(r"(?i)^nationstrustbank\s*", "", ref).strip(" -:") or ref
+    # ComBank Bank Reference：O6000… 勿保留成 06000…
+    combank_ref = _normalize_combank_bank_reference(ref)
+    if combank_ref and re.fullmatch(r"O6000\d+", combank_ref):
+        ref = combank_ref
     if not any(k.lower() == "payment reference" for k in fields):
         fields["Payment Reference"] = ref
     if not any(_norm_label(k) == "transactionreference" for k in fields):
@@ -4046,9 +4055,53 @@ def _synthesize_cdm_datetime_fields(fields: dict) -> dict:
     return fields
 
 
+def _normalize_combank_bank_reference(value: str) -> Optional[str]:
+    """ComBank e-Receipt Bank Reference：剥 logo 银行名，并把首字母 O 被 OCR 成 0 的还原。
+
+    真实格式为 O + 数字（如 O600069688024）。OCR 常产出：
+    - "COMMERAL BANK 0600069688024"（右上 logo 粘进右列）
+    - "0600069688024"（字母 O 被读成数字 0）
+    """
+    v = _clean(value or "")
+    if not v:
+        return None
+    v = re.sub(
+        r"(?i)^(?:commercial|commeral|comnercial|cornmercial|commerciai)\s*"
+        r"bank(?:\s+of\s+ceylon)?(?:\s*plc)?\s*",
+        "",
+        v,
+    ).strip(" -:")
+    if re.search(r"(?i)bank", v) or " " in v:
+        toks = re.split(r"\s+", v)
+        picked = None
+        for t in toks:
+            if re.fullmatch(r"[Oo0]?\d{10,14}", t) or re.fullmatch(r"[A-Za-z]\d{10,}", t):
+                picked = t
+                break
+        if picked is None:
+            digit_toks = [t for t in toks if re.search(r"\d{6,}", t)]
+            if digit_toks:
+                picked = max(digit_toks, key=lambda t: len(re.sub(r"\D", "", t)))
+        if picked:
+            v = picked
+    v = v.strip()
+    # ComBank 网上转账参考号：O6000…；OCR 把 O 读成 0 / 丢掉 O
+    m = re.fullmatch(r"[Oo0]?(6000\d{7,10})", v)
+    if m:
+        return "O" + m.group(1)
+    if re.fullmatch(r"[A-Za-z]\d{10,}", v):
+        return v[0].upper() + v[1:]
+    return v if re.search(r"\d{6,}", v) else None
+
+
 def _build_ereceipt_fields(lines) -> dict:
     buckets = _right_column_buckets(lines, _E_RECEIPT_LABELS)
-    return {k: " ".join(v) for k, v in buckets.items() if v}
+    fields = {k: " ".join(v) for k, v in buckets.items() if v}
+    if fields.get("Bank Reference Number"):
+        norm = _normalize_combank_bank_reference(fields["Bank Reference Number"])
+        if norm:
+            fields["Bank Reference Number"] = norm
+    return fields
 
 
 def _build_nsb_fields(lines) -> dict:

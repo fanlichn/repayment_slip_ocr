@@ -3935,12 +3935,17 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             parsed_fee = _parse_money(fee_v)
             if parsed_fee is not None:
                 fee = parsed_fee
+        # 通用金额抽取常误把手续费当成主金额，先清掉再认顶部大额
+        if fee is not None and amount is not None and abs(amount - fee) < 0.01:
+            amount = None
         picked = _pick_boc_hero_transfer_amount(lines, fee)
         if picked is not None:
             amount = picked
-            fields.setdefault("Transfer Amount", f"LKR {amount:,.2f}")
+            fields["Transfer Amount"] = f"LKR {amount:,.2f}"
         if fee is not None and amount is not None:
             total = amount + fee
+        elif amount is not None:
+            total = amount
         # 结构化收付款方以扁平字段为准（竖拍时通用分区易串位）
         if fields.get("Receiver's Account No"):
             payee.account = fields["Receiver's Account No"]

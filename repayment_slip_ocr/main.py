@@ -272,7 +272,7 @@ def _has_boc_hero_amount_text(lines: List[OcrLine], fee_hint: Optional[float] = 
         if "fee" in low or "charge" in low:
             continue
         if not re.search(r"(?i)\blkr\b", ln.text) and not re.search(
-            r"\d{1,3}(?:,\d{3})+\.\d{2}", ln.text
+            r"\d{1,3}(?:,\d{3})+\.\d{2}|\d+\.\d{2}", ln.text
         ):
             continue
         m = _parse_money(ln.text)
@@ -284,12 +284,12 @@ def _has_boc_hero_amount_text(lines: List[OcrLine], fee_hint: Optional[float] = 
     return False
 
 
-def _ocr_boc_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
-    """复检 BOC Transaction Details 顶部大额（标题 ~ Receiver's Account 之间）。"""
+def _boc_amount_band_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    """标题到 Receiver 之间的多个裁剪窗；(crop, top, left)。"""
     h, w = img.shape[:2]
     scale_y = _anchor_scale_y(float(h), lines)
-    y0 = h * 0.04
-    y1 = h * 0.32
+    y0 = h * 0.06
+    y1 = h * 0.30
     for ln in lines:
         low = ln.text.lower()
         if "transaction detail" in low:
@@ -297,33 +297,85 @@ def _ocr_boc_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
         if "receiver" in low and "account" in low:
             y1 = min(y1, min(p[1] for p in ln.box) * scale_y)
     if y1 <= y0 + 30:
-        y0, y1 = h * 0.05, h * 0.30
-    top = max(0, int(y0) - int(h * 0.01))
-    bottom = min(h, int(y1) + int(h * 0.01))
-    left = max(0, int(w * 0.05))
-    right = min(w, int(w * 0.95))
-    crop = img[top:bottom, left:right]
-    if crop.size == 0:
-        return []
+        y0, y1 = h * 0.08, h * 0.28
+    windows = [
+        # 全宽标题~Receiver
+        (y0, y1, w * 0.05, w * 0.95),
+        # 居中大额（避开右上反光）
+        (y0, y1, w * 0.15, w * 0.85),
+        (y0 + (y1 - y0) * 0.1, y0 + (y1 - y0) * 0.85, w * 0.20, w * 0.80),
+        # 固定比例兜底
+        (h * 0.08, h * 0.28, w * 0.12, w * 0.88),
+        (h * 0.10, h * 0.26, w * 0.18, w * 0.82),
+    ]
+    out = []
+    seen = set()
+    for ya, yb, xa, xb in windows:
+        top = max(0, int(ya))
+        bottom = min(h, int(yb))
+        left = max(0, int(xa))
+        right = min(w, int(xb))
+        if bottom - top < 30 or right - left < 40:
+            continue
+        key = (top // 10, bottom // 10, left // 20)
+        if key in seen:
+            continue
+        seen.add(key)
+        crop = img[top:bottom, left:right]
+        if crop.size:
+            out.append((crop, float(top), float(left)))
+    return out
 
-    def _run(crop_img: np.ndarray, scale: float) -> List[OcrLine]:
+
+def _boc_amount_prep_variants(crop_img: np.ndarray) -> List[np.ndarray]:
+    """抗反光预处理：CLAHE、压高光、提蓝字、二值。"""
+    out = [crop_img]
+    if len(crop_img.shape) == 3:
+        bgr = crop_img
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        # BOC 金额多为蓝色大字：强化 B 通道
+        b, g, r = cv2.split(bgr)
+        blue_emph = cv2.addWeighted(b, 1.4, gray, -0.2, 0)
+        out.append(blue_emph)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        # 压掉过曝反光后再 OCR
+        v = hsv[:, :, 2]
+        v = np.clip(v, 0, 220).astype(np.uint8)
+        hsv2 = hsv.copy()
+        hsv2[:, :, 2] = v
+        out.append(cv2.cvtColor(hsv2, cv2.COLOR_HSV2BGR))
+    else:
+        gray = crop_img
+    clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    out.append(enhanced)
+    binary = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 9
+    )
+    out.append(binary)
+    out.append(cv2.bitwise_not(binary))
+    return out
+
+
+def _ocr_boc_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
+    """复检 BOC Transaction Details 顶部大额（标题 ~ Receiver's Account 之间）。"""
+    found: List[OcrLine] = []
+
+    def _run(crop_img: np.ndarray, top: float, left: float, scale: float) -> List[OcrLine]:
         work = crop_img
         if scale != 1.0:
             work = cv2.resize(
                 crop_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
             )
         raw = engine.recognize(work)
-        return _offset_ocr_lines(raw, dy=float(top), dx=float(left), scale=scale)
+        return _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
 
-    found = _run(crop, 1.0)
-    if not _has_boc_hero_amount_text(found):
-        if len(crop.shape) == 3:
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = crop
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        found = dedup_lines(found + _run(enhanced, 1.0) + _run(enhanced, 2.0))
+    for crop, top, left in _boc_amount_band_windows(img, lines):
+        for prep in _boc_amount_prep_variants(crop):
+            for scale in (1.0, 2.0, 2.5):
+                found = dedup_lines(found + _run(prep, top, left, scale))
+                if _has_boc_hero_amount_text(found):
+                    return found
     return found
 
 

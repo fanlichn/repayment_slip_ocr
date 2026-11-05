@@ -1806,6 +1806,34 @@ def test_boc_mobile_txn_details_upright_hero_amount_and_kak_artha():
     assert r.fields["Fees & Charges"] == "LKR 25.00"
 
 
+def test_boc_mobile_txn_fee_not_used_as_transfer_when_hero_missing():
+    """顶部大额漏读时，不得把 Fees 25 当成 Transfer Amount；amount 应先置空。"""
+    lines = [
+        _lr("Transaction Details", 385, 192, 856, 240, 0.999),
+        _lr("Receiver's Account No", 166, 659, 570, 696, 0.999),
+        _lr("1001096962", 811, 644, 1044, 689, 0.999),
+        _lr("Receiver's Bank", 161, 833, 450, 870, 0.96),
+        _lr("Commercial Bank", 693, 823, 1044, 867, 0.98),
+        _lr("Receiver's Name", 153, 1001, 464, 1048, 0.999),
+        _lr("Kak Artha", 836, 1004, 1045, 1048, 0.977),
+        _lr("Sender's Account No", 150, 1185, 528, 1222, 0.999),
+        _lr("******8417", 845, 1179, 1042, 1230, 0.96),
+        _lr("Sender's NameMR E S M HI SENEVIRATNE", 140, 1355, 1037, 1411, 0.927),
+        _lr("Sender's Bank Name", 135, 1534, 528, 1587, 0.972),
+        _lr("Bank of Ceylon", 730, 1544, 1040, 1603, 0.971),
+        _lr("Remarks", 125, 1712, 301, 1769, 0.999),
+        _lr("loan", 943, 1743, 1046, 1798, 0.991),
+        _lr("Fees & Charges", 120, 1899, 416, 1963, 0.999),
+        _lr("LKR 25.00", 826, 1933, 1040, 1989, 0.944),
+    ]
+    r = extract(lines)
+    assert r.fee == 25.0
+    assert r.fields.get("Transfer Amount") is None
+    assert r.amount is None or abs(r.amount - 25.0) > 0.01
+    assert r.fields["Receiver's Name"] == "Lak Artha (Pvt) Ltd"
+    assert "SENEVIRATNE" in r.fields["Sender's Name"].upper()
+
+
 def test_boc_mobile_txn_details_rotated_phone():
     """竖拍 BOC 手机 Transaction Details：值在标签上方同列，不得把下一标签当值。"""
     lines = [

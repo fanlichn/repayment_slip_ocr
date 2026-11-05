@@ -1319,6 +1319,52 @@ def test_nsb_online_banking():
     assert r.fields["Benefi. Account Type"] == "Savings Account"
 
 
+def test_union_ubgo_fund_transfer_receipt():
+    """Union Bank UBgo FUND TRANSFER RECEIPT：冒号字段 + Amount 上下 + 收款行居中。"""
+    lines = [
+        _lr("UNIONBANK", 155, 65, 591, 117),
+        _lr("UBgO", 931, 43, 1128, 136),
+        _lr("FUND TRANSFER RECEIPT", 161, 232, 1066, 287),
+        _lr("Amount", 519, 389, 674, 435),
+        _lr("LKR 5,000.00", 384, 456, 800, 514),
+        _lr("COMMERCIAL BANK OF CEYLON PLC", 245, 545, 945, 575),
+        _lr("Transaction Status:Success", 64, 620, 473, 652),
+        _lr("Paid From:", 64, 704, 230, 734),
+        _lr("***6011", 353, 700, 454, 736),
+        _lr("Pay To: 1001096962", 63, 765, 365, 806),
+        _lr("Branch: -", 57, 832, 187, 868),
+        _lr("Beneficiary Name: Lak artha.", 61, 901, 454, 931),
+        _lr("Service Charge: LKR 25.00", 62, 971, 454, 1001),
+        _lr("Remarks: UBGo trnx", 62, 1041, 370, 1071),
+        _lr("Date & Time: 02-Nov-2026 | 02:09 PM", 59, 1100, 602, 1137),
+        _lr("Reference Number: FC1250140934", 65, 1170, 575, 1205),
+        _lr("Union Bank of Colombo PLC", 812, 1511, 1127, 1536),
+        _lr("This is a system generated receipt", 61, 1607, 429, 1633),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "union_bank"
+    assert r.amount == 5000.0
+    assert r.fee == 25.0
+    assert r.total_debit == 5025.0
+    assert r.datetime == "2026-11-02T14:09:00"
+    assert r.payer.account == "***6011"
+    assert r.payer.bank == "Union Bank of Colombo PLC"
+    assert r.payee.account == "1001096962"
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert "COMMERCIAL BANK" in (r.payee.bank or "").upper()
+    assert r.fields["Amount"] == "LKR 5,000.00"
+    assert r.fields["Pay To"] == "1001096962"
+    assert r.fields["Paid From"] == "***6011"
+    assert r.fields["Service Charge"] == "LKR 25.00"
+    assert r.fields["Date & Time"] == "2026-11-02 14:09:00"
+    assert r.fields["Reference Number"] == "FC1250140934"
+    assert r.fields["Payment Reference"] == "FC1250140934"
+    assert r.fields["Status"] == "Success"
+    assert r.fields["Remarks"] == "UBGo trnx"
+    assert "Branch" not in r.fields  # Branch: - 为空，不得串下一字段
+
+
 def test_peoples_pay_without_logo_text_still_extracts():
     """People's Pay：Logo/行名 OCR 漏读、标题截成 Transaction confirmat... 时仍应识别。
 

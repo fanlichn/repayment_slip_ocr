@@ -678,11 +678,31 @@ def _account_near(lines, anchor_line) -> Optional[str]:
     return best[1] if best else None
 
 
+def _extract_union_ubgo_parties(lines) -> tuple[PartyOut, PartyOut]:
+    """Union Bank UBgo：Paid From / Pay To / Beneficiary Name + 金额下收款行。"""
+    payer, payee = PartyOut(), PartyOut()
+    fields = _build_union_ubgo_fields(lines)
+    if fields.get("Paid From"):
+        payer.account = fields["Paid From"].strip()
+    if fields.get("Pay To"):
+        payee.account = _account_token(fields["Pay To"]) or fields["Pay To"].strip()
+    if fields.get("Beneficiary Name"):
+        payee.name = fields["Beneficiary Name"].strip(" .")
+    if fields.get("Beneficiary Bank"):
+        payee.bank = fields["Beneficiary Bank"]
+    payer.bank = "Union Bank of Colombo PLC"
+    payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+    return payer, payee
+
+
 def _extract_parties(lines, bank: Optional[str] = None) -> tuple[PartyOut, PartyOut]:
     if bank == "ipay":
         return _extract_ipay_parties(lines)
     if bank == "peoples_bank":
         return _extract_peoples_bank_parties(lines)
+    if bank == "union_bank":
+        return _extract_union_ubgo_parties(lines)
     if _is_boc_app(lines):
         return _extract_boc_app_parties(lines)
     if _is_cash_deposit(lines):
@@ -921,6 +941,9 @@ def _parse_datetime(s: str) -> Optional[str]:
     s = re.sub(r"(?i)(\d{1,2})[/.-](\d)[tl][/.-](\d{2,4})", r"\1/\g<2>1/\3", s)
     # 时间点号： "1.43 PM" / "1.43PM" -> "1:43 PM"
     s = re.sub(r"(?i)(\d{1,2})\.(\d{2})\s*(am|pm)", r"\1:\2 \3", s)
+    # UBgo："02-Nov-2026 | 02:09 PM" / "02-Nov-202602:09PM"
+    s = re.sub(r"\s*\|\s*", " ", s)
+    s = re.sub(r"(?i)([A-Za-z]{3}-\d{4})(\d{1,2}:\d{2})", r"\1 \2", s)
     # 归一化：日期分隔符 "." 统一为 "/"，去掉日期与时间之间的逗号，补偿
     # "10.08.2026 , 06:45 PM" / "10.08.202606:45PM" 这类带逗号或无空格写法。
     s = s.replace(".", "/")
@@ -940,8 +963,12 @@ def _parse_datetime(s: str) -> Optional[str]:
         "%d-%m-%Y %I:%M:%S %p",
         "%d/%m/%Y %I:%M %p",
         "%d-%m-%Y %I:%M %p",
+        "%d-%b-%Y %I:%M %p",
+        "%d-%b-%Y %I:%M:%S %p",
         "%d %b %Y %I:%M %p",
         "%d %b %Y %H:%M",
+        "%d-%b-%Y",
+        "%d %b %Y",
         "%d/%m/%Y",
         "%d-%m-%Y",
         "%d/%m/%y",
@@ -1554,6 +1581,8 @@ _BANK_MARKERS = [
     ("ipay", ("ipay", "www.ipay.lk")),
     ("hnb", ("hatton national", "this is an auto generated receipt")),
     ("ntb", ("nations trust", "nationstrust")),
+    # Union Bank UBgo：须抢在 commercial_bank 之前（收款行常为 Commercial Bank）
+    ("union_bank", ("unionbank", "union bank of colombo", "ubgo", "ubgp", "ubgo trnx")),
     ("peoples_bank", ("peoplespay", "people's pay", "people's bank", "people's")),
     ("commercial_bank", ("cardless deposit", "combank", "transfer within", "e-receipt", "bank reference number", "sender's account number", "beneficiary notified", "cash credit slip")),
     ("boc", ("bank of ceylon", "boc flex", "boc smartpay", "boc")),
@@ -2276,6 +2305,21 @@ _HNB_APP_LABELS = (
     "Receiver Reference",
 )
 
+# Union Bank UBgo Fund Transfer Receipt：同行 Label: Value + Amount 上下布局
+_UNION_UBGO_LABELS = (
+    "Transaction Status",
+    "Status",
+    "Paid From",
+    "Pay To",
+    "Branch",
+    "Beneficiary Name",
+    "Service Charge",
+    "Remarks",
+    "Date & Time",
+    "Reference Number",
+    "Amount",
+)
+
 _NSB_MOBILE_LABELS = (
     "Transaction ID",
     "Transaction Date/Time",
@@ -2754,11 +2798,39 @@ def _build_dash_label_fields(lines, labels) -> dict:
         if key is None or key in fields:
             continue
         value = _clean(raw_value)
+        # "Branch: -" 表示空值，不能向下误取下一字段
+        if value in {"-", "–", "—"}:
+            continue
         if not value:
-            value = _value_below(i, ordered, ln)
-            value = _clean(value) if value else None
-        if value and not _looks_like_label_text(value):
+            # 空值：先右侧（UBgo Paid From:  ****6011），再下方
+            side = _value_to_right(i, ordered, ln)
+            value = _clean(side) if side else None
+            if not value or value in {"-", "–", "—"}:
+                below = _value_below(i, ordered, ln)
+                value = _clean(below) if below else None
+            # 下方若是另一组 "Label: value"，不是当前空字段的值
+            if value and re.match(r"^[A-Za-z][A-Za-z\s/&]{1,40}\s*[:：-]", value):
+                value = None
+        if value and value not in {"-", "–", "—"} and not _looks_like_label_text(value):
             fields[key] = value
+    return fields
+
+
+def _build_union_ubgo_fields(lines) -> dict:
+    """Union Bank UBgo FUND TRANSFER RECEIPT：冒号同行字段 + Amount 上下布局。"""
+    fields = _build_dash_label_fields(lines, _UNION_UBGO_LABELS)
+    # Amount 常独占一行，值在正下方 "LKR 5,000.00"
+    for k, v in _build_label_fields(lines, ("Amount", "Paid From")).items():
+        fields.setdefault(k, v)
+    if fields.get("Transaction Status") and not fields.get("Status"):
+        fields["Status"] = fields["Transaction Status"]
+    # 金额下方居中的收款行名（无 Bank 标签）
+    if not fields.get("Beneficiary Bank"):
+        for ln in _sorted_by_y(lines):
+            t = ln.text.strip()
+            if re.search(r"(?i)commercial\s*bank", t) and not re.search(r"(?i)union", t):
+                fields["Beneficiary Bank"] = re.sub(r"\s+", " ", t).strip(" .")
+                break
     return fields
 
 
@@ -3036,6 +3108,8 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         field_labels = _LB_FINANCE_LABELS
     elif bank == "ipay":
         field_labels = _IPAY_LABELS
+    elif bank == "union_bank":
+        field_labels = _UNION_UBGO_LABELS
     elif bank == "ntb":
         field_labels = (
             "Status",
@@ -3055,6 +3129,32 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
 
     if bank == "ipay":
         fields = _build_ipay_fields(lines)
+    elif bank == "union_bank":
+        fields = _build_union_ubgo_fields(lines)
+        if amount is None and fields.get("Amount"):
+            amount = _parse_money(fields["Amount"])
+        if fee is None and fields.get("Service Charge"):
+            fee = _parse_money(fields["Service Charge"])
+        if total is None and amount is not None:
+            total = amount + (fee or 0.0)
+        if not payee.account and fields.get("Pay To"):
+            payee.account = _account_token(fields["Pay To"]) or fields["Pay To"].strip()
+            payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+        if not payee.name and fields.get("Beneficiary Name"):
+            raw_name = fields["Beneficiary Name"].strip(" .")
+            compact = re.sub(r"[^a-z]", "", raw_name.lower())
+            payee.name = "Lak Artha (Pvt) Ltd" if "lakartha" in compact else raw_name
+        if payee.name:
+            fields["Beneficiary Name"] = payee.name
+        if not payee.bank and fields.get("Beneficiary Bank"):
+            payee.bank = fields["Beneficiary Bank"]
+        if not payer.account and fields.get("Paid From"):
+            payer.account = fields["Paid From"].strip()
+            payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+        if not payer.bank:
+            payer.bank = "Union Bank of Colombo PLC"
+        if amount is not None or payee.account is not None or fields.get("Reference Number"):
+            success = True
     elif _is_peoples_otp(lines):
         fields = _build_label_fields(lines, _PEOPLES_OTP_LABELS)
         # 结构化付款/收款方：OTP 页无 Pay from/to 分区，从扁平字段回填

@@ -344,6 +344,13 @@ def _collect_column_block(lines, value_line, max_gap: float = 400.0, x_tol: floa
     return " ".join(parts)
 
 
+def _has_notes_value_table(lines) -> bool:
+    texts = {" ".join(ln.text.lower().split()) for ln in lines}
+    return any("notes" == t or t.startswith("notes") for t in texts) and any(
+        "value" == t or t.startswith("value") for t in texts
+    )
+
+
 def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optional[float]:
     """取标签右侧（含上下偏移）最近的一条含金额的行，跳过纯货币词 "LKR"。
 
@@ -352,6 +359,8 @@ def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optiona
     """
     ly = _line_center_y(label_line.box)
     rx = max(p[0] for p in label_line.box) - 15
+    label_is_deposit = "deposit" in label_line.text.lower() and "amount" in _norm_label(label_line.text)
+    skip_denoms = label_is_deposit and _has_notes_value_table(lines)
     best = None
     for other in lines:
         if other is label_line:
@@ -369,6 +378,10 @@ def _money_near_label_right(lines, label_line, max_dy: float = 260.0) -> Optiona
         # 存款金额通常 ≥ 100，< 100 的纯整数多半是 OCR 噪声
         # （如 "000008" 由 "8,000.00" 读坏而来），跳过
         if val < 100 and val == int(val):
+            continue
+        # DEPOSIT AMOUNT 上方面额表 VALUE 列的单位面额（500/1000）不能当存款总额；
+        # 5000/10000 本身也常是存款总额，不可一律跳过。
+        if skip_denoms and val in {20, 50, 100, 200, 500, 1000, 2000} and dy > 60:
             continue
         if best is None or dy < best[0]:
             best = (dy, val)
@@ -773,7 +786,10 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
                     amount = _parse_money(side)
                     if amount is not None and amount < 100 and amount == int(amount):
                         amount = None
-            if amount is None and "deposit amount" in low:
+            if amount is None and (
+                "deposit amount" in low
+                or _norm_label(ln.text).startswith("depositamount")
+            ):
                 amount = _money_near_label_right(ordered, ln)
             if amount is not None:
                 break
@@ -1211,9 +1227,27 @@ def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[Denomi
         unique_denoms.append((y, denom))
     denom_rows = unique_denoms
 
+    # OCR 漏读 VALUE 列时：NOTES 数量行多于面额行（如 4、3 两行数量但只认出 500），
+    # 按索引硬配对会把总额算少；此时放弃不完整明细，避免把 4×500 当成存款总额。
+    if len(qty_rows) >= 2 and len(qty_rows) > len(denom_rows):
+        return []
+
     breakdown: List[DenominationOut] = []
-    for i, (_, denom) in enumerate(denom_rows):
-        qty = qty_rows[i][1] if i < len(qty_rows) else 1
+    used_qty = set()
+    for y_d, denom in denom_rows:
+        # 按 y 邻近配对 NOTES 数量，而不是按索引（行高不同时索引会错位）
+        best_i = None
+        best_dy = 55.0
+        for i, (y_q, qty) in enumerate(qty_rows):
+            if i in used_qty:
+                continue
+            dy = abs(y_q - y_d)
+            if dy < best_dy:
+                best_dy = dy
+                best_i = i
+        qty = qty_rows[best_i][1] if best_i is not None else 1
+        if best_i is not None:
+            used_qty.add(best_i)
         amount = denom * qty
         for _, amt in amount_rows:
             if abs(amt - denom * qty) < 0.05:
@@ -2199,6 +2233,8 @@ def _norm_label(s: str) -> str:
     # Vishwa 等版式常见 beneficiary 拼写损坏
     for bad in ("beneficlary", "beneflciary", "beneticlary", "benefciary"):
         s = s.replace(bad, "beneficiary")
+    # CDM「DEPOSIT AMOUNT」常被读成 AMCUNT / AMOUNI
+    s = s.replace("amcunt", "amount").replace("amouni", "amount").replace("arnount", "amount")
     return s
 
 
@@ -2722,6 +2758,31 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     fields = _normalize_money_fields(fields)
     if _is_cash_deposit(lines) or (bank == "commercial_bank" and fields.get("DATE")):
         fields = _synthesize_cdm_datetime_fields(fields)
+        # OCR 常漏读 CARDLESS DEPOSIT / 账号 / 存款总额行，用已识别结构化结果回填
+        if not fields.get("TRANSACTION") and _is_cash_deposit(lines):
+            fields["TRANSACTION"] = "CARDLESS DEPOSIT"
+        if not fields.get("ACCOUNT NUMBER") and payee.account:
+            fields["ACCOUNT NUMBER"] = payee.account
+        if not fields.get("CUSTOMER NAME") and payee.name:
+            fields["CUSTOMER NAME"] = payee.name
+        if not fields.get("DEPOSIT AMOUNT") and amount is not None:
+            fields["DEPOSIT AMOUNT"] = f"{amount:,.2f}"
+        # fields 已有 DEPOSIT AMOUNT 但结构化 amount 仍空时回填（如 OCR 标签拼写损坏）
+        if amount is None and fields.get("DEPOSIT AMOUNT"):
+            parsed_amt = _parse_money(fields["DEPOSIT AMOUNT"])
+            if parsed_amt is not None:
+                amount = parsed_amt
+                if total is None:
+                    total = parsed_amt
+        if not fields.get("TRANSACTION STATUS") and status == "success":
+            # 仅当 OCR 原文能佐证成功时填写，避免无 Status 行时硬造
+            if re.search(r"(?i)success", full_text):
+                fields["TRANSACTION STATUS"] = "SUCCESSFUL"
+        # 回填 amount 后刷新 success；CDM 仅表头完整时也视为识别成功
+        if amount is not None or payee.account is not None or payee.name is not None:
+            success = True
+        elif fields.get("TRACE") or fields.get("TERMINAL ID"):
+            success = True
     fields = _enrich_reference_aliases(fields, references)
     # 金额字段被水印/噪点污染时，用已解析数值回填
     for amount_key in list(fields.keys()):

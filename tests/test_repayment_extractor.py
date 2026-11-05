@@ -559,6 +559,72 @@ def test_boc_flex_ocr_typo_date_1t():
     assert r.datetime == "2026-11-02T16:41:00"
 
 
+def test_cdm_incomplete_notes_table_should_not_invent_amount():
+    """CDM：NOTES 有两行数量但 VALUE 只认出一个面额时，不能把 4×500 当成存款总额。"""
+    lines = [
+        _lr("DATE", 221, 1430, 421, 1524),
+        _lr("03/11/26", 226, 1519, 596, 1604),
+        _lr("TIME", 758, 1404, 950, 1502),
+        _lr("09:30", 750, 1493, 998, 1582),
+        _lr("TERMINAL ID", 1244, 1383, 1744, 1472),
+        _lr("RPOLGAHIHT", 1244, 1472, 1702, 1557),
+        _lr("TRACE", 235, 1680, 465, 1774),
+        _lr("6157", 758, 1655, 954, 1753),
+        _lr("TRANSACTION", 252, 1939, 749, 2024),
+        _lr("NOTES", 290, 3197, 533, 3291),
+        _lr("VALUE", 690, 3168, 932, 3275),
+        _lr("AMOUNT", 1673, 3105, 1945, 3198),
+        _lr("4", 532, 3366, 587, 3442),
+        _lr("LKR", 695, 3358, 879, 3439),
+        _lr("500.00", 973, 3334, 1254, 3423),
+        _lr("3", 528, 3451, 595, 3540),
+        _lr("DEPOSIT AMOUNT :", 332, 3626, 990, 3715),
+        _lr("LKR", 1154, 3593, 1324, 3695),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "commercial_bank"
+    assert r.fields["DATE"] == "2026-11-03 00:00:00"
+    assert r.fields["TIME"] == "09:30"
+    assert r.fields["TERMINAL ID"] == "RPOLGAHIHT"
+    assert r.fields["TRACE"] == "6157"
+    assert r.fields["TRANSACTION"] == "CARDLESS DEPOSIT"
+    # 面额表不完整时不得捏造 2,000.00
+    assert r.amount is None
+    assert "DEPOSIT AMOUNT" not in r.fields or r.fields.get("DEPOSIT AMOUNT") != "2,000.00"
+    assert r.deposit_breakdown == []
+
+
+def test_cdm_deposit_amcunt_ocr_typo_and_amount_backfill():
+    """CDM：DEPOSIT AMCUNT 拼写损坏仍应匹配；有可靠金额时回填 DEPOSIT AMOUNT。"""
+    lines = [
+        _lr("COMMERCIAL BANK OF CEYLON PLC", 200, 1000, 900, 1060),
+        _lr("DATE", 200, 1200, 300, 1250),
+        _lr("03/11/26", 200, 1260, 400, 1310),
+        _lr("TIME", 450, 1200, 550, 1250),
+        _lr("09:30", 450, 1260, 560, 1310),
+        _lr("TERMINAL ID", 700, 1200, 900, 1250),
+        _lr("RPOLGAHIHT", 700, 1260, 950, 1310),
+        _lr("TRACE", 200, 1350, 320, 1400),
+        _lr("6157", 450, 1350, 550, 1400),
+        _lr("TRANSACTION", 200, 1500, 500, 1550),
+        _lr("CARDLESS DEPOSIT", 520, 1500, 900, 1550),
+        _lr("ACCOUNT NUMBER", 200, 1600, 500, 1650),
+        _lr("1001096962", 520, 1600, 800, 1650),
+        _lr("CUSTOMER NAME", 200, 1700, 480, 1750),
+        _lr("LAK ARTHA SERVICES", 500, 1700, 900, 1750),
+        _lr("DEPOSIT AMCUNT:", 200, 2000, 520, 2050),
+        _lr("LKR", 560, 2000, 640, 2050),
+        _lr("5,000.00", 700, 2000, 900, 2050),
+        _lr("TRANSACTION STATUS SUCCESSFUL", 200, 2200, 900, 2250),
+    ]
+    r = extract(lines)
+    assert r.fields["DEPOSIT AMOUNT"] == "5,000.00"
+    assert r.amount == 5000.0
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+    assert r.fields["CUSTOMER NAME"] == "LAK ARTHA SERVICES"
+
+
 def test_cdm_amount_with_notes_header():
     """CDM 凭条：含 NOTES VALUE AMOUNT 表头行，不应取错金额。"""
     rows = [

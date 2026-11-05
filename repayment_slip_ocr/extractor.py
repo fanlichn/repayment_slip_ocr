@@ -196,17 +196,37 @@ def _value_after_label(line_text: str, label: str) -> Optional[str]:
 
 
 def _value_below(idx: int, lines, label_line) -> Optional[str]:
+    """取标签正下方最近的值行。
+
+    用中心点 x + 收紧的水平窗口，避免 CDM 并排表头把邻列 TERMINAL ID
+    （left-x 仍可能落入旧的 200px 窗口）抢给 DATE/TIME。
+    打分优先更近的下一行（dy），再比水平对齐（dx）：TRACE 的值常印在 TIME
+    列正下方，若先比 dx 会越过本列的 HH:MM 误取 TRACE 号。
+    """
     base_y = _line_center_y(label_line.box)
-    base_x = label_line.box[0][0]
+    label_left = min(p[0] for p in label_line.box)
+    label_cx = _line_center_x(label_line.box)
     best = None
     for j, other in enumerate(lines):
         if j == idx:
             continue
+        text = other.text.strip()
+        if not text or _looks_like_label_text(text):
+            continue
         y = _line_center_y(other.box)
-        x = other.box[0][0]
-        if y > base_y + 2 and abs(x - base_x) < 200:
-            if best is None or y < best[0]:
-                best = (y, other.text.strip())
+        other_left = min(p[0] for p in other.box)
+        other_cx = _line_center_x(other.box)
+        dy = y - base_y
+        if dy <= 2 or dy > 160:
+            continue
+        # 宽标签（如 Beneficiary Account Number）中心偏右，值往往左对齐；
+        # 窄并列表头则中心对齐更稳。取 left/center 较小 dx。
+        dx = min(abs(other_left - label_left), abs(other_cx - label_cx))
+        if dx >= 140:
+            continue
+        score = (dy, dx)
+        if best is None or score < best[0]:
+            best = (score, text)
     return best[1] if best else None
 
 
@@ -825,6 +845,8 @@ def _parse_datetime(s: str) -> Optional[str]:
         return None
     s = re.sub(r"\s+", " ", s.strip())
     s = re.sub(r"(?i)\b(am|pm)\b", lambda m: m.group(1).upper(), s)
+    # OCR 把日期中的 1 读成 t/l： "02-1t-2026" / "02-1l-2026" → "02-11-2026"
+    s = re.sub(r"(?i)(\d{1,2})[/.-](\d)[tl][/.-](\d{2,4})", r"\1/\g<2>1/\3", s)
     # 时间点号： "1.43 PM" / "1.43PM" -> "1:43 PM"
     s = re.sub(r"(?i)(\d{1,2})\.(\d{2})\s*(am|pm)", r"\1:\2 \3", s)
     # 归一化：日期分隔符 "." 统一为 "/"，去掉日期与时间之间的逗号，补偿
@@ -1425,14 +1447,16 @@ def _breakdown_single_line(lines) -> List[DenominationOut]:
 # "Commercial Bank PLC" 误判（还款场景收款方恒为 Lak Artha / Commercial Bank）。
 _BANK_MARKERS = [
     ("vishwa", ("vishwa",)),
+    # iPay / HNB 须抢在 people's bank 之前：回执正文常带付款来源行 "People's Bank **"
+    ("ipay", ("ipay", "www.ipay.lk")),
+    ("hnb", ("hatton national", "this is an auto generated receipt")),
+    ("ntb", ("nations trust", "nationstrust")),
     ("peoples_bank", ("peoplespay", "people's pay", "people's bank", "people's")),
     ("commercial_bank", ("cardless deposit", "combank", "transfer within", "e-receipt", "bank reference number", "sender's account number", "beneficiary notified", "cash credit slip")),
-    ("ipay", ("ipay",)),
-    ("boc", ("bank of ceylon", "boc flex", "boc")),
-    ("hnb", ("hatton national", "hnb", "this is an auto generated receipt")),
+    ("boc", ("bank of ceylon", "boc flex", "boc smartpay", "boc")),
+    ("hnb", ("hnb",)),
     ("dfcc", ("dfcc bank", "dfcc")),
-    ("ntb", ("nations trust",)),
-    ("nsb", ("nsb online banking", "nsb")),
+    ("nsb", ("nsb online banking", "nsb online payment", "nsb")),
     ("lb_finance", ("cash in mobile", "lb finance", "lbcim")),
     ("pay_master", ("paymaster", "pay master")),
     ("qpayment", ("q payment", "qpayment")),
@@ -1447,11 +1471,27 @@ _BOC_APP_MARKERS = (
     "settlement service charge",
 )
 
+_BOC_SMARTPAY_MARKERS = (
+    "boc smartpay",
+    "smartpay",
+    "sender name:",
+    "receiver name:",
+    "receiver account & bank",
+)
+
 
 def _is_boc_app(lines) -> bool:
     """BOC 手机银行 "Transaction Successful" 版式（Account Information 卡片）。"""
     full = " ".join(ln.text for ln in lines).lower()
     return any(m in full for m in _BOC_APP_MARKERS)
+
+
+def _is_boc_smartpay(lines) -> bool:
+    """BOC SmartPay / LANKAQR 转账回执：Sender Name / Receiver Name / Invoice Number。"""
+    full = " ".join(ln.text for ln in lines).lower()
+    if "boc smartpay" in full or ("smartpay" in full and "bank of ceylon" in full):
+        return True
+    return "sender name:" in full and "receiver name:" in full
 
 
 _PEOPLES_OTP_MARKERS = (
@@ -1484,12 +1524,21 @@ def _is_boc_flex(lines) -> bool:
 
 
 _CDM_MARKERS = ("cardless deposit",)
+_CDM_HEADER_NORMS = {"date", "time", "terminalid", "trace", "depositamount"}
 
 
 def _is_cash_deposit(lines) -> bool:
     """Commercial Bank CDM 无卡存款凭条（CARDLESS DEPOSIT）。"""
     full = " ".join(ln.text for ln in lines).lower()
-    return any(m in full for m in _CDM_MARKERS)
+    if any(m in full for m in _CDM_MARKERS):
+        return True
+    # OCR 漏读 CARDLESS DEPOSIT 时：并排表头 + DEPOSIT AMOUNT 仍可判定
+    headers = {
+        _norm_label(ln.text)
+        for ln in lines
+        if _norm_label(ln.text) in _CDM_HEADER_NORMS
+    }
+    return len(headers) >= 4 and "deposit" in full
 
 
 _CASH_CREDIT_SLIP_MARKERS = ("cash credit slip", "current account - cash deposit")
@@ -1550,8 +1599,10 @@ def _is_hnb_app_receipt(lines) -> bool:
 def _detect_bank(lines) -> Optional[str]:
     full = " ".join(ln.text for ln in lines).lower()
     # 抢在 "people's bank" 之前：该版式底部会显示付款来源银行（如 People's Bank）。
-    if _is_boc_app(lines):
+    if _is_boc_smartpay(lines) or _is_boc_app(lines):
         return "boc"
+    if _is_hnb_app_receipt(lines):
+        return "hnb"
     for bank, markers in _BANK_MARKERS:
         for m in markers:
             if m == "bank of ceylon":
@@ -2034,11 +2085,54 @@ _SAMPATH_VISHWA_LABELS = (
     "Transaction ID",
     "Date & Time",
     "Source Account Number",
+    "Source Account",
     "Amount",
     "Beneficiary Name",
     "Beneficiary Account No.",
+    "Beneficiary Account",
     "Beneficiary Remarks",
+    "Beneficiary Bank",
     "Destination Bank",
+)
+
+_BOC_SMARTPAY_LABELS = (
+    "Sender Name",
+    "Receiver Name",
+    "Source Account",
+    "Receiver Account & Bank",
+    "Transaction Amount",
+    "Service Charge",
+    "Transaction Date",
+    "Transaction Time",
+    "Transaction Status",
+    "Invoice Number",
+    "Description",
+)
+
+_HNB_APP_LABELS = (
+    "Transaction Reference",
+    "Payment Reference",
+    "Date/ Time",
+    "Date/Time",
+    "Receiver reference",
+    "Receiver Reference",
+)
+
+_NSB_MOBILE_LABELS = (
+    "Transaction ID",
+    "Transaction Date/Time",
+    "Transaction Type",
+    "Transaction Amount",
+    "Bank Charges",
+    "Status",
+    "Sender's Name",
+    "Source Bank Name",
+    "Source Bank Account Number",
+    "Beneficiary Name",
+    "Destination Bank",
+    "Destination Account No",
+    "Destination Account No.",
+    "Remarks",
 )
 
 _BOC_FLEX_LABELS = (
@@ -2094,13 +2188,18 @@ _IPAY_LABELS = (
     "Recipient",
     "Remarks",
     "Status",
+    "Amount",
 )
 
 
 def _norm_label(s: str) -> str:
     """标签归一化：去非字母数字，并还原常见 OCR 字母数字混淆（0→O、1→I）。"""
     s = re.sub(r"[^a-z0-9]", "", s.lower())
-    return s.replace("0", "o").replace("1", "i")
+    s = s.replace("0", "o").replace("1", "i")
+    # Vishwa 等版式常见 beneficiary 拼写损坏
+    for bad in ("beneficlary", "beneflciary", "beneticlary", "benefciary"):
+        s = s.replace(bad, "beneficiary")
+    return s
 
 
 def _build_label_fields(lines, labels, same_row: bool = False) -> dict:
@@ -2237,7 +2336,117 @@ def _right_column_buckets(lines, labels) -> dict:
 
 def _build_ipay_fields(lines) -> dict:
     buckets = _right_column_buckets(lines, _IPAY_LABELS)
-    return {k: " ".join(v) for k, v in buckets.items() if v}
+    fields = {k: " ".join(v) for k, v in buckets.items() if v}
+    # Amount 常无标签，仅 "Rs.7,575.00" 独立行
+    if not any("amount" in k.lower() for k in fields):
+        for ln in _sorted_by_y(lines):
+            m = re.search(r"(?i)\bRs\.?\s*([\d,]+(?:\.\d{2})?)", ln.text)
+            if m:
+                fields["Amount"] = f"Rs.{m.group(1)}"
+                break
+    return fields
+
+
+def _looks_like_terminal_id_value(value: str) -> bool:
+    """CDM TIME 误取 TERMINAL ID 时的形态：如 RWELAWA2HT / RMATCIT2HT。"""
+    compact = re.sub(r"\s+", "", value or "")
+    if re.search(r"\d{1,2}:\d{2}", compact):
+        return False
+    return bool(re.match(r"(?i)^R?[A-Z]{3,}\d*[A-Z]*HT$", compact))
+
+
+def _is_plausible_reference(value: str) -> bool:
+    """过滤 OCR 噪点参考号（如 Vishwa 的 \"Transaction ID :e\"）。"""
+    v = _clean(value or "")
+    if len(v) < 4:
+        return False
+    if v.lower() in {"n/a", "na", "none", "null", "success", "failed"}:
+        return False
+    if not re.search(r"\d", v):
+        return False
+    # 纯水印/银行名 + 数字不够长时也丢掉
+    if re.search(r"(?i)nationstrust", v) and not re.search(r"\d{6,}", v):
+        return False
+    return True
+
+
+def _build_dash_label_fields(lines, labels) -> dict:
+    """解析「Label - value」/「Label: value」同行写法（HNB App / ComBank App）。
+
+    值为空时（如 \"Transaction Reference -\"）取正下方一行。
+    """
+    wanted = {_norm_label(lbl): lbl for lbl in labels}
+    fields: dict = {}
+    ordered = _sorted_by_y(lines)
+    for i, ln in enumerate(ordered):
+        text = ln.text.strip()
+        m = re.match(r"^(.+?)\s*[-:：]\s*(.*)$", text)
+        if not m:
+            continue
+        raw_label, raw_value = m.group(1).strip(), m.group(2).strip()
+        key = wanted.get(_norm_label(raw_label))
+        if key is None or key in fields:
+            continue
+        value = _clean(raw_value)
+        if not value:
+            value = _value_below(i, ordered, ln)
+            value = _clean(value) if value else None
+        if value and not _looks_like_label_text(value):
+            fields[key] = value
+    return fields
+
+
+def _enrich_reference_aliases(fields: dict, references: ReferencesOut) -> dict:
+    """下游常用 Payment Reference / Transaction Reference 别名补齐。"""
+    candidates = [
+        fields.get("Payment Reference"),
+        fields.get("Transaction Reference"),
+        fields.get("Transaction reference"),
+        fields.get("Reference number"),
+        references.txn_ref,
+        references.transaction_id,
+        references.bank_reference_number,
+        references.e_receipt_reference,
+    ]
+    ref = next((c for c in candidates if c and _is_plausible_reference(str(c))), None)
+    if not ref:
+        return fields
+    ref = _clean(str(ref))
+    # 去掉 OCR 粘上的银行水印前缀
+    ref = re.sub(r"(?i)^nationstrustbank\s*", "", ref).strip(" -:") or ref
+    if not any(k.lower() == "payment reference" for k in fields):
+        fields["Payment Reference"] = ref
+    if not any(_norm_label(k) == "transactionreference" for k in fields):
+        fields["Transaction Reference"] = ref
+    return fields
+
+
+def _synthesize_cdm_datetime_fields(fields: dict) -> dict:
+    """CDM 的 DATE+TIME 合成下游常用 Date & Time / Transaction Date/Time。"""
+    date_v = fields.get("DATE")
+    time_v = fields.get("TIME")
+    if not date_v:
+        return fields
+    if time_v and _looks_like_terminal_id_value(time_v):
+        fields.pop("TIME", None)
+        time_v = None
+    if time_v and not re.match(r"^\s*([01]?\d|2[0-3])[:.\- ][0-5]\d\s*$", time_v):
+        # 非 HH:MM，避免合成错误时间
+        time_v = None
+    date_part = str(date_v).split()[0]
+    if time_v:
+        t = time_v.strip().replace(".", ":").replace("-", ":").replace(" ", ":")
+        parts = t.split(":")
+        if len(parts) >= 2:
+            hh, mm = parts[0].zfill(2), parts[1].zfill(2)
+            ss = parts[2].zfill(2) if len(parts) > 2 else "00"
+            combined = f"{date_part} {hh}:{mm}:{ss}"
+            fields.setdefault("Date & Time", combined)
+            fields.setdefault("Transaction Date/Time", combined)
+            fields["TIME"] = f"{hh}:{mm}" if len(parts) == 2 else f"{hh}:{mm}:{ss}"
+    else:
+        fields.setdefault("Date & Time", date_part if " " in str(date_v) else f"{date_part} 00:00:00")
+    return fields
 
 
 def _build_ereceipt_fields(lines) -> dict:
@@ -2387,9 +2596,9 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     doc_type = _detect_doc_type(full_text)
     status = _detect_status(full_text)
     bank = _detect_bank(lines)
-    # 现金存款凭条版式固定为 Commercial Bank，即使 OCR 把 "cash credit slip" 读坏，
-    # 只要面额表检测命中就设为 commercial_bank。
-    if _is_cash_credit_slip(lines) and not bank:
+    # 现金存款凭条版式固定为 Commercial Bank，即使 OCR 把标题读坏，
+    # 只要面额表 / CDM 表头检测命中就设为 commercial_bank。
+    if (_is_cash_credit_slip(lines) or _is_cash_deposit(lines)) and not bank:
         bank = "commercial_bank"
 
     payer, payee = _extract_parties(lines, bank)
@@ -2444,7 +2653,9 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         success = False
         warnings.append("上传图片不是银行交易凭证，请上传银行还款截图")
 
-    if _is_boc_app(lines):
+    if _is_boc_smartpay(lines):
+        field_labels = _BOC_SMARTPAY_LABELS
+    elif _is_boc_app(lines):
         field_labels = _BOC_APP_LABELS
     elif _is_boc_flex(lines):
         field_labels = _BOC_FLEX_LABELS
@@ -2458,6 +2669,20 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         field_labels = _LB_FINANCE_LABELS
     elif bank == "ipay":
         field_labels = _IPAY_LABELS
+    elif bank == "ntb":
+        field_labels = (
+            "Status",
+            "Amount",
+            "Date",
+            "Time",
+            "Reference number",
+            "From account",
+            "To account",
+            "To account name",
+            "Bank",
+            "Service charge",
+            "Description",
+        )
     else:
         field_labels = _E_RECEIPT_LABELS
 
@@ -2469,22 +2694,65 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         fields = _build_peoples_pay_fields(lines, payer, payee)
     elif doc_type == "e_receipt":
         fields = _build_ereceipt_fields(lines)
-    elif bank == "nsb":
+    elif bank == "nsb" and "nsb online banking" in full_text.lower():
         fields = _build_nsb_fields(lines)
+    elif bank == "nsb":
+        # NSB Online Payment - Mobile：左标签冒号右值
+        fields = _build_label_fields(lines, _NSB_MOBILE_LABELS, same_row=True)
+        dash = _build_dash_label_fields(lines, _NSB_MOBILE_LABELS)
+        for k, v in dash.items():
+            fields.setdefault(k, v)
+    elif _is_hnb_app_receipt(lines) or _is_to_only_receipt(lines):
+        fields = _build_dash_label_fields(lines, _HNB_APP_LABELS)
+        # ComBank / HNB App 金额常为独立 "LKR x,xxx.00" 行
+        if not any("amount" in k.lower() for k in fields):
+            for ln in lines:
+                m = re.search(r"(?i)\bLKR\s*([\d,]+(?:\.\d{2})?)", ln.text)
+                if m:
+                    fields["Amount"] = f"LKR {m.group(1)}"
+                    break
+    elif _is_boc_smartpay(lines):
+        fields = _build_label_fields(lines, _BOC_SMARTPAY_LABELS)
+        dash = _build_dash_label_fields(lines, _BOC_SMARTPAY_LABELS)
+        for k, v in dash.items():
+            fields.setdefault(k, v)
     else:
         fields = _build_label_fields(lines, field_labels)
     # 金额小数点被 OCR 误读为冒号时还原（如 "2,500:00" → "2,500.00"）
     fields = _normalize_money_fields(fields)
+    if _is_cash_deposit(lines) or (bank == "commercial_bank" and fields.get("DATE")):
+        fields = _synthesize_cdm_datetime_fields(fields)
+    fields = _enrich_reference_aliases(fields, references)
+    # 金额字段被水印/噪点污染时，用已解析数值回填
+    for amount_key in list(fields.keys()):
+        if "amount" not in amount_key.lower():
+            continue
+        raw_amt = fields.get(amount_key) or ""
+        if amount is not None and not re.search(r"\d{1,3}(?:,\d{3})*(?:\.\d{2})?|\d+\.\d{2}", raw_amt):
+            fields[amount_key] = f"LKR {amount:,.2f}"
+    if bank == "ntb":
+        if fields.get("Status") and "nationstrust" in str(fields["Status"]).lower():
+            if status:
+                fields["Status"] = "Success" if status == "success" else status
+        # Reference number 里的水印前缀已在 alias 里剥掉；同步写回
+        if fields.get("Payment Reference") and "Reference number" in fields:
+            fields["Reference number"] = fields["Payment Reference"]
     # 时间无标签（如 BOC App 独立的 "10.08.2026 , 06:45 PM" 行）时，从 OCR 原文补 Date & Time
     if not any("date" in k.lower() or "time" in k.lower() for k in fields):
         raw_dt = _find_datetime_raw(lines)
         if raw_dt:
             fields["Date & Time"] = raw_dt
+        elif dt:
+            fields["Date & Time"] = dt.replace("T", " ")
     # Remarks 兜底：结构化字段已提取但 fields 无 Remarks 时补上（如 People's Pay 占位标签下一行值）
     if references.remarks and not any("remark" in k.lower() for k in fields):
         fields["Remarks"] = references.remarks
     # 时间字段统一成 24 小时制（YYYY-MM-DD HH:MM:SS），去掉 AM/PM 与点号分隔
     for k in list(fields.keys()):
+        if k in ("TIME",):
+            # CDM 的 TIME 保持 HH:MM，避免被解析成仅时间失败后丢掉
+            if re.match(r"^\s*([01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?\s*$", fields[k] or ""):
+                continue
         if "date" in k.lower() or "time" in k.lower():
             parsed = _parse_datetime(fields[k])
             if parsed:

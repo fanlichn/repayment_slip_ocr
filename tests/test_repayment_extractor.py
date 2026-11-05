@@ -362,6 +362,39 @@ def test_cdm_date_time_terminal_header_fields():
     assert r.fields["DATE"] == "2026-10-30 00:00:00"
 
 
+def test_cdm_header_right_column_should_not_steal_terminal():
+    """真实 WELLAWAY CDM：DATE/TIME 值略偏下且 TERMINAL 值 y 更靠近标签行，
+    不能把 RWELAWA2HT 抢给 DATE/TIME。"""
+    lines = [
+        _lr("COMMERCIAL BANK OF CEYLON PLC", 400, 1100, 1200, 1160),
+        _lr("WELLAWAY-CRM2 BR", 677, 1305, 1085, 1378),
+        _lr("DATE", 442, 1486, 550, 1533),
+        _lr("TIME", 729, 1462, 847, 1523),
+        _lr("TERMINAL ID", 1005, 1437, 1300, 1511),
+        _lr("03/11/26", 434, 1518, 649, 1593),
+        _lr("10:49", 731, 1512, 868, 1572),
+        _lr("RWELAWA2HT", 1005, 1495, 1273, 1558),
+        _lr("TRACE", 441, 1617, 582, 1688),
+        _lr("762", 763, 1615, 847, 1669),
+        _lr("TRANSACTION", 452, 1764, 726, 1826),
+        _lr(": CARDLESS DEPOSIT", 789, 1747, 1253, 1809),
+        _lr("ACCOUNT NUMBER: 1001096962", 452, 1849, 1104, 1925),
+        _lr("CUSTOMER NAME :LAK ARTHA SERVICES", 455, 1951, 1286, 2020),
+        _lr("SOURCE OF FUNDS:UNKNOWN", 456, 2373, 1040, 2424),
+        _lr("DEPOSIT AMOUNT", 459, 2744, 830, 2791),
+        _lr("LKR", 942, 2737, 1033, 2791),
+        _lr("4,000.00", 1212, 2734, 1431, 2781),
+        _lr("TRANSACTION STATUS : SUCCESSFUL", 536, 2825, 1344, 2894),
+    ]
+    r = extract(lines)
+
+    assert r.fields["DATE"] == "2026-11-03 00:00:00"
+    assert r.fields["TIME"] == "10:49"
+    assert r.fields["TERMINAL ID"] == "RWELAWA2HT"
+    assert r.datetime == "2026-11-03T10:49:00"
+    assert r.fields["TRACE"] == "762"
+
+
 def test_cdm_amount_with_notes_header():
     """CDM 凭条：含 NOTES VALUE AMOUNT 表头行，不应取错金额。"""
     rows = [

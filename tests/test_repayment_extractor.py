@@ -1319,6 +1319,56 @@ def test_nsb_online_banking():
     assert r.fields["Benefi. Account Type"] == "Savings Account"
 
 
+def test_peoples_pay_without_logo_text_still_extracts():
+    """People's Pay：Logo/行名 OCR 漏读、标题截成 Transaction confirmat... 时仍应识别。
+
+    仅剩 Pay to + Amount(LKR) + Trace No + Remarks Max 16 characters 版式特征。
+    """
+    lines = [
+        _lr("Transaction confirmat...", 228, 194, 995, 256),
+        _lr("Pay to", 95, 470, 268, 539),
+        _lr("Name", 98, 589, 239, 642),
+        _lr("L.a.k Artha", 834, 592, 1096, 642),
+        _lr("Bank Name", 99, 669, 355, 725),
+        _lr("Commercial Bank PLC", 617, 678, 1093, 717),
+        _lr("Account No", 104, 758, 358, 806),
+        _lr("1001096962", 796, 756, 1102, 811),
+        _lr("Amount (LKR)", 98, 975, 490, 1036),
+        _lr("7,900.00", 897, 975, 1099, 1033),
+        _lr("Fee", 96, 1191, 203, 1263),
+        _lr("Fee Amount (LKR )", 101, 1308, 528, 1364),
+        _lr("25.00", 969, 1311, 1102, 1361),
+        _lr("Total debit amount ( LKR )", 101, 1395, 669, 1442),
+        _lr("7,925.00", 909, 1392, 1099, 1442),
+        _lr("Date & Time", 99, 1603, 416, 1667),
+        _lr("2026/10/30 14:21:53", 632, 1614, 1093, 1653),
+        _lr("Trace No", 98, 1828, 335, 1886),
+        _lr("2026103000769043", 649, 1831, 1096, 1878),
+        _lr("Remarks - Max 16 characters", 107, 2053, 848, 2100),
+        _lr("loan", 96, 2155, 206, 2221),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "peoples_bank"
+    assert r.doc_type == "payment_confirmation"
+    assert r.payee.name == "Lak Artha (Pvt) Ltd"
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank PLC"
+    assert r.amount == 7900.0
+    assert r.fee == 25.0
+    assert r.total_debit == 7925.0
+    assert r.datetime == "2026-10-30T14:21:53"
+    assert r.trace_no == "2026103000769043"
+    assert r.fields["Amount (LKR)"] == "7,900.00"
+    assert r.fields["Fee Amount (LKR)"] == "25.00"
+    assert r.fields["Total debit amount (LKR)"] == "7,925.00"
+    assert r.fields["Date & Time"] == "2026-10-30 14:21:53"
+    assert r.fields["Trace No"] == "2026103000769043"
+    assert r.fields["Payee Name"] == "Lak Artha (Pvt) Ltd"
+    assert r.fields["Payee Account No"] == "1001096962"
+    assert r.fields["Remarks"] == "loan"
+
+
 def test_peoples_pay_two_column():
     """真实 People's Bank People's Pay 回执：左标右值两栏版式。
 

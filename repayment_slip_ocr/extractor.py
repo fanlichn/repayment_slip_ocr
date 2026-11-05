@@ -893,7 +893,8 @@ def _detect_doc_type(full_text: str) -> Optional[str]:
         return "cash_deposit_slip"
     if "e-receipt" in t:
         return "e_receipt"
-    if "confirmation" in t or "payment details" in t:
+    # OCR 常把标题截成 "Transaction confirmat..."
+    if "confirmation" in t or "confirmat" in t or "payment details" in t:
         return "payment_confirmation"
     if "receipt" in t or "transfer" in t or "payment" in t:
         return "fund_transfer_receipt"
@@ -1012,11 +1013,13 @@ def _find_datetime(lines) -> Optional[str]:
             return parsed
 
     # 全卡扫描带时间的完整日期时间（优先于纯日期，避免误取 Payment Date 的无时间值）
+    # 必须先匹配 4 位年，且日/月模式加 (?<!\d)：否则 "2026/10/30 14:21:53"
+    # 会被 `\d{1,2}/...` 吃成 "26/10/30 14:21:53" → 2030-10-26。
     datetime_pats = [
-        r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s*[,\s]?\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
-        r"\d{4}[/-]\d{1,2}[/-]\d{1,2}[ T]\s*\d{1,2}:\d{2}(?::\d{2})?",
-        r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
-        r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
+        r"(?<!\d)\d{4}[/-]\d{1,2}[/-]\d{1,2}[ T]\s*\d{1,2}:\d{2}(?::\d{2})?",
+        r"(?<!\d)\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s*[,\s]?\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
+        r"(?<!\d)\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
+        r"(?<!\d)\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
     ]
     for ln in lines:
         for pat in datetime_pats:
@@ -1052,13 +1055,17 @@ def _find_datetime(lines) -> Optional[str]:
                     if combined:
                         return combined
 
-    # 兜底：纯日期
+    # 兜底：纯日期（同样先 4 位年，避免从 2026/10/30 里截出 26/10/30）
     for ln in lines:
-        m = re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", ln.text)
-        if m:
-            parsed = _parse_datetime(m.group(0))
-            if parsed:
-                return parsed
+        for pat in (
+            r"(?<!\d)\d{4}[/-]\d{1,2}[/-]\d{1,2}(?!\d)",
+            r"(?<!\d)\d{1,2}[/-]\d{1,2}[/-]\d{2,4}(?!\d)",
+        ):
+            m = re.search(pat, ln.text)
+            if m:
+                parsed = _parse_datetime(m.group(0))
+                if parsed:
+                    return parsed
     return None
 
 
@@ -1068,21 +1075,28 @@ def _find_datetime_raw(lines) -> Optional[str]:
     只匹配整行几乎就是日期时间的行，避免把带标签的时间行
     （如 "Date & Time : 09/10/2026 01:19 PM"）重复提取。
     """
-    pat = re.compile(
-        r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s*[,\s]?\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
-        re.IGNORECASE,
-    )
+    pats = [
+        re.compile(
+            r"(?<!\d)\d{4}[./-]\d{1,2}[./-]\d{1,2}\s*[,\s]?\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?<!\d)\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s*[,\s]?\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?",
+            re.IGNORECASE,
+        ),
+    ]
     for ln in _sorted_by_y(lines):
         text = ln.text.strip()
-        m = pat.search(text)
-        if not m:
-            continue
-        rest = (text[:m.start()] + text[m.end():]).strip(" :：.-,，")
-        if rest:
-            continue
-        raw = m.group(0).strip()
-        if _parse_datetime(raw):
-            return raw
+        for pat in pats:
+            m = pat.search(text)
+            if not m:
+                continue
+            rest = (text[: m.start()] + text[m.end() :]).strip(" :：.-,，")
+            if rest:
+                continue
+            raw = m.group(0).strip()
+            if _parse_datetime(raw):
+                return raw
     return None
 
 
@@ -1698,6 +1712,39 @@ def _is_hnb_app_receipt(lines) -> bool:
     return "fund transfer receipt" in full and "receiver reference" in full
 
 
+def _is_peoples_pay_layout(lines) -> bool:
+    """无 PEOPLE'S 字样时，凭版式判定 People's Pay 确认/回执页。
+
+    强特征组合：Pay to + Trace No + Amount(LKR)/Total debit；
+    常伴截断标题 Transaction confirmat... 或 Remarks Max 16 characters。
+    """
+    full = " ".join(ln.text for ln in lines).lower()
+    if any(
+        m in full
+        for m in (
+            "ipay",
+            "www.ipay.lk",
+            "vishwa",
+            "smartpay",
+            "cardless deposit",
+            "acknowledgement",
+            "one time transfer",
+        )
+    ):
+        return False
+    norms = {_norm_label(ln.text) for ln in lines}
+    has_pay_to = any(ln.text.strip().lower() == "pay to" for ln in lines)
+    has_trace = "traceno" in norms
+    has_amount = bool(norms & {"amountlkr", "totaldebitamountlkr", "feeamountlkr"})
+    has_title = "confirmat" in full or "successfully completed" in full
+    has_remarks_hint = "max 16 characters" in full
+    if has_pay_to and has_trace and has_amount:
+        return True
+    if has_pay_to and has_amount and (has_title or has_remarks_hint):
+        return True
+    return False
+
+
 def _detect_bank(lines) -> Optional[str]:
     full = " ".join(ln.text for ln in lines).lower()
     # 抢在 "people's bank" 之前：该版式底部会显示付款来源银行（如 People's Bank）。
@@ -1714,6 +1761,9 @@ def _detect_bank(lines) -> Optional[str]:
                 continue
             if m in full:
                 return bank
+    # Logo / 行名 OCR 漏读时，用 People's Pay 版式兜底
+    if _is_peoples_pay_layout(lines):
+        return "peoples_bank"
     return None
 
 
@@ -2877,14 +2927,14 @@ def _build_peoples_pay_fields(lines, payer, payee) -> dict:
     if payer_fields.get("Account Currency"):
         fields["Account Currency"] = payer_fields["Account Currency"]
 
-    # Pay to 区 -> Payee 别名
+    # Pay to 区 -> Payee 别名（结构化 payee 已经过 Lak Artha 等归一化，优先采用）
     payee_fields = _build_label_fields(payee_zone or lines, ("Name", "Bank Name", "Account No"))
-    if payee_fields.get("Name") or payee.name:
-        fields["Payee Name"] = payee_fields.get("Name") or payee.name
-    if payee_fields.get("Bank Name") or payee.bank:
-        fields["Payee Bank"] = payee_fields.get("Bank Name") or payee.bank
-    if payee_fields.get("Account No") or payee.account:
-        fields["Payee Account No"] = payee_fields.get("Account No") or payee.account
+    if payee.name or payee_fields.get("Name"):
+        fields["Payee Name"] = payee.name or payee_fields.get("Name")
+    if payee.bank or payee_fields.get("Bank Name"):
+        fields["Payee Bank"] = payee.bank or payee_fields.get("Bank Name")
+    if payee.account or payee_fields.get("Account No"):
+        fields["Payee Account No"] = payee.account or payee_fields.get("Account No")
 
     return fields
 
@@ -2957,10 +3007,11 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             if total is None:
                 total = breakdown_sum
 
-    # 收款方归一化：还款场景常见 Lak Artha 系列写法
+    # 收款方归一化：还款场景常见 Lak Artha 系列写法（含 "L.a.k Artha" OCR 插点）
     if payee.name:
         low = payee.name.lower()
-        if "lak artha" in low or "lak-artha" in low:
+        compact = re.sub(r"[^a-z]", "", low)
+        if "lakartha" in compact or "lak artha" in low or "lak-artha" in low:
             payee.name = "Lak Artha (Pvt) Ltd"
 
     success = bool(amount is not None or payee.account is not None or payee.name is not None)
@@ -3129,6 +3180,9 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             parsed = _parse_datetime(fields[k])
             if parsed:
                 fields[k] = parsed.replace("T", " ")
+                # 扁平 Date & Time 更可信时回写结构化 datetime
+                if "date" in k.lower() and "time" in k.lower():
+                    dt = parsed
 
     return RepaymentResult(
         success=success,

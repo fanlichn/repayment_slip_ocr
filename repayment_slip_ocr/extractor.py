@@ -3947,6 +3947,9 @@ def _looks_like_cdm_notes_row_amount(amount: float, lines) -> bool:
         moneys.append(val)
     if qty_like < 2 or not moneys:
         return False
+    # 多行张数 + 金额恰为常见面额面值（含 10,000）→ 行 AMOUNT，非存款总额
+    if amount in _COMMON_DENOMS:
+        return True
     return any(m > amount + 0.01 for m in moneys)
 
 

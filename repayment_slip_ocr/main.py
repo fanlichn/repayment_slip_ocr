@@ -95,6 +95,10 @@ def _line_center_y(box) -> float:
     return sum(p[1] for p in box) / len(box)
 
 
+def _line_center_x(box) -> float:
+    return sum(p[0] for p in box) / len(box)
+
+
 def _is_cdm_result(result) -> bool:
     fields = result.fields or {}
     return (
@@ -148,11 +152,21 @@ def _cdm_missing_deposit_amount(result) -> bool:
     return True
 
 
+def _cdm_missing_header_fields(result) -> bool:
+    """缺 TERMINAL ID / BRANCH 时复检日期行右侧与银行名下方。"""
+    if not _is_cdm_result(result):
+        return False
+    fields = result.fields or {}
+    return not fields.get("TERMINAL ID") or not fields.get("BRANCH")
+
+
 def _looks_like_row_subtotal_deposit(amount: float, fields: dict) -> bool:
     """无可靠大额时，偏小的「存款额」更像面额表行 AMOUNT。"""
     if amount < 100:
         return False
-    # 典型行小计：等于常见面额×张数且总额偏小；真正万元级存款很少只有几百
+    # 常见面额面值（含 10,000 行小计）不得充当 DEPOSIT 总额而停止复检
+    if amount in {100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0}:
+        return True
     if amount >= 5000:
         return False
     for denom in (100.0, 500.0, 1000.0, 2000.0, 5000.0):
@@ -239,7 +253,9 @@ def _has_cdm_deposit_amount_text(lines: List[OcrLine]) -> bool:
     if not vals:
         return False
     max_v = max(vals)
-    # 仅有行小计/面额（≤5000 且像张数×面额）不算读到总额
+    # 面额面值（含 10,000 行 AMOUNT）不算读到总额，继续扫 LKR 旁 11,400
+    if max_v in {100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0}:
+        return False
     if max_v <= 5000 and any(
         abs(max_v / d - round(max_v / d)) < 0.01 and 2 <= round(max_v / d) <= 50
         for d in (100.0, 500.0, 1000.0, 2000.0, 5000.0)
@@ -282,14 +298,27 @@ def _roi_from_boxes(
     return crop, float(y0), float(x0)
 
 
+def _cdm_receipt_x_bounds(lines: List[OcrLine], img_w: int) -> tuple:
+    """按已识别文字框估计收据左右边界，裁掉手/地面背景以免干扰 OCR。"""
+    xs = [float(p[0]) for ln in lines if ln.box for p in ln.box]
+    if not xs:
+        return 0, img_w
+    x0 = max(0, int(min(xs) - img_w * 0.02))
+    x1 = min(img_w, int(max(xs) + img_w * 0.04))
+    if x1 - x0 < img_w * 0.35:
+        return 0, img_w
+    return x0, x1
+
+
 def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
     """生成若干中间带裁剪：(crop, top, left)。
 
-    优先锚点并集（兼容竖排旋转收据）；再 TRANSACTION~NARRATION 水平带；
-    最后固定比例窗口（正拍整页 CDM）。
+    NAWALAPI 类折痕凭条：全幅裁易被背景干扰；用 TRACE/TRANSACTION→NOTES
+    锚定，限制在收据 x 范围内切细条，专打 ACCOUNT/CUSTOMER。
     """
     h, w = img.shape[:2]
     scale_y = _anchor_scale_y(float(h), lines)
+    rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
 
     out: List[tuple] = []
     seen = set()
@@ -317,7 +346,6 @@ def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple
         ],
     )
     if party_boxes:
-        # 并入账号附近的数字碎片框
         xs0 = min(p[0] for b in party_boxes for p in b)
         xs1 = max(p[0] for b in party_boxes for p in b)
         ys0 = min(p[1] for b in party_boxes for p in b)
@@ -332,52 +360,55 @@ def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple
         roi = _roi_from_boxes(img, party_boxes, pad_x=0.06, pad_y=0.05)
         if roi:
             _add_crop(*roi)
-            # 再扩一圈，照顾竖排值列在标签外侧
-            crop, top, left = roi
-            y0 = max(0, int(top - h * 0.03))
-            x0 = max(0, int(left - w * 0.05))
-            y1 = min(h, int(top + crop.shape[0] + h * 0.05))
-            x1 = min(w, int(left + crop.shape[1] + w * 0.08))
-            _add_crop(img[y0:y1, x0:x1], float(y0), float(x0))
 
-    y0_hits = _anchor_ys(lines, ["cardless", "transaction"])
-    y1_hits = _anchor_ys(lines, ["narration", "mobile", "source of funds", "notes", "value"])
-    y0 = min(y0_hits) * scale_y if y0_hits else None
+    y0_hits = _anchor_ys(lines, ["cardless", "transaction", "trace"])
+    y1_hits = _anchor_ys(lines, ["narration", "mobile", "source of funds", "notes", "hotes", "value"])
+    # TRACE 下方即 TRANSACTION/ACCOUNT；NOTES 上方结束中间段
+    y_trace = min(_anchor_ys(lines, ["trace"]), default=None)
+    y_txn = min(_anchor_ys(lines, ["transaction", "cardless"]), default=None)
+    y_notes = min(_anchor_ys(lines, ["notes", "hotes", "value"]), default=None)
+    y0 = None
+    if y_txn is not None:
+        y0 = y_txn * scale_y
+    elif y_trace is not None:
+        y0 = y_trace * scale_y + 40
+    elif y0_hits:
+        y0 = min(y0_hits) * scale_y
     y1 = None
-    if y0 is not None and y1_hits:
-        below = [y * scale_y for y in y1_hits if y * scale_y > y0 + 40]
-        y1 = min(below) if below else min(y1_hits) * scale_y
+    if y_notes is not None:
+        y1 = y_notes * scale_y
     elif y1_hits:
-        y1 = min(y1_hits) * scale_y
+        below = [y * scale_y for y in y1_hits if y0 is None or y * scale_y > y0 + 40]
+        y1 = min(below) if below else min(y1_hits) * scale_y
 
-    left = max(0, int(w * 0.01))
-    # 细条带优先：宽幅中间带 Paddle 常整段漏读 ACCOUNT/CUSTOMER，单行高裁更稳（EKALA）
+    # 细条带优先：限制在收据宽度内，避免右手/地面进框
     strip_windows: List[tuple] = []
     if y0 is not None and y1 is not None and y1 > y0 + 80:
-        gap0 = y0 + 25
-        gap1 = y1 - 15
-        strip_h = max(100.0, min(160.0, (gap1 - gap0) / 5.0))
-        step = strip_h * 0.55
+        gap0 = y0 + 20
+        gap1 = y1 - 10
+        strip_h = max(110.0, min(200.0, (gap1 - gap0) / 4.5))
+        step = strip_h * 0.50
         y = gap0
-        while y < gap1 - 50:
+        while y < gap1 - 60:
             strip_windows.append((y, min(gap1, y + strip_h)))
             y += step
-        # 再加两档稍高的账号带（ACCOUNT+CUSTOMER 两行）
-        mid = (gap0 + gap1) / 2.0
-        strip_windows.append((mid - 120, mid + 140))
-        strip_windows.append((gap0 + (gap1 - gap0) * 0.2, gap0 + (gap1 - gap0) * 0.75))
+        # 半段 / 整段放后：细条先跑，避免宽幅热敏区整段漏读
+        strip_windows.append((gap0 + (gap1 - gap0) * 0.05, gap0 + (gap1 - gap0) * 0.55))
+        strip_windows.append((gap0 + (gap1 - gap0) * 0.35, gap0 + (gap1 - gap0) * 0.95))
+        strip_windows.append((gap0, gap1))
     else:
-        # 无锚点时按整页比例切细条（EKALA 账号约 0.36–0.43）
         for ya, yb in (
             (h * 0.36, h * 0.40),
             (h * 0.38, h * 0.42),
             (h * 0.40, h * 0.44),
-            (h * 0.35, h * 0.43),
-            (h * 0.37, h * 0.45),
+            (h * 0.42, h * 0.55),
+            (h * 0.35, h * 0.55),
+            (h * 0.45, h * 0.65),
         ):
             strip_windows.append((ya, yb))
 
-    # 细条插入队首，先于宽幅 ROI 复检
+    # 中间字段在收据左~75%：裁掉右侧手/地面，对齐诊断 party_mid
+    party_x1 = min(rx1, max(rx0 + int((rx1 - rx0) * 0.78), int(w * 0.62)))
     strip_out: List[tuple] = []
     strip_seen = set()
     for y_a, y_b in strip_windows:
@@ -385,48 +416,48 @@ def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple
         bottom = min(h, int(y_b))
         if bottom - top < 50:
             continue
-        key = (top // 10, bottom // 10)
+        key = (top // 10, bottom // 10, rx0 // 20)
         if key in strip_seen:
             continue
         strip_seen.add(key)
-        crop = img[top:bottom, left:w]
+        crop = img[top:bottom, rx0:party_x1]
         if crop.size:
-            strip_out.append((crop, float(top), float(left)))
+            strip_out.append((crop, float(top), float(rx0)))
     out = strip_out + out
 
     windows: List[tuple] = []
-    # 固定比例：正拍整页 CDM，EKALA 账号约在 0.34–0.45
     windows.extend(
         [
             (h * 0.34, h * 0.47),
             (h * 0.32, h * 0.50),
-            (h * 0.30, h * 0.52),
-            (h * 0.28, h * 0.55),
-            # 合成截图里收据常在下半幅
+            (h * 0.30, h * 0.55),
+            (h * 0.40, h * 0.68),
             (h * 0.55, h * 0.85),
-            (h * 0.60, h * 0.92),
-            (h * 0.70, h * 0.98),
         ]
     )
     if y0 is not None and y1 is not None and y1 > y0 + 60:
         span = y1 - y0
-        windows.append((y0 + span * 0.15, y1 - span * 0.10))
-        windows.append((y0 + 20, y1 - 10))
+        windows.append((y0 + span * 0.10, y1 - span * 0.05))
+        windows.append((y0 + 15, y1 - 5))
 
     for y_a, y_b in windows:
         top = max(0, int(y_a))
         bottom = min(h, int(y_b))
         if bottom - top < 40:
             continue
-        _add_crop(img[top:bottom, left:w], float(top), float(left))
+        _add_crop(img[top:bottom, rx0:party_x1], float(top), float(rx0))
     return out
 
 
 def _prepare_cdm_amount_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
-    """DEPOSIT AMOUNT / NOTES 面额表区域裁剪。"""
+    """DEPOSIT AMOUNT / NOTES 面额表区域裁剪。
+
+    诊断：右侧 AMOUNT 列 + 底部 LKR 旁 11,400 在紧裁下清晰；宽幅全图易漏。
+    """
     h, w = img.shape[:2]
     out: List[tuple] = []
     seen = set()
+    rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
 
     def _add(crop, top: float, left: float) -> None:
         if crop is None or crop.size == 0:
@@ -452,41 +483,104 @@ def _prepare_cdm_amount_band_crops(img: np.ndarray, lines: List[OcrLine]) -> Lis
             "status",
         ],
     )
-    if amt_boxes:
-        roi = _roi_from_boxes(img, amt_boxes, pad_x=0.10, pad_y=0.10)
-        if roi:
-            _add(*roi)
-        # 细横条：专打 DEPOSIT AMOUNT / 底部 LKR 旁总额（折痕时宽幅裁易漏）
-        ys = [_line_center_y(b) for b in amt_boxes]
-        y_mid = sum(ys) / len(ys)
-        y_max = max(ys)
-        for y_a, y_b, x_a in (
-            (y_max - h * 0.02, min(h, y_max + h * 0.12), 0.35),
-            (y_mid, min(h, y_max + h * 0.18), 0.40),
-            (max(0, y_max - h * 0.05), min(h, y_max + h * 0.08), 0.45),
-        ):
-            top = max(0, int(y_a))
-            bottom = min(h, int(y_b))
-            x0 = max(0, int(w * x_a))
-            if bottom - top < 28:
-                continue
-            _add(img[top:bottom, x0:w], float(top), float(x0))
-    # 正拍：下部金额带；右下专攻总额列；合成图底部收据区
+    # AMOUNT 列表头 x：专裁右列（400 / 1,000 / 10,000 / 11,400）
+    amount_xs = []
+    notes_ys = []
+    lkr_ys = []
+    for ln in lines:
+        low = ln.text.strip().lower()
+        cy = _line_center_y(ln.box)
+        cx = _line_center_x(ln.box)
+        if low.rstrip(":.") == "amount" or low.startswith("amount"):
+            amount_xs.append(cx)
+        if _looks_like_notes_header_text(low) or low.startswith("value"):
+            notes_ys.append(cy)
+        if re.fullmatch(r"lkr", low) and cy > h * 0.55:
+            lkr_ys.append(cy)
+            amount_xs.append(min(p[0] for p in ln.box))
+
+    col_x0 = int(min(amount_xs) - 80) if amount_xs else int(w * 0.50)
+    col_x0 = max(rx0, min(col_x0, int(w * 0.70)))
+    y_notes = min(notes_ys) if notes_ys else h * 0.65
+    y_lkr = max(lkr_ys) if lkr_ys else h * 0.82
+
+    # 右列：NOTES 表到页脚（诊断裁 notes_right / amt_lkr）
     for y_a, y_b, x_a in (
-        (h * 0.55, h * 0.92, 0.01),
-        (h * 0.65, h * 0.98, 0.01),
-        (h * 0.70, h * 0.99, 0.20),
-        (h * 0.75, h * 0.99, 0.40),
-        (h * 0.80, h * 1.00, 0.35),
-        (h * 0.45, h * 0.85, 0.25),
-        (h * 0.58, h * 0.88, 0.50),
+        (y_notes - 40, min(h, y_lkr + 180), col_x0),
+        (y_notes - 20, min(h, y_notes + (h - y_notes) * 0.85), col_x0 - 40),
+        (y_lkr - 80, min(h, y_lkr + 160), max(rx0, int(w * 0.35))),
+        (y_lkr - 40, min(h, y_lkr + 120), col_x0 - 100),
+        (max(0, y_lkr - 30), min(h, y_lkr + 100), max(rx0, int(w * 0.40))),
     ):
         top = max(0, int(y_a))
         bottom = min(h, int(y_b))
-        x0 = max(0, int(w * x_a))
+        x0 = max(0, int(x_a))
+        if bottom - top < 36:
+            continue
+        _add(img[top:bottom, x0:rx1], float(top), float(x0))
+
+    if amt_boxes:
+        roi = _roi_from_boxes(img, amt_boxes, pad_x=0.10, pad_y=0.12)
+        if roi:
+            _add(*roi)
+
+    for y_a, y_b, x_a in (
+        (h * 0.65, h * 0.98, 0.45),
+        (h * 0.70, h * 0.99, 0.50),
+        (h * 0.75, h * 1.00, 0.40),
+        (h * 0.58, h * 0.92, 0.48),
+    ):
+        top = max(0, int(y_a))
+        bottom = min(h, int(y_b))
+        x0 = max(rx0, int(w * x_a))
         if bottom - top < 40:
             continue
-        _add(img[top:bottom, x0:w], float(top), float(x0))
+        _add(img[top:bottom, x0:rx1], float(top), float(x0))
+    return out
+
+
+def _looks_like_notes_header_text(text: str) -> bool:
+    t = " ".join((text or "").lower().split()).strip(":.")
+    return t in {"notes", "hotes", "hote"} or t.startswith(("notes", "hotes"))
+
+
+def _prepare_cdm_header_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    """TERMINAL ID / BRANCH：DATE-TIME 行右侧与银行名下方。"""
+    h, w = img.shape[:2]
+    rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
+    out: List[tuple] = []
+    seen = set()
+
+    def _add(crop, top: float, left: float) -> None:
+        if crop is None or crop.size == 0:
+            return
+        key = (int(top) // 12, int(left) // 12, crop.shape[0] // 12)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append((crop, float(top), float(left)))
+
+    y_date = min(_anchor_ys(lines, ["date"]), default=None)
+    y_time = min(_anchor_ys(lines, ["time", "tiwe"]), default=None)
+    y_trace = min(_anchor_ys(lines, ["trace"]), default=None)
+    y0 = min(v for v in (y_date, y_time) if v is not None) if (y_date or y_time) else h * 0.22
+    y1 = y_trace if y_trace is not None else y0 + h * 0.12
+    # TERMINAL 在 TIME 右侧（诊断裁 term）；上扩避免切掉 TERMINAL 标签
+    x_term = int(w * 0.42)
+    for ya, yb, xa in (
+        (y0 - 100, y1 + 40, x_term),
+        (y0 - 140, y1 + 80, int(w * 0.38)),
+        (max(0, y0 - h * 0.10), min(h, y1 + 20), int(w * 0.40)),
+        (max(0, y0 - h * 0.08), y0 + 40, rx0),  # BRANCH 在 DATE 上方
+        (h * 0.12, h * 0.32, rx0),
+        (h * 0.15, h * 0.36, int(w * 0.40)),
+    ):
+        top = max(0, int(ya))
+        bottom = min(h, int(yb))
+        left = max(rx0, int(xa))
+        if bottom - top < 40:
+            continue
+        _add(img[top:bottom, left:rx1], float(top), float(left))
     return out
 
 
@@ -503,10 +597,15 @@ def _cdm_band_prep_variants(crop_img: np.ndarray) -> List[np.ndarray]:
     blur = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
     sharp = cv2.addWeighted(enhanced, 1.6, blur, -0.6, 0)
     out.append(sharp)
+    # 折痕断裂：横向闭运算把断开笔画粘回（ACCOUNT / 11,400）
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
+    closed = cv2.morphologyEx(sharp, cv2.MORPH_CLOSE, h_kernel, iterations=1)
+    out.append(closed)
     binary = cv2.adaptiveThreshold(
         enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
     )
     out.append(binary)
+    out.append(cv2.morphologyEx(binary, cv2.MORPH_CLOSE, h_kernel, iterations=1))
     _, otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     out.append(otsu)
     kernel = np.ones((2, 2), np.uint8)
@@ -569,6 +668,40 @@ def _ocr_cdm_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
             for scale in scales:
                 found = dedup_lines(found + _run(prep, top, left, scale))
                 if _has_cdm_deposit_amount_text(found):
+                    return found
+    return found
+
+
+def _has_cdm_terminal_text(lines: List[OcrLine]) -> bool:
+    blob = " ".join(ln.text for ln in lines)
+    if re.search(r"(?i)terminal", blob):
+        return True
+    return any(
+        re.fullmatch(r"[A-Z]{1,3}[A-Z0-9]{5,12}", ln.text.strip().upper())
+        for ln in lines
+    )
+
+
+def _ocr_cdm_header_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
+    """复检 TERMINAL ID / BRANCH。"""
+    found: List[OcrLine] = []
+
+    def _run(crop_img: np.ndarray, top: float, left: float, scale: float) -> List[OcrLine]:
+        work = crop_img
+        if scale != 1.0:
+            work = cv2.resize(
+                crop_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+            )
+        raw = engine.recognize(work)
+        return _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
+
+    for crop, top, left in _prepare_cdm_header_band_crops(img, lines):
+        for prep in _cdm_band_prep_variants(crop):
+            for scale in (1.5, 2.0, 2.5, 3.0):
+                found = dedup_lines(found + _run(prep, top, left, scale))
+                if _has_cdm_terminal_text(found) and any(
+                    re.search(r"(?i)\bbr\b", ln.text) for ln in found
+                ):
                     return found
     return found
 
@@ -856,6 +989,21 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
             probe = dedup_lines(unique + extras)
             probe_result = extract(probe, include_lines=False)
             if not _cdm_missing_deposit_amount(probe_result):
+                unique = probe
+                result = extract(unique, include_lines=include_lines)
+                break
+        else:
+            if extras:
+                unique = dedup_lines(unique + extras)
+                result = extract(unique, include_lines=include_lines)
+    # CDM TERMINAL ID / BRANCH：并排表头右侧与网点行常漏
+    if _cdm_missing_header_fields(result):
+        extras = []
+        for name in ("color_raw", "enhanced", "color"):
+            extras.extend(_ocr_cdm_header_band(_engine, _variant_img(variants, name), unique))
+            probe = dedup_lines(unique + extras)
+            probe_result = extract(probe, include_lines=False)
+            if not _cdm_missing_header_fields(probe_result):
                 unique = probe
                 result = extract(unique, include_lines=include_lines)
                 break

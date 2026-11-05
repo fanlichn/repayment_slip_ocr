@@ -7,8 +7,10 @@ from app.ocr_engine import OcrLine
 from repayment_slip_ocr.main import (
     _anchor_scale_y,
     _cdm_account_digits_weak,
+    _has_cdm_deposit_amount_text,
     _prepare_cdm_amount_band_crops,
     _prepare_cdm_band_crops,
+    _prepare_cdm_header_band_crops,
 )
 
 
@@ -81,3 +83,59 @@ def test_kalutara_rotated_roi_covers_account_digits():
     )
     assert _cdm_account_digits_weak("00109696")
     assert not _cdm_account_digits_weak("1001096962")
+
+
+def test_nawalapi_sparse_crops_cover_party_amount_terminal():
+    """NAWALAPI 折痕稀疏 OCR：裁窗须覆盖 ACCOUNT(~2000)/11400(~3350)/TERMINAL(~1300)。"""
+    lines = [
+        _lr("DATE", 500, 1238, 682, 1320),
+        _lr("TIME", 981, 1211, 1157, 1305),
+        _lr("08:03", 983, 1287, 1193, 1381),
+        _lr("TRACE", 513, 1461, 734, 1554),
+        _lr("3528", 999, 1429, 1183, 1523),
+        _lr("TRANSACTION", 533, 1697, 997, 1787),
+        _lr("CARDL", 1148, 1682, 1356, 1732),
+        _lr("NOTES", 608, 2880, 830, 2966),
+        _lr("VALUE", 979, 2843, 1198, 2937),
+        _lr("AMOUNT", 1873, 2770, 2131, 2864),
+        _lr("4", 836, 3032, 881, 3097),
+        _lr("100.00", 1238, 2988, 1493, 3069),
+        _lr("400.00", 1888, 2933, 2156, 3022),
+        _lr("1", 839, 3118, 889, 3181),
+        _lr("1.000.00", 1813, 3023, 2160, 3112),
+        _lr("2", 847, 3200, 890, 3264),
+        _lr("LKR", 1412, 3303, 1566, 3394),
+    ]
+    img = np.zeros((4096, 3072, 3), dtype=np.uint8)
+    party = _prepare_cdm_band_crops(img, lines)
+    assert party
+    assert any(top <= 2000 <= top + crop.shape[0] for crop, top, _ in party)
+    assert any(top <= 2200 <= top + crop.shape[0] for crop, top, _ in party)
+    # 中间带不得过宽带进右手背景
+    assert all(left + crop.shape[1] < 2800 for crop, top, left in party[:8])
+
+    amt = _prepare_cdm_amount_band_crops(img, lines)
+    assert amt
+    assert any(
+        top <= 3350 <= top + crop.shape[0] and left <= 1900 <= left + crop.shape[1]
+        for crop, top, left in amt
+    )
+    assert any(
+        top <= 3100 <= top + crop.shape[0] and left >= 1500
+        for crop, top, left in amt
+    )
+
+    hdr = _prepare_cdm_header_band_crops(img, lines)
+    assert hdr
+    assert any(
+        top <= 1300 <= top + crop.shape[0] and left <= 1600 <= left + crop.shape[1]
+        for crop, top, left in hdr
+    )
+
+    # 仅有面额 10000 不得早停；须见到非面额总额
+    assert not _has_cdm_deposit_amount_text(
+        [_lr("10,000.00", 1813, 3023, 2160, 3112), _lr("400.00", 1888, 2933, 2156, 3022)]
+    )
+    assert _has_cdm_deposit_amount_text(
+        [_lr("11,400.00", 1700, 3344, 2100, 3376), _lr("10,000.00", 1813, 3023, 2160, 3112)]
+    )

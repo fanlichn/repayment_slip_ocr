@@ -501,6 +501,57 @@ def _is_transaction_type(low: str) -> bool:
     return any(k in low for k in ("cardless", "withdrawal", "transfer", "cheque", "cash "))
 
 
+_KNOWN_LABEL_COMPACT = frozenset(
+    {
+        "narration",
+        "mobileno",
+        "accountnumber",
+        "accountno",
+        "customername",
+        "sourceoffunds",
+        "depositamount",
+        "transaction",
+        "transactionstatus",
+        "terminalid",
+        "trace",
+        "date",
+        "time",
+        "notes",
+        "value",
+        "amount",
+        "remarks",
+        "branch",
+        "status",
+    }
+)
+
+
+def _is_near_known_label(value: str) -> bool:
+    """识别 OCR 残缺/串字标签：IARRATION、IOBILE NO、IT AMOUNT、NSACTION STATUS 等。"""
+    compact = _norm_label(value)
+    if not compact or len(compact) < 4:
+        return False
+    if compact in _KNOWN_LABEL_COMPACT:
+        return True
+    for lab in _KNOWN_LABEL_COMPACT:
+        if len(lab) < 4:
+            continue
+        # 前缀 1–2 个噪点字母：iarration / iobileno / itamount
+        if compact.endswith(lab) and 0 < len(compact) - len(lab) <= 2:
+            return True
+        # 截断标签：nsactionstatus / erminalid / ranaction
+        if lab.endswith(compact) and 0 < len(lab) - len(compact) <= 3:
+            return True
+        if abs(len(compact) - len(lab)) > 2:
+            continue
+        # 少量替换：iobileno ↔ mobileno
+        mismatch = sum(1 for a, b in zip(compact, lab) if a != b)
+        mismatch += abs(len(compact) - len(lab))
+        if mismatch <= 2:
+            return True
+    return False
+
+
 def _looks_like_label_text(value: str) -> bool:
     """某些标签后紧跟的其实是另一个标签（如账户行 "Account No 138200..." 里
     "account" 匹配后得到 "no 138200..."）。此处用于剔除明显是标签残留的取值。"""
@@ -510,6 +561,8 @@ def _looks_like_label_text(value: str) -> bool:
         return True
     if all(w in _FIELD_WORDS for w in words):
         return True  # 整值只由字段词组成，如 "Reference Number"
+    if _is_near_known_label(value):
+        return True
     for token in ("no", "no.", "name", "number", "bank", "ref", "amount", "date"):
         if low == token or low.startswith(token + " "):
             rest = low[len(token):].strip(" .:：")
@@ -3017,6 +3070,16 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
             fields[key] = found
         elif key in fields and not _is_plausible_cdm_field_value(key, fields[key]):
             fields.pop(key, None)
+    # 空字段 OCR 残片：NARRATION/MOBILE 读成 IARRATION: / IOBILE NO.: 时清空
+    for blank_key in ("NARRATION", "MOBILE NO.", "SOURCE OF FUNDS", "CUSTOMER NAME"):
+        val = fields.get(blank_key)
+        if val is None:
+            continue
+        if _looks_like_label_text(val) or not _clean(val) or _clean(val) in {":", "-", "–", "—"}:
+            fields.pop(blank_key, None)
+    rem = fields.get("Remarks")
+    if rem and _looks_like_label_text(rem):
+        fields.pop("Remarks", None)
     # DEPOSIT AMOUNT：仅丢掉「账号当金额」这类明显错值，不从面额表臆造总额
     dep = fields.get("DEPOSIT AMOUNT")
     if dep:
@@ -3598,8 +3661,19 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         elif dt:
             fields["Date & Time"] = dt.replace("T", " ")
     # Remarks 兜底：结构化字段已提取但 fields 无 Remarks 时补上（如 People's Pay 占位标签下一行值）
-    if references.remarks and not any("remark" in k.lower() for k in fields):
+    if (
+        references.remarks
+        and not _looks_like_label_text(references.remarks)
+        and not any("remark" in k.lower() for k in fields)
+    ):
         fields["Remarks"] = references.remarks
+    # CDM 空 NARRATION 常被写成 Remarks；标签残片不得作为备注
+    if fields.get("NARRATION") and _looks_like_label_text(fields["NARRATION"]):
+        fields.pop("NARRATION", None)
+    if fields.get("Remarks") and _looks_like_label_text(fields["Remarks"]):
+        fields.pop("Remarks", None)
+    if fields.get("NARRATION") and not any("remark" in k.lower() for k in fields):
+        fields["Remarks"] = fields["NARRATION"]
     # 时间字段统一成 24 小时制（YYYY-MM-DD HH:MM:SS），去掉 AM/PM 与点号分隔
     for k in list(fields.keys()):
         if k in ("TIME",):

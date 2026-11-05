@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
+import cv2
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
@@ -96,42 +99,87 @@ def _cdm_missing_party_fields(result) -> bool:
     return not fields.get("ACCOUNT NUMBER") or not fields.get("CUSTOMER NAME")
 
 
-def _anchor_y(lines: List[OcrLine], patterns: List[str]) -> Optional[float]:
+def _anchor_ys(lines: List[OcrLine], patterns: List[str]) -> List[float]:
+    hits: List[float] = []
     for ln in lines:
         low = ln.text.lower()
         if any(p in low for p in patterns):
-            return _line_center_y(ln.box)
-    return None
+            hits.append(_line_center_y(ln.box))
+    return hits
 
 
-def _offset_ocr_lines(lines: List[OcrLine], dy: float, dx: float = 0.0) -> List[OcrLine]:
+def _offset_ocr_lines(lines: List[OcrLine], dy: float, dx: float = 0.0, scale: float = 1.0) -> List[OcrLine]:
     out: List[OcrLine] = []
+    inv = 1.0 / scale if scale else 1.0
     for ln in lines:
-        box = [[p[0] + dx, p[1] + dy] for p in ln.box]
+        box = [[p[0] * inv + dx, p[1] * inv + dy] for p in ln.box]
         out.append(OcrLine(text=ln.text, confidence=ln.confidence, box=box))
     return out
 
 
 def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
-    """对 CDM 的 TRANSACTION~NARRATION/NOTES 中间带二次 OCR，补账号/户名。"""
+    """对 CDM 的 TRANSACTION~NARRATION/NOTES 中间带二次 OCR，补账号/户名。
+
+    优先用未纠偏原图（调用方传入 color_raw）：手持倾角纠偏常把中间账号行拉没。
+    中间带过矮或仍空时放大再识一次。
+    """
     h, w = img.shape[:2]
-    y0 = _anchor_y(lines, ["cardless", "transaction"])
-    y1 = _anchor_y(lines, ["narration", "mobile", "source of funds", "notes", "value"])
+    y0_hits = _anchor_ys(lines, ["cardless", "transaction"])
+    y1_hits = _anchor_ys(lines, ["narration", "mobile", "source of funds", "notes", "value"])
+    y0 = min(y0_hits) if y0_hits else None
+    # 取 TRANSACTION 下方最近的下界锚点，避免 NOTES 表头把带拉得过宽
+    y1 = None
+    if y0 is not None and y1_hits:
+        below = [y for y in y1_hits if y > y0 + 40]
+        y1 = min(below) if below else min(y1_hits)
+    elif y1_hits:
+        y1 = min(y1_hits)
     if y0 is None or y1 is None or y1 <= y0 + 60:
-        y0 = h * 0.30
-        y1 = h * 0.58
-    pad = int(h * 0.02)
+        y0 = h * 0.28
+        y1 = h * 0.62
+    pad = int(h * 0.03)
     top = max(0, int(y0) - pad)
     bottom = min(h, int(y1) + pad)
     if bottom - top < 50:
         return []
-    # 左手拇指常挡左侧标签，右半+中间更易读出账号/户名
-    left = int(w * 0.05)
+    # 左侧拇指常挡标签首字母，但账号数字在中右；保留少量左边距
+    left = max(0, int(w * 0.02))
     crop = img[top:bottom, left:w]
     if crop.size == 0:
         return []
-    raw = engine.recognize(crop)
-    return _offset_ocr_lines(raw, dy=float(top), dx=float(left))
+
+    def _run(crop_img: np.ndarray, scale: float) -> List[OcrLine]:
+        work = crop_img
+        if scale != 1.0:
+            work = cv2.resize(
+                crop_img,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC,
+            )
+        raw = engine.recognize(work)
+        return _offset_ocr_lines(raw, dy=float(top), dx=float(left), scale=scale)
+
+    found = _run(crop, 1.0)
+    # 仍看不到账号/户名关键词时，放大中间带再识
+    blob = " ".join(ln.text.lower() for ln in found)
+    has_party = (
+        "account" in blob
+        or "customer" in blob
+        or re.search(r"\d{8,}", blob) is not None
+        or re.search(r"[a-z]{3,}\s+[a-z]{3,}", blob) is not None
+    )
+    if not has_party:
+        found = dedup_lines(found + _run(crop, 1.8))
+    return found
+
+
+def _variant_img(variants: List[dict], name: str):
+    for v in variants:
+        if v.get("name") == name:
+            return v["img"]
+    return variants[0]["img"]
 
 
 def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
@@ -148,14 +196,24 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     unique = dedup_lines(lines)
 
     result = extract(unique, include_lines=False)
-    # CDM 中间段（ACCOUNT/CUSTOMER）易被拇指/倾角漏检：对中间带复检一次
+    # CDM 中间段（ACCOUNT/CUSTOMER）易被拇指/倾角漏检：对中间带复检
     if _cdm_missing_party_fields(result):
-        extra = _ocr_cdm_party_band(_engine, variants[0]["img"], unique)
-        if extra:
-            unique = dedup_lines(unique + extra)
-            result = extract(unique, include_lines=include_lines)
-        elif include_lines:
-            result = extract(unique, include_lines=True)
+        # 先未纠偏原图，再 enhanced；纠偏色图常把中间行读丢
+        extras: List[OcrLine] = []
+        for name in ("color_raw", "enhanced", "color"):
+            extras.extend(_ocr_cdm_party_band(_engine, _variant_img(variants, name), unique))
+            probe = dedup_lines(unique + extras)
+            probe_result = extract(probe, include_lines=False)
+            if not _cdm_missing_party_fields(probe_result):
+                unique = probe
+                result = extract(unique, include_lines=include_lines)
+                break
+        else:
+            if extras:
+                unique = dedup_lines(unique + extras)
+                result = extract(unique, include_lines=include_lines)
+            elif include_lines:
+                result = extract(unique, include_lines=True)
     elif include_lines:
         result = extract(unique, include_lines=True)
 

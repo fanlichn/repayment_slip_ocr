@@ -1391,6 +1391,46 @@ def test_cdm_branch_split_ekala_crm_br():
     assert r.amount == 5000.0
 
 
+def test_cdm_empty_narration_not_label_echo_and_midband_party():
+    """EKALA CDM：空 NARRATION/MOBILE 的 OCR 残片 IARRATION/IOBILE 不得当值；
+    中间带补回的 ACCOUNT/CUSTOMER 应写入 fields。"""
+    lines = [
+        _lr("EKALA-CRM1", 440, 657, 831, 754),
+        _lr("BR", 988, 665, 1082, 755),
+        _lr("DATE", 27, 886, 210, 968),
+        _lr("30/10/26", 25, 962, 376, 1068),
+        _lr("TIME", 518, 894, 700, 989),
+        _lr("11:37", 518, 985, 732, 1062),
+        _lr("TERMINAL ID", 954, 903, 1395, 981),
+        _lr("REKALAO1HT", 949, 981, 1354, 1054),
+        _lr("TRACE", 35, 1121, 260, 1227),
+        _lr("9950", 526, 1140, 700, 1221),
+        _lr("TRANSACTION", 58, 1376, 509, 1449),
+        _lr(": CARDLESS DEPOSIT", 566, 1368, 1324, 1446),
+        # 首轮漏读账号/户名；中间带复检补回（模拟）
+        _lr("ACCOUNT NUMBER: 1001096962", 58, 1500, 900, 1560),
+        _lr("CUSTOMER NAME :LAK ARTHA SERVICES", 58, 1680, 1100, 1740),
+        _lr("NARRATION:", 62, 1914, 463, 1991, 0.996),
+        _lr("IARRATION:", 99, 1927, 456, 1990, 0.953),
+        _lr("MOBILE NO. :", 66, 2146, 507, 2224, 0.987),
+        _lr("IOBILE NO.:", 100, 2157, 507, 2225, 0.899),
+        _lr("SOURCE OF FUNDS:UNKNOWN", 58, 2300, 700, 2360),
+        _lr("DEPOSIT AMOUNT:", 339, 2842, 683, 2915),
+        _lr("LKR 5,000.00", 834, 2829, 1200, 2915),
+        _lr("TRANSACTION STATUS : SUCCESSFUL", 325, 3006, 1453, 3079),
+    ]
+    r = extract(lines)
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+    assert r.fields["CUSTOMER NAME"] == "LAK ARTHA SERVICES"
+    assert r.fields.get("NARRATION") in (None, "", "-")
+    assert r.fields.get("MOBILE NO.") in (None, "", "-", "–", "—")
+    assert r.fields.get("Remarks") in (None, "", "-")
+    assert "IARRATION" not in str(r.fields.get("NARRATION") or "")
+    assert "IOBILE" not in str(r.fields.get("MOBILE NO.") or "")
+    assert "5,000.00" in str(r.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
+    assert r.amount == 5000.0
+
+
 def test_peoples_pay_sinhala_positional_fields():
     """僧伽罗语 People's Pay：英文 Pay from/to 标签缺失，按 People's Bank/Commercial Bank 锚点提取。"""
     lines = [

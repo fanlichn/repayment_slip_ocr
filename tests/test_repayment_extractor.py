@@ -1742,6 +1742,51 @@ def test_boc_app_transaction_successful():
     assert r.fields["Date & Time"] == "2026-08-10 18:45:00"
 
 
+def test_boc_mobile_txn_details_rotated_phone():
+    """竖拍 BOC 手机 Transaction Details：值在标签上方同列，不得把下一标签当值。"""
+    lines = [
+        _lr("2026.11.01", 2967, 1369, 3157, 1414, 0.999),
+        _lr("Receiver's Bank", 1000, 974, 1047, 1254, 0.999),
+        _lr("Sender's Account No", 1383, 878, 1430, 1241, 0.999),
+        _lr("Bank of Ceylon", 1807, 208, 1864, 508, 0.999),
+        _lr("Sender's Name", 1594, 960, 1641, 1232, 0.999),
+        _lr("Remarks", 1971, 1063, 2017, 1219, 0.999),
+        _lr("1001096962", 763, 184, 819, 428, 0.999),
+        _lr("Sender's Bank Name", 1797, 867, 1844, 1228, 0.999),
+        _lr("5,000.00", 502, 441, 622, 885, 0.999),
+        _lr("Fees & Charges", 2151, 947, 2197, 1219, 0.999),
+        _lr("Commercial Bank", 973, 187, 1029, 550, 0.999),
+        _lr("LKR 25.00", 2181, 215, 2227, 409, 0.995),
+        _lr("Receiver's Account No", 789, 853, 840, 1261, 0.992),
+        _lr("kumara", 1627, 209, 1673, 376, 0.991),
+        _lr("Fees&Charges", 2148, 944, 2204, 1219, 0.990),
+        _lr("Receiver's Name", 1193, 942, 1240, 1244, 0.985),
+        _lr("bathme wadanage ruwan chamara", 1577, 206, 1624, 865, 0.981),
+        _lr("deepika priyadarshani", 1994, 212, 2047, 637, 0.979),
+        _lr("Lak Artha pvt Itd", 1176, 197, 1236, 534, 0.961),
+        _lr("LKR", 543, 845, 607, 990, 0.960),
+        _lr("90********00", 1377, 199, 1433, 431, 0.881),
+        _lr("00********6", 1377, 199, 1433, 431, 0.833),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "boc"
+    assert r.fields["Receiver's Account No"] == "1001096962"
+    assert r.fields["Receiver's Bank"] == "Commercial Bank"
+    assert r.fields["Receiver's Name"] == "Lak Artha (Pvt) Ltd"
+    assert r.fields["Sender's Name"] == "bathme wadanage ruwan chamara kumara"
+    assert r.fields["Sender's Bank Name"] == "Bank of Ceylon"
+    assert r.fields["Remarks"] == "deepika priyadarshani"
+    assert r.fields["Fees & Charges"] == "LKR 25.00"
+    assert r.fields["Sender's Name"] != "Sender's Account No"
+    assert r.fields["Remarks"] != "Fees&Charges"
+    assert r.fields["Sender's Account No"] == "90********00"
+    assert r.amount == 5000.0
+    assert r.fee == 25.0
+    assert r.payee.account == "1001096962"
+    assert r.payer.name == "bathme wadanage ruwan chamara kumara"
+
+
 def test_boc_flex_fund_transfer():
     """BOC Flex 网页版转账回执：Transaction Details + Sender/Beneficiary A/C Details 分区，
     单行 "Label : Value" 格式，应完整提取所有字段（含两个不同的 Account Number / Account No）。"""

@@ -211,6 +211,104 @@ def _value_after_label(line_text: str, label: str) -> Optional[str]:
     return value or None
 
 
+def _value_line_above(idx: int, lines, label_line):
+    """取标签正上方同列最近的值行（竖拍手机截图：原左值转到标签上方）。"""
+    tall = _is_tall_box(label_line.box)
+    label_top = min(p[1] for p in label_line.box)
+    base_y = label_top if tall else _line_center_y(label_line.box)
+    label_left = min(p[0] for p in label_line.box)
+    label_cx = _line_center_x(label_line.box)
+    best = None
+    for j, other in enumerate(lines):
+        if j == idx:
+            continue
+        text = other.text.strip()
+        if not text or _looks_like_label_text(text):
+            continue
+        other_bottom = max(p[1] for p in other.box)
+        y = _line_center_y(other.box)
+        other_left = min(p[0] for p in other.box)
+        other_cx = _line_center_x(other.box)
+        if tall:
+            dy = base_y - other_bottom
+            # 竖拍手机 UI 标签与值纵向间距常 400–600px
+            if dy < -40 or dy > 700:
+                continue
+            dy = max(dy, 0.0) + 0.01
+        else:
+            dy = base_y - y
+            if dy <= 2 or dy > 180:
+                continue
+        dx = min(abs(other_left - label_left), abs(other_cx - label_cx))
+        if dx >= 140:
+            continue
+        score = (dy, dx)
+        if best is None or score < best[0]:
+            best = (score, other)
+    return best[1] if best else None
+
+
+def _value_above(idx: int, lines, label_line) -> Optional[str]:
+    """取标签正上方最近的值行文本。"""
+    ln = _value_line_above(idx, lines, label_line)
+    return _clean(ln.text) if ln else None
+
+
+def _merge_x_adjacent_fragments(lines, seed_line, wanted_norms: set) -> str:
+    """竖排 OCR 把长姓名拆成左右相邻碎片时，按 x 拼回同一值。"""
+    sy0 = min(p[1] for p in seed_line.box)
+    sy1 = max(p[1] for p in seed_line.box)
+    seed_h = max(sy1 - sy0, 1.0)
+    cands = []
+    for other in lines:
+        text = other.text.strip()
+        if not text or _looks_like_label_text(text):
+            continue
+        if _norm_label(text) in wanted_norms:
+            continue
+        oy0 = min(p[1] for p in other.box)
+        oy1 = max(p[1] for p in other.box)
+        overlap = max(0.0, min(sy1, oy1) - max(sy0, oy0))
+        if overlap < 0.25 * min(seed_h, max(oy1 - oy0, 1.0)):
+            continue
+        cands.append(other)
+    if not cands:
+        return _clean(seed_line.text)
+    # 同框 OCR 变体（掩码账号 90***/00***）只留置信度最高者，避免拼成两串
+    cands.sort(
+        key=lambda ln: (
+            -float(getattr(ln, "confidence", 0.0) or 0.0),
+            _line_center_x(ln.box),
+        )
+    )
+    unique = []
+    for ln in cands:
+        cx, cy = _line_center_x(ln.box), _line_center_y(ln.box)
+        if any(abs(cx - _line_center_x(u.box)) < 35 and abs(cy - _line_center_y(u.box)) < 35 for u in unique):
+            continue
+        unique.append(ln)
+    cands = sorted(unique, key=lambda ln: (_line_center_x(ln.box), _line_center_y(ln.box)))
+    xs = [_line_center_x(ln.box) for ln in cands]
+    seed_i = next((i for i, ln in enumerate(cands) if ln is seed_line), None)
+    if seed_i is None:
+        seed_i = min(
+            range(len(cands)),
+            key=lambda i: abs(xs[i] - _line_center_x(seed_line.box)),
+        )
+    lo = hi = seed_i
+    while lo > 0 and xs[lo] - xs[lo - 1] < 90:
+        lo -= 1
+    while hi + 1 < len(cands) and xs[hi + 1] - xs[hi] < 90:
+        hi += 1
+    parts = [_clean(ln.text) for ln in cands[lo : hi + 1] if _clean(ln.text)]
+    out = []
+    for p in parts:
+        if out and _norm_label(out[-1]) == _norm_label(p):
+            continue
+        out.append(p)
+    return " ".join(out)
+
+
 def _value_below(idx: int, lines, label_line) -> Optional[str]:
     """取标签正下方最近的值行。
 
@@ -522,6 +620,18 @@ _KNOWN_LABEL_COMPACT = frozenset(
         "remarks",
         "branch",
         "status",
+        "receiversaccountno",
+        "receiversaccountnumber",
+        "receiversbank",
+        "receiversname",
+        "sendersaccountno",
+        "sendersaccountnumber",
+        "sendersname",
+        "sendersbank",
+        "sendersbankname",
+        "feescharges",
+        "feesandcharges",
+        "feecharges",
     }
 )
 
@@ -555,13 +665,23 @@ def _is_near_known_label(value: str) -> bool:
 def _looks_like_label_text(value: str) -> bool:
     """某些标签后紧跟的其实是另一个标签（如账户行 "Account No 138200..." 里
     "account" 匹配后得到 "no 138200..."）。此处用于剔除明显是标签残留的取值。"""
-    low = value.lower()
-    words = [w for w in re.split(r"[\s:：.\-]+", low) if w]
+    low = value.lower().strip()
+    words = [w for w in re.split(r"[\s:：.\-&]+", low) if w]
     if not words:
         return True
     if all(w in _FIELD_WORDS for w in words):
         return True  # 整值只由字段词组成，如 "Reference Number"
     if _is_near_known_label(value):
+        return True
+    # BOC/NSB 等：整行就是下一字段标题（Sender's Account No / Fees & Charges）
+    if re.match(
+        r"(?i)^(sender|receiver|beneficiary)'?s?\s+(account|name|bank)\b",
+        low,
+    ):
+        return True
+    if re.match(r"(?i)^fees?\s*&?\s*charges?$", low.replace(" ", "")) or re.match(
+        r"(?i)^fees?\s*&?\s*charges?$", low
+    ):
         return True
     for token in ("no", "no.", "name", "number", "bank", "ref", "amount", "date"):
         if low == token or low.startswith(token + " "):
@@ -760,6 +880,8 @@ def _extract_parties(lines, bank: Optional[str] = None) -> tuple[PartyOut, Party
         return _extract_peoples_bank_parties(lines)
     if bank == "union_bank":
         return _extract_union_ubgo_parties(lines)
+    if _is_boc_mobile_txn_details(lines):
+        return _extract_boc_mobile_txn_parties(lines)
     if _is_boc_app(lines):
         return _extract_boc_app_parties(lines)
     if _is_cash_deposit(lines):
@@ -1725,6 +1847,18 @@ def _is_boc_flex(lines) -> bool:
     return any(m in full for m in _BOC_FLEX_MARKERS)
 
 
+def _is_boc_mobile_txn_details(lines) -> bool:
+    """BOC 手机银行 Transaction Details：Receiver's/Sender's Account No + Fees & Charges。"""
+    norms = {_norm_label(ln.text) for ln in lines}
+    has_recv = any(n.startswith("receivers") for n in norms)
+    has_send = any(n.startswith("senders") for n in norms)
+    has_fees = any("feescharge" in n or n in {"feescharges", "feesandcharges"} for n in norms)
+    if not (has_recv and has_send):
+        return False
+    full = " ".join(ln.text for ln in lines).lower()
+    return "bank of ceylon" in full or has_fees or "remarks" in norms
+
+
 _CDM_MARKERS = ("cardless deposit",)
 _CDM_HEADER_NORMS = {"date", "time", "terminalid", "trace", "depositamount"}
 
@@ -2393,6 +2527,25 @@ def _extract_boc_app_parties(lines) -> tuple[PartyOut, PartyOut]:
     return payer, payee
 
 
+def _extract_boc_mobile_txn_parties(lines) -> tuple[PartyOut, PartyOut]:
+    """BOC 手机 Transaction Details：Receiver's* / Sender's* 扁平字段回填收付款方。"""
+    payer, payee = PartyOut(), PartyOut()
+    fields = _build_label_fields(lines, _BOC_MOBILE_TXN_LABELS)
+    payee.account = fields.get("Receiver's Account No")
+    payee.bank = fields.get("Receiver's Bank")
+    payee.name = fields.get("Receiver's Name")
+    payer.account = fields.get("Sender's Account No")
+    payer.name = fields.get("Sender's Name")
+    payer.bank = fields.get("Sender's Bank Name") or "Bank of Ceylon"
+    if payee.name:
+        compact = re.sub(r"[^a-z]", "", payee.name.lower())
+        if "lakartha" in compact:
+            payee.name = "Lak Artha (Pvt) Ltd"
+    payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+    return payer, payee
+
+
 _PEOPLES_BANK_LABELS = (
     "Bank",
     "Account No",
@@ -2564,6 +2717,18 @@ _BOC_FLEX_LABELS = (
     "Beneficiary Bank",
 )
 
+# BOC 手机 App Transaction Details（竖拍常见）：Receiver/Sender 字段 + Fees & Charges
+_BOC_MOBILE_TXN_LABELS = (
+    "Receiver's Account No",
+    "Receiver's Bank",
+    "Receiver's Name",
+    "Sender's Account No",
+    "Sender's Name",
+    "Sender's Bank Name",
+    "Remarks",
+    "Fees & Charges",
+)
+
 _CDM_LABELS = (
     "TRANSACTION",
     "ACCOUNT NUMBER",
@@ -2695,13 +2860,23 @@ def _build_label_fields(lines, labels, same_row: bool = False) -> dict:
         tall = _is_tall_box(ln.box)
         value = None
         if adjacent_header:
-            if not same_row:
+            # 并排表头默认取下方（CDM DATE/TIME）。竖拍手机 UI 值在标签上方。
+            if not same_row and tall:
+                above_ln = _value_line_above(i, ordered, ln)
+                if above_ln is not None and _norm_label(above_ln.text) not in wanted:
+                    merged = _merge_x_adjacent_fragments(ordered, above_ln, set(wanted))
+                    value = _accept_amountish(key, merged) if merged else None
+            if value is None and not same_row:
                 value = _accept_below_value(key, _value_below(i, ordered, ln) or "")
         elif tall:
-            # 竖拍：先左侧（DATE/TIME/TERMINAL）。TIME 同带右侧真值须先于正下方，
-            # 否则 DATE 列误读（01:11.26）会抢走 19:11。TRACE/STATUS 仍可走下方。
+            # 竖拍：先左侧（CDM DATE/TIME/TERMINAL）。TIME 同带右侧真值须先于正下方。
+            # 手机竖拍 UI（BOC Transaction Details）原左值转到标签正上方，above 先于 below。
             left = _value_line_to_left(i, ordered, ln)
-            if left is not None and _norm_label(left.text) not in wanted:
+            if (
+                left is not None
+                and _norm_label(left.text) not in wanted
+                and not _looks_like_label_text(left.text)
+            ):
                 value = _accept_side_value(key, ln, left)
             prefer_right_before_below = _norm_label(key) == "time"
             if value is None and not same_row and prefer_right_before_below:
@@ -2714,6 +2889,11 @@ def _build_label_fields(lines, labels, same_row: bool = False) -> dict:
                     value = _accept_side_value(key, ln, cand)
                     if value:
                         break
+            if value is None and not same_row:
+                above_ln = _value_line_above(i, ordered, ln)
+                if above_ln is not None and _norm_label(above_ln.text) not in wanted:
+                    merged = _merge_x_adjacent_fragments(ordered, above_ln, set(wanted))
+                    value = _accept_amountish(key, merged) if merged else None
             if value is None and not same_row:
                 value = _accept_below_value(key, _value_below(i, ordered, ln) or "")
             if value is None and not same_row and not prefer_right_before_below:
@@ -3464,7 +3644,9 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         success = False
         warnings.append("上传图片不是银行交易凭证，请上传银行还款截图")
 
-    if _is_boc_smartpay(lines):
+    if _is_boc_mobile_txn_details(lines):
+        field_labels = _BOC_MOBILE_TXN_LABELS
+    elif _is_boc_smartpay(lines):
         field_labels = _BOC_SMARTPAY_LABELS
     elif _is_boc_app(lines):
         field_labels = _BOC_APP_LABELS
@@ -3587,6 +3769,76 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
                 m = re.search(r"(?i)\bLKR\s*([\d,]+(?:\.\d{2})?)", ln.text)
                 if m:
                     fields["Amount"] = f"LKR {m.group(1)}"
+                    break
+    elif _is_boc_mobile_txn_details(lines):
+        fields = _build_label_fields(lines, _BOC_MOBILE_TXN_LABELS)
+        # 顶部大额为转账金额；Fees & Charges 为手续费（勿把 25 当成主金额）
+        fee_v = fields.get("Fees & Charges")
+        if fee_v:
+            parsed_fee = _parse_money(fee_v)
+            if parsed_fee is not None:
+                fee = parsed_fee
+        hero_amounts = []
+        for ln in lines:
+            if _looks_like_label_text(ln.text):
+                continue
+            low = ln.text.lower()
+            if "fee" in low or "charge" in low:
+                continue
+            # 只要带币种或千分位+两位小数的金额；排除日期 2026.11.01 / 账号
+            if re.fullmatch(r"\d{4}[./\-]\d{1,2}[./\-]\d{1,2}", ln.text.strip()):
+                continue
+            if not re.search(r"(?i)\blkr\b", ln.text) and not re.search(
+                r"\d{1,3}(?:,\d{3})+\.\d{2}|\d+\.\d{2}", ln.text
+            ):
+                continue
+            if re.fullmatch(r"\d{8,}", re.sub(r"\s", "", ln.text)):
+                continue
+            m = _parse_money(ln.text)
+            if m is not None and m >= 100:
+                hero_amounts.append(m)
+        if hero_amounts:
+            # 主金额取最大；若最大就是手续费则退而求其次
+            hero_amounts.sort(reverse=True)
+            for cand in hero_amounts:
+                if fee is not None and abs(cand - fee) < 0.01:
+                    continue
+                amount = cand
+                break
+            if amount is not None:
+                fields.setdefault("Transfer Amount", f"LKR {amount:,.2f}")
+        if fee is not None and amount is not None:
+            total = amount + fee
+        # 结构化收付款方以扁平字段为准（竖拍时通用分区易串位）
+        if fields.get("Receiver's Account No"):
+            payee.account = fields["Receiver's Account No"]
+        if fields.get("Receiver's Bank"):
+            payee.bank = fields["Receiver's Bank"]
+        if fields.get("Receiver's Name"):
+            raw_name = fields["Receiver's Name"]
+            compact = re.sub(r"[^a-z]", "", raw_name.lower())
+            payee.name = "Lak Artha (Pvt) Ltd" if "lakartha" in compact else raw_name
+            fields["Receiver's Name"] = payee.name
+        if fields.get("Sender's Account No"):
+            payer.account = fields["Sender's Account No"]
+        if fields.get("Sender's Name"):
+            payer.name = fields["Sender's Name"]
+        if fields.get("Sender's Bank Name"):
+            payer.bank = fields["Sender's Bank Name"]
+        elif not payer.bank:
+            payer.bank = "Bank of Ceylon"
+        payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+        payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+        if amount is not None or payee.account or fields.get("Remarks"):
+            success = True
+        # 日期常在截图角落：2026.11.01
+        if not any("date" in k.lower() for k in fields):
+            for ln in lines:
+                if re.fullmatch(r"\d{4}[./\-]\d{1,2}[./\-]\d{1,2}", ln.text.strip()):
+                    fields["Date"] = ln.text.strip().replace(".", "-")
+                    parsed_dt = _parse_datetime(fields["Date"])
+                    if parsed_dt:
+                        dt = parsed_dt
                     break
     elif _is_boc_smartpay(lines):
         fields = _build_label_fields(lines, _BOC_SMARTPAY_LABELS)

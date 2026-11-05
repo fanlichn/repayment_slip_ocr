@@ -595,6 +595,50 @@ def test_cdm_incomplete_notes_table_should_not_invent_amount():
     assert r.deposit_breakdown == []
 
 
+def test_peoples_otp_acknowledgement_status_reference():
+    """People's OTP 成功回执页：Status/Reference/From/Beneficiary 标签在上值在下。"""
+    lines = [
+        _lr("PEOPLE'S", 525, 114, 842, 169),
+        _lr("BANK", 525, 167, 684, 217),
+        _lr("One Time Transfer", 271, 267, 857, 322),
+        _lr("ACKNOWLEDGEMENT", 274, 481, 926, 536),
+        _lr("Status", 49, 564, 228, 611),
+        _lr("Successful", 55, 636, 352, 695),
+        _lr("Reference Number", 58, 747, 537, 803),
+        _lr("2610302087625086", 58, 831, 614, 886),
+        _lr("From Account", 55, 945, 421, 1000),
+        _lr("LKR 055-2-001-2-3595355", 55, 1028, 802, 1083),
+        _lr("Payment Option", 58, 1142, 470, 1197),
+        _lr("LANKAPAY - ONLINE", 55, 1222, 638, 1278),
+        _lr("Beneficiary Account Bank", 61, 1339, 718, 1386),
+        _lr("7056 - Commercial Bank PLC", 61, 1417, 860, 1472),
+        _lr("Beneficiary Branch Name", 58, 1531, 710, 1586),
+        _lr("00000 - Head Office", 58, 1611, 606, 1667),
+        _lr("Beneficiary Account Number", 58, 1722, 793, 1781),
+        _lr("1001096962", 58, 1803, 407, 1867),
+        _lr("Beneficiary Name", 55, 1917, 517, 1981),
+        _lr("LAK ARTHA SERVICES PVT LTD", 58, 2006, 897, 2053),
+        _lr("MAKE ANOTHER TRANSFER", 214, 2409, 984, 2467),
+    ]
+    r = extract(lines)
+
+    assert r.bank == "peoples_bank"
+    assert r.fields["Status"] == "Successful"
+    assert r.fields["Reference Number"] == "2610302087625086"
+    assert r.fields["Payment Reference"] == "2610302087625086"
+    assert r.fields["From Account"] == "LKR 055-2-001-2-3595355"
+    assert r.fields["Payment Option"] == "LANKAPAY - ONLINE"
+    assert r.fields["Beneficiary Account Bank"] == "7056 - Commercial Bank PLC"
+    assert r.fields["Beneficiary Branch Name"] == "00000 - Head Office"
+    assert r.fields["Beneficiary Account Number"] == "1001096962"
+    assert r.fields["Beneficiary Name"] == "LAK ARTHA SERVICES PVT LTD"
+    assert "Payer Bank" not in r.fields
+    # 账号行不能被解析成金额
+    assert r.amount is None
+    assert r.payee.account == "1001096962"
+    assert r.payee.bank == "Commercial Bank PLC"
+
+
 def test_cdm_deposit_amcunt_ocr_typo_and_amount_backfill():
     """CDM：DEPOSIT AMCUNT 拼写损坏仍应匹配；有可靠金额时回填 DEPOSIT AMOUNT。"""
     lines = [

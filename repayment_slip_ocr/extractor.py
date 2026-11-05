@@ -157,6 +157,9 @@ def _parse_money(s: str) -> Optional[float]:
     # OCR 把币种词 LKR 读成 "1.KR"、"1KR" 等：短数字+点/无点+字母，不是金额
     if re.match(r"^\s*\d{1,2}\.?[A-Za-z]{1,3}\s*$", s):
         return None
+    # 账号形态（如 "LKR 055-2-001-2-3595355"）不能当金额
+    if re.search(r"\d+-\d+-\d+", s):
+        return None
     # OCR 常在千分位逗号后插入空格（如 "5, 000.00"），先去掉数字间空格
     s = re.sub(r"(?<=\d)[,\s]+(?=\d)", ",", s)
     s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
@@ -1533,15 +1536,28 @@ _PEOPLES_OTP_MARKERS = (
     "transfer description",
     "debit amount",
     "beneficiary mobile number",
+    "one time transfer",
+    "reference number",
+    "beneficiary account number",
+    "payment option",
 )
 
 
 def _is_peoples_otp(lines) -> bool:
-    """People's Bank "One Time Transfer" 确认回执（ACKNOWLEDGEMENT），标签在上、值在下。"""
+    """People's Bank "One Time Transfer" 确认回执（ACKNOWLEDGEMENT），标签在上、值在下。
+
+    有两版：带 Transfer Amount/Debit 的金额确认页，以及带 Status/Reference Number
+    的成功回执页。后者 OCR 常把 Beneficiary Mobile Number 读坏，不能只靠它判定。
+    """
     full = " ".join(ln.text for ln in lines).lower()
     if "acknowledgement" not in full:
         return False
-    return any(m in full for m in _PEOPLES_OTP_MARKERS[1:])
+    if any(m in full for m in ("transfer description", "debit amount", "beneficiary mobile number")):
+        return True
+    return "one time transfer" in full and any(
+        m in full
+        for m in ("reference number", "beneficiary account number", "payment option", "from account")
+    )
 
 
 _BOC_FLEX_MARKERS = (
@@ -2049,6 +2065,12 @@ _PEOPLES_BANK_LABELS = (
 
 # People's Bank "One Time Transfer" 确认回执（ACKNOWLEDGEMENT）：标签在上、值在下。
 _PEOPLES_OTP_LABELS = (
+    "Status",
+    "Reference Number",
+    "From Account",
+    "Payment Option",
+    "Beneficiary Account Bank",
+    "Beneficiary Branch Name",
     "Beneficiary Account Number",
     "Beneficiary Name",
     "Email Address",
@@ -2726,6 +2748,25 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         fields = _build_ipay_fields(lines)
     elif _is_peoples_otp(lines):
         fields = _build_label_fields(lines, _PEOPLES_OTP_LABELS)
+        # 结构化付款/收款方：OTP 页无 Pay from/to 分区，从扁平字段回填
+        if not payee.account and fields.get("Beneficiary Account Number"):
+            payee.account = _account_token(fields["Beneficiary Account Number"]) or fields[
+                "Beneficiary Account Number"
+            ].strip()
+        if not payee.name and fields.get("Beneficiary Name"):
+            payee.name = fields["Beneficiary Name"]
+        if not payee.bank and fields.get("Beneficiary Account Bank"):
+            payee.bank = re.sub(r"^\d+\s*-\s*", "", fields["Beneficiary Account Bank"]).strip()
+        if not payer.account and fields.get("From Account"):
+            payer.account = fields["From Account"].strip()
+        payer.account_prefix, payer.account_last4 = _derive_account_parts(payer.account)
+        payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+        if amount is None and fields.get("Transfer Amount"):
+            amount = _parse_money(fields["Transfer Amount"])
+        if not success and (
+            payee.account or payee.name or fields.get("Reference Number") or fields.get("Status")
+        ):
+            success = True
     elif bank == "peoples_bank":
         fields = _build_peoples_pay_fields(lines, payer, payee)
     elif doc_type == "e_receipt":

@@ -3188,6 +3188,82 @@ def _pick_cdm_typed_near(idx: int, ordered, label_line, key: str) -> Optional[st
     return best[1] if best else None
 
 
+def _recover_cdm_account_number(lines) -> Optional[str]:
+    """CDM 漏读 ACCOUNT 标签时：取 TRANSACTION~NARRATION 之间的 8–14 位账号。"""
+    ordered = _sorted_by_y(lines)
+    y0 = None
+    y1 = None
+    for ln in ordered:
+        low = ln.text.lower()
+        if y0 is None and ("cardless" in low or _norm_label(ln.text) in {"transaction", "ransaction"}):
+            y0 = _line_center_y(ln.box)
+        if y0 is not None and y1 is None and any(
+            k in low for k in ("narration", "mobile", "source of funds", "notes")
+        ):
+            y1 = _line_center_y(ln.box)
+    best = None
+    for ln in ordered:
+        cy = _line_center_y(ln.box)
+        if y0 is not None and cy < y0 - 20:
+            continue
+        if y1 is not None and cy > y1 + 20:
+            continue
+        # 同行或整行账号
+        for m in re.finditer(r"(?<!\d)(\d{8,14})(?!\d)", ln.text):
+            acct = m.group(1)
+            # 排除面额/金额碎片
+            if acct in {"500000", "100000", "200000", "1000000"}:
+                continue
+            conf = float(getattr(ln, "confidence", 0.0) or 0.0)
+            if best is None or conf > best[0]:
+                best = (conf, acct)
+        if re.search(r"(?i)account", ln.text):
+            tok = _account_token(_value_after_label(ln.text, "account number") or "")
+            if not tok:
+                tok = _account_token(ln.text)
+            if tok and (best is None or len(tok) >= 8):
+                return tok
+    return best[1] if best else None
+
+
+def _recover_cdm_customer_name(lines) -> Optional[str]:
+    """CDM 漏读 CUSTOMER NAME 标签时：中间带人名/机构名兜底。"""
+    ordered = _sorted_by_y(lines)
+    y0 = y1 = None
+    for ln in ordered:
+        low = ln.text.lower()
+        if y0 is None and ("cardless" in low or _norm_label(ln.text) in {"transaction", "ransaction"}):
+            y0 = _line_center_y(ln.box)
+        if y0 is not None and y1 is None and any(
+            k in low for k in ("narration", "mobile", "source of funds", "notes")
+        ):
+            y1 = _line_center_y(ln.box)
+    for ln in ordered:
+        cy = _line_center_y(ln.box)
+        if y0 is not None and cy < y0 - 20:
+            continue
+        if y1 is not None and cy > y1 + 20:
+            continue
+        text = ln.text.strip()
+        if re.search(r"(?i)customer\s*name", text):
+            inline = _value_after_label(text, "customer name")
+            if inline and not _looks_like_label_text(inline):
+                return _clean(inline)
+        low = text.lower()
+        if any(k in low for k in ("account", "transaction", "cardless", "narration", "mobile", "source")):
+            continue
+        if _looks_like_label_text(text) or re.search(r"\d{5,}", text):
+            continue
+        letters = re.findall(r"[A-Za-z]{2,}", text)
+        if len(letters) >= 2:
+            name = _clean(text)
+            compact = re.sub(r"[^a-z]", "", name.lower())
+            if "lakartha" in compact:
+                return "LAK ARTHA SERVICES" if "service" in compact or "lak" in low else name
+            return name
+    return None
+
+
 def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
     """纠正竖拍/串列导致的 CDM DATE/TIME/TERMINAL/TRACE/ACCOUNT 等错绑。"""
     typed_keys = (
@@ -3859,6 +3935,20 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             fields["ACCOUNT NUMBER"] = payee.account
         if not fields.get("CUSTOMER NAME") and payee.name:
             fields["CUSTOMER NAME"] = payee.name
+        # 中间带补检后：无标签时从纯数字行/户名行兜底
+        if not fields.get("ACCOUNT NUMBER"):
+            recovered_acct = _recover_cdm_account_number(lines)
+            if recovered_acct:
+                fields["ACCOUNT NUMBER"] = recovered_acct
+                if not payee.account:
+                    payee.account = recovered_acct
+                    payee.account_prefix, payee.account_last4 = _derive_account_parts(payee.account)
+        if not fields.get("CUSTOMER NAME"):
+            recovered_name = _recover_cdm_customer_name(lines)
+            if recovered_name:
+                fields["CUSTOMER NAME"] = recovered_name
+                if not payee.name:
+                    payee.name = recovered_name
         if branch:
             fields.setdefault("BRANCH", branch)
         if not fields.get("DEPOSIT AMOUNT") and amount is not None:

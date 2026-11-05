@@ -117,38 +117,81 @@ def _offset_ocr_lines(lines: List[OcrLine], dy: float, dx: float = 0.0, scale: f
     return out
 
 
-def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
-    """对 CDM 的 TRANSACTION~NARRATION/NOTES 中间带二次 OCR，补账号/户名。
+def _line_max_y(lines: List[OcrLine]) -> float:
+    ys = [max(p[1] for p in ln.box) for ln in lines if ln.box]
+    return max(ys) if ys else 1.0
 
-    优先用未纠偏原图（调用方传入 color_raw）：手持倾角纠偏常把中间账号行拉没。
-    中间带过矮或仍空时放大再识一次。
+
+def _has_cdm_party_text(lines: List[OcrLine]) -> bool:
+    """是否已读到账号/户名（不能把 CARDLESS DEPOSIT 误判为已有 party）。"""
+    blob = " ".join(ln.text.lower() for ln in lines)
+    if "account" in blob or "customer" in blob or "acc0unt" in blob:
+        return True
+    return re.search(r"(?<!\d)\d{8,14}(?!\d)", blob) is not None
+
+
+def _prepare_cdm_band_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    """生成若干中间带裁剪：(crop, top, left)。
+
+    行框可能来自纠偏后的其它 variant，需按当前图高做比例映射；
+    并收紧到 TRANSACTION 与 NARRATION 之间，避免只读到 CARDLESS 就停。
     """
     h, w = img.shape[:2]
+    ref_h = max(_line_max_y(lines), float(h))
+    scale_y = h / ref_h
+
     y0_hits = _anchor_ys(lines, ["cardless", "transaction"])
     y1_hits = _anchor_ys(lines, ["narration", "mobile", "source of funds", "notes", "value"])
-    y0 = min(y0_hits) if y0_hits else None
-    # 取 TRANSACTION 下方最近的下界锚点，避免 NOTES 表头把带拉得过宽
+    y0 = min(y0_hits) * scale_y if y0_hits else None
     y1 = None
     if y0 is not None and y1_hits:
-        below = [y for y in y1_hits if y > y0 + 40]
-        y1 = min(below) if below else min(y1_hits)
+        below = [y * scale_y for y in y1_hits if y * scale_y > y0 + 40]
+        y1 = min(below) if below else min(y1_hits) * scale_y
     elif y1_hits:
-        y1 = min(y1_hits)
-    if y0 is None or y1 is None or y1 <= y0 + 60:
-        y0 = h * 0.28
-        y1 = h * 0.62
-    pad = int(h * 0.03)
-    top = max(0, int(y0) - pad)
-    bottom = min(h, int(y1) + pad)
-    if bottom - top < 50:
-        return []
-    # 左侧拇指常挡标签首字母，但账号数字在中右；保留少量左边距
-    left = max(0, int(w * 0.02))
-    crop = img[top:bottom, left:w]
-    if crop.size == 0:
-        return []
+        y1 = min(y1_hits) * scale_y
 
-    def _run(crop_img: np.ndarray, scale: float) -> List[OcrLine]:
+    windows: List[tuple] = []
+    if y0 is not None and y1 is not None and y1 > y0 + 60:
+        # 略缩进：跳过 TRANSACTION 行本身，聚焦 ACCOUNT/CUSTOMER
+        span = y1 - y0
+        windows.append((y0 + span * 0.12, y1 - span * 0.08))
+        windows.append((y0 - h * 0.01, y1 + h * 0.01))
+    # 固定比例兜底（手持 CDM 账号常在中上部）
+    windows.extend(
+        [
+            (h * 0.32, h * 0.50),
+            (h * 0.28, h * 0.55),
+            (h * 0.35, h * 0.48),
+        ]
+    )
+
+    left = max(0, int(w * 0.01))
+    out: List[tuple] = []
+    seen = set()
+    for y_a, y_b in windows:
+        top = max(0, int(y_a))
+        bottom = min(h, int(y_b))
+        if bottom - top < 40:
+            continue
+        key = (top // 20, bottom // 20)
+        if key in seen:
+            continue
+        seen.add(key)
+        crop = img[top:bottom, left:w]
+        if crop.size == 0:
+            continue
+        out.append((crop, float(top), float(left)))
+    return out
+
+
+def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
+    """对 CDM 的 TRANSACTION~NARRATION 中间带二次 OCR，补账号/户名。
+
+    多窗口 + CLAHE/放大：首轮常只能读到 CARDLESS，必须在未见账号数字时继续加强。
+    """
+    found: List[OcrLine] = []
+
+    def _run(crop_img: np.ndarray, top: float, left: float, scale: float) -> List[OcrLine]:
         work = crop_img
         if scale != 1.0:
             work = cv2.resize(
@@ -159,19 +202,31 @@ def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
                 interpolation=cv2.INTER_CUBIC,
             )
         raw = engine.recognize(work)
-        return _offset_ocr_lines(raw, dy=float(top), dx=float(left), scale=scale)
+        return _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
 
-    found = _run(crop, 1.0)
-    # 仍看不到账号/户名关键词时，放大中间带再识
-    blob = " ".join(ln.text.lower() for ln in found)
-    has_party = (
-        "account" in blob
-        or "customer" in blob
-        or re.search(r"\d{8,}", blob) is not None
-        or re.search(r"[a-z]{3,}\s+[a-z]{3,}", blob) is not None
-    )
-    if not has_party:
-        found = dedup_lines(found + _run(crop, 1.8))
+    def _variants(crop_img: np.ndarray) -> List[np.ndarray]:
+        out = [crop_img]
+        if len(crop_img.shape) == 3:
+            gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = crop_img
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        out.append(enhanced)
+        binary = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
+        )
+        out.append(binary)
+        return out
+
+    for crop, top, left in _prepare_cdm_band_crops(img, lines):
+        for prep in _variants(crop):
+            found = dedup_lines(found + _run(prep, top, left, 1.0))
+            if _has_cdm_party_text(found):
+                return found
+            found = dedup_lines(found + _run(prep, top, left, 2.0))
+            if _has_cdm_party_text(found):
+                return found
     return found
 
 

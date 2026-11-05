@@ -1431,6 +1431,35 @@ def test_cdm_empty_narration_not_label_echo_and_midband_party():
     assert r.amount == 5000.0
 
 
+def test_cdm_recover_account_without_label_from_midband_digits():
+    """EKALA：首轮完全漏掉 ACCOUNT/CUSTOMER 标签，中间带只补出纯数字与户名行。"""
+    lines = [
+        _lr("DATE", 27, 886, 210, 968),
+        _lr("30/10/26", 25, 962, 376, 1068),
+        _lr("TIME", 518, 894, 700, 989),
+        _lr("11:37", 518, 985, 732, 1062),
+        _lr("TERMINAL ID", 954, 903, 1395, 981),
+        _lr("REKALAO1HT", 949, 981, 1354, 1054),
+        _lr("TRACE", 35, 1121, 260, 1227),
+        _lr("9950", 526, 1140, 700, 1221),
+        _lr("TRANSACTION", 58, 1376, 509, 1449),
+        _lr(": CARDLESS DEPOSIT", 566, 1368, 1324, 1446),
+        # 无标签，仅中间带数字/户名
+        _lr("1001096962", 400, 1520, 900, 1580, 0.99),
+        _lr("LAK ARTHA SERVICES", 60, 1680, 900, 1740, 0.95),
+        _lr("NARRATION:", 62, 1914, 463, 1991),
+        _lr("IARRATION:", 99, 1927, 456, 1990, 0.95),
+        _lr("DEPOSIT AMOUNT:", 339, 2842, 683, 2915),
+        _lr("LKR 5,000.00", 834, 2829, 1200, 2915),
+        _lr("TRANSACTION STATUS : SUCCESSFUL", 325, 3006, 1453, 3079),
+    ]
+    r = extract(lines)
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+    assert "LAK ARTHA" in r.fields["CUSTOMER NAME"].upper()
+    assert r.fields.get("NARRATION") in (None, "", "-")
+    assert r.amount == 5000.0
+
+
 def test_peoples_pay_sinhala_positional_fields():
     """僧伽罗语 People's Pay：英文 Pay from/to 标签缺失，按 People's Bank/Commercial Bank 锚点提取。"""
     lines = [

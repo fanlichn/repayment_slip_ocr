@@ -1702,6 +1702,31 @@ def _reliable_explicit_cdm_deposit_amount(lines) -> Optional[float]:
     return None
 
 
+def _cdm_deposit_amount_has_lkr(lines) -> bool:
+    """DEPOSIT AMOUNT 标签同行明确出现 LKR 时保留币种前缀。"""
+    ordered = _sorted_by_y(lines)
+    labels = [
+        ln for ln in ordered
+        if "depositamount" in _norm_label(ln.text)
+    ]
+    for label in labels:
+        if re.search(r"(?i)\blkr\b", label.text):
+            return True
+        label_cy = _line_center_y(label.box)
+        label_h = max(p[1] for p in label.box) - min(p[1] for p in label.box)
+        label_left = min(p[0] for p in label.box)
+        label_right = max(p[0] for p in label.box)
+        for other in ordered:
+            if not re.fullmatch(r"(?i)\s*lkr\s*", other.text):
+                continue
+            if abs(_line_center_y(other.box) - label_cy) > max(55.0, label_h * 1.5):
+                continue
+            other_cx = _line_center_x(other.box)
+            if other_cx >= label_left - 40 and other_cx <= label_right + 600:
+                return True
+    return False
+
+
 def _parse_denomination(s: str) -> Optional[float]:
     """解析纸币面额（VALUE 列），容忍 OCR 千分位分隔符的混合写法。
 
@@ -5101,12 +5126,17 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         # DEPOSIT AMOUNT：结构化总额优先；面额表面值（5000）被误填时用 10,200 覆盖
         if amount is not None:
             dep_amt = _parse_money(fields["DEPOSIT AMOUNT"]) if fields.get("DEPOSIT AMOUNT") else None
+            has_lkr = _cdm_deposit_amount_has_lkr(lines)
             if dep_amt is None or dep_amt < 100 or (
                 abs(dep_amt - amount) > 0.01
                 and _has_notes_value_table(lines)
                 and dep_amt in _COMMON_DENOMS
+            ) or (
+                has_lkr
+                and not re.match(r"(?i)^\s*lkr\b", str(fields.get("DEPOSIT AMOUNT") or ""))
             ):
-                fields["DEPOSIT AMOUNT"] = f"{amount:,.2f}"
+                prefix = "LKR " if has_lkr else ""
+                fields["DEPOSIT AMOUNT"] = f"{prefix}{amount:,.2f}"
             if fee is None:
                 total = amount
         elif fields.get("DEPOSIT AMOUNT"):

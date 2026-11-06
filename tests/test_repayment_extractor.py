@@ -250,7 +250,7 @@ def test_cdm_real_ocr_field_labels():
 
     assert r.doc_type == "cash_deposit_slip"
     assert r.fields["ACCOUNT NUMBER"] == "1001096962"
-    assert r.fields["DEPOSIT AMOUNT"] == "6,100.00"
+    assert r.fields["DEPOSIT AMOUNT"] == "LKR 6,100.00"
     assert r.fields["TRANSACTION"] == "CARDLESS DEPOSIT"
     assert r.fields["CUSTOMER NAME"] == "LAK ARTHA SERVICES"
     assert r.fields["SOURCE OF FUNDS"] == "UNKNOWN"
@@ -742,7 +742,7 @@ def test_cdm_deposit_amcunt_ocr_typo_and_amount_backfill():
         _lr("TRANSACTION STATUS SUCCESSFUL", 200, 2200, 900, 2250),
     ]
     r = extract(lines)
-    assert r.fields["DEPOSIT AMOUNT"] == "5,000.00"
+    assert r.fields["DEPOSIT AMOUNT"] == "LKR 5,000.00"
     assert r.amount == 5000.0
     assert r.fields["ACCOUNT NUMBER"] == "1001096962"
     assert r.fields["CUSTOMER NAME"] == "LAK ARTHA SERVICES"
@@ -1726,6 +1726,7 @@ def test_madawala_cdm_typed_fields_single_row_breakdown_and_rm_branch():
         L("LKR 5,000.00", 325, 415, 786),
         L("5,000.00", 470, 535, 795),
         L("DEPOSIT AMOUNT", 258, 365, 815),
+        L("LKR", 370, 392, 823),
         L("000.00", 395, 535, 823),  # 总额左侧数字被裁掉，完整明细可校验恢复
         L("TRANSACTION STATUS", 275, 410, 850),
         L("SUCCESSFUL", 430, 510, 850),
@@ -1740,7 +1741,7 @@ def test_madawala_cdm_typed_fields_single_row_breakdown_and_rm_branch():
     assert r.fields["NOTES"] == "1"
     assert r.fields["VALUE"] == "LKR 5,000.00"
     assert r.fields["AMOUNT"] == "5,000.00"
-    assert "5,000.00" in r.fields["DEPOSIT AMOUNT"]
+    assert r.fields["DEPOSIT AMOUNT"] == "LKR 5,000.00"
     assert r.fields["TRANSACTION STATUS"] == "SUCCESSFUL"
     assert len(r.deposit_breakdown) == 1
     assert r.deposit_breakdown[0].quantity == 1

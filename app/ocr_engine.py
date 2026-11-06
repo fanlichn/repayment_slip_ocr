@@ -5,9 +5,17 @@ optional Tesseract fallback. Both expose ``recognize(image) -> list[OcrLine]``.
 """
 from __future__ import annotations
 
+import gc
+import logging
 import threading
 from dataclasses import dataclass
 from typing import List
+
+import cv2
+import numpy as np
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,35 +29,92 @@ class PaddleOcrEngine:
     def __init__(self, settings):
         self._settings = settings
         self._ocr = None
-        self._lock = threading.Lock()
+        # Paddle Predictor 不是线程安全的。FastAPI 的同步 endpoint 会在线程池
+        # 并发调用同一个 engine，必须把初始化和整次推理都串行化。
+        self._lock = threading.RLock()
+
+    def _new_ocr(self):
+        from paddleocr import PaddleOCR
+
+        return PaddleOCR(
+            use_angle_cls=self._settings.paddle_use_angle_cls,
+            lang=self._settings.ocr_lang,
+            use_gpu=self._settings.paddle_use_gpu,
+            show_log=False,
+        )
 
     def _ensure(self):
         if self._ocr is None:
             with self._lock:
                 if self._ocr is None:
-                    from paddleocr import PaddleOCR
-
-                    self._ocr = PaddleOCR(
-                        use_angle_cls=self._settings.paddle_use_angle_cls,
-                        lang=self._settings.ocr_lang,
-                        use_gpu=self._settings.paddle_use_gpu,
-                        show_log=False,
-                    )
+                    self._ocr = self._new_ocr()
         return self._ocr
 
     def warmup(self):
         self._ensure()
 
+    @staticmethod
+    def _bounded_image(image, max_side: int = 3200, max_pixels: int = 8_000_000):
+        """限制 Paddle 输入，返回 ``(连续数组, 坐标恢复倍率)``。
+
+        高分辨率原图和 2.5x CDM 裁剪可超过 12MP，CPU oneDNN/Paddle 偶发
+        ``could not execute a primitive``。检测本身会缩放，预先限幅不会损失
+        实际检测分辨率；输出框再映射回原坐标。
+        """
+        arr = np.asarray(image)
+        if arr.ndim not in (2, 3) or arr.size == 0:
+            return np.ascontiguousarray(arr), 1.0
+        h, w = arr.shape[:2]
+        scale = min(
+            1.0,
+            max_side / max(h, w),
+            (max_pixels / float(h * w)) ** 0.5,
+        )
+        if scale < 0.999:
+            arr = cv2.resize(
+                arr,
+                (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        return np.ascontiguousarray(arr), (1.0 / scale if scale else 1.0)
+
+    def _run(self, ocr, image):
+        return ocr.ocr(image, cls=self._settings.paddle_use_angle_cls)
+
     def recognize(self, image) -> List[OcrLine]:
-        ocr = self._ensure()
-        result = ocr.ocr(image, cls=self._settings.paddle_use_angle_cls)
+        bounded, restore = self._bounded_image(image)
+        with self._lock:
+            ocr = self._ensure()
+            try:
+                result = self._run(ocr, bounded)
+            except RuntimeError as exc:
+                # oneDNN primitive/predictor 状态错误可污染当前实例。只对这一类
+                # 底层错误重建并重试一次；其它 RuntimeError 保留原堆栈。
+                if "could not execute a primitive" not in str(exc).lower():
+                    raise
+                logger.warning("Paddle primitive 执行失败，重建 predictor 后重试一次")
+                self._ocr = None
+                del ocr
+                gc.collect()
+                self._ocr = self._new_ocr()
+                result = self._run(self._ocr, bounded)
         lines: List[OcrLine] = []
         for page in result or []:
             if not page:
                 continue
             for item in page:
                 box, (text, conf) = item[0], item[1]
-                lines.append(OcrLine(text=text or "", confidence=float(conf), box=box))
+                mapped_box = [
+                    [float(point[0]) * restore, float(point[1]) * restore]
+                    for point in box
+                ]
+                lines.append(
+                    OcrLine(
+                        text=text or "",
+                        confidence=float(conf),
+                        box=mapped_box,
+                    )
+                )
         return lines
 
 

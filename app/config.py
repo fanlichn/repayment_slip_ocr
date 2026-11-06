@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     ocr_lang: str = "en"
     paddle_use_gpu: bool = False
     paddle_use_angle_cls: bool = True
+    # 0 表示保留 Paddle 默认值；生产环境应通过同机基准选择 1/2/4。
+    paddle_cpu_threads: int = 0
+    # None 表示保留 PaddleOCR 默认值。
+    paddle_enable_mkldnn: Optional[bool] = None
+    # 0 表示保留 OpenCV 默认线程设置。
+    opencv_threads: int = 0
+    # repayment 服务的二值 variant 使用轻量高斯降噪；false 可回滚到 NLM。
+    fast_preprocessing: bool = True
 
     # ---- NIC decoding ----
     # "literal": read day-of-year code literally (Jan 1 == day 001)
@@ -35,11 +43,18 @@ class Settings(BaseSettings):
     port: int = 8000
     max_upload_bytes: int = 15 * 1024 * 1024  # 15 MB
     workers: int = 2
+    # 单 worker 共享一个非线程安全 Paddle predictor；默认整请求串行，避免请求间
+    # 交错数十次推理并造成内存/尾延迟放大。多进程并发由 Uvicorn workers 提供。
+    ocr_max_concurrent_requests_per_worker: int = 1
 
     # ---- Remote image fetching (POST /ocr_url) ----
     url_fetch_timeout_seconds: float = 10.0
     # False: reject URLs resolving to private/loopback addresses (SSRF guard)
     url_fetch_allow_private_hosts: bool = False
+    # 仅向服务器日志写入分阶段耗时；不会改变 API JSON。
+    stage_timing_log: bool = False
+    # false 保留优化前 CDM 调用顺序，便于同版本 A/B 和紧急回滚。
+    cdm_adaptive_early_stop: bool = True
 
     # ---- 多语言姓名第二引擎（僧伽罗语/泰米尔语） ----
     # "none": 关闭；"tesseract": 用 Tesseract sin+tam 补充识别（需安装系统语言包）

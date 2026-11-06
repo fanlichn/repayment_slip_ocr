@@ -5076,13 +5076,26 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
     fields = _normalize_money_fields(fields)
     if _is_cash_deposit(lines) or (bank == "commercial_bank" and fields.get("DATE")):
         fields = _repair_cdm_typed_fields(fields, lines)
+        customer = fields.get("CUSTOMER NAME")
+        if customer and not _is_plausible_cdm_field_value(
+            "CUSTOMER NAME", str(customer)
+        ):
+            fields.pop("CUSTOMER NAME", None)
         fields = _synthesize_cdm_datetime_fields(fields)
+        if payee.name and not _is_plausible_cdm_field_value(
+            "CUSTOMER NAME", payee.name
+        ):
+            payee.name = None
         # OCR 常漏读 CARDLESS DEPOSIT / 账号 / 存款总额行，用已识别结构化结果回填
         if not fields.get("TRANSACTION") and _is_cash_deposit(lines):
             fields["TRANSACTION"] = "CARDLESS DEPOSIT"
         if not fields.get("ACCOUNT NUMBER") and payee.account:
             fields["ACCOUNT NUMBER"] = payee.account
-        if not fields.get("CUSTOMER NAME") and payee.name:
+        if (
+            not fields.get("CUSTOMER NAME")
+            and payee.name
+            and _is_plausible_cdm_field_value("CUSTOMER NAME", payee.name)
+        ):
             fields["CUSTOMER NAME"] = payee.name
         # 中间带补检后：无标签时从纯数字行/户名行兜底
         if not fields.get("ACCOUNT NUMBER"):
@@ -5102,7 +5115,12 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             recovered_name = _recover_cdm_customer_name(lines)
             if recovered_name:
                 fields["CUSTOMER NAME"] = recovered_name
-                if not payee.name:
+                if (
+                    not payee.name
+                    or not _is_plausible_cdm_field_value(
+                        "CUSTOMER NAME", payee.name
+                    )
+                ):
                     payee.name = recovered_name
         if branch:
             # 多候选时 _extract_branch 已优选；覆盖 OCR 串位网点

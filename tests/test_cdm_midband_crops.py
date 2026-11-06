@@ -22,6 +22,7 @@ from repayment_slip_ocr.main import (
     _prepare_cdm_header_band_crops,
     _priority_cdm_amount_crops,
     _priority_cdm_party_crops,
+    _run_cdm_direct_line_windows,
 )
 
 
@@ -31,6 +32,31 @@ def _lr(text: str, x0, y0, x1, y1) -> OcrLine:
         confidence=0.9,
         box=[[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
     )
+
+
+def test_direct_line_windows_can_run_one_prep_then_fallback():
+    class Engine:
+        def __init__(self):
+            self.calls = 0
+
+        def recognize_line(self, image):
+            self.calls += 1
+            return []
+
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    window = [(10, 20, 190, 80)]
+
+    raw_engine = Engine()
+    _run_cdm_direct_line_windows(
+        raw_engine, image, window, prep_indices=(0,)
+    )
+    assert raw_engine.calls == 1
+
+    fallback_engine = Engine()
+    _run_cdm_direct_line_windows(
+        fallback_engine, image, window, prep_indices=(0, 1)
+    )
+    assert fallback_engine.calls == 2
 
 
 def test_anchor_scale_ignores_bottom_margin():

@@ -8,9 +8,10 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -20,7 +21,17 @@ from pydantic import BaseModel
 from app.config import get_settings
 from app.logging_setup import setup_logging
 from app.ocr_engine import OcrLine, create_engine
-from app.preprocessing import build_variants, load_image
+from app.preprocessing import (
+    build_binarized_variant,
+    build_variants,
+    load_image,
+)
+from app.stage_timing import (
+    current_operation,
+    operation,
+    request_timing,
+    stage,
+)
 from app.url_fetch import UrlFetchError, fetch_image_bytes
 
 from .extractor import (
@@ -37,14 +48,19 @@ from .extractor import (
 setup_logging("repayment_ocr")
 
 _engine = None
+_ocr_request_slots = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _engine
+    global _engine, _ocr_request_slots
     settings = get_settings()
     _engine = create_engine(settings)
     _engine.warmup()
+    limit = max(
+        1, int(settings.ocr_max_concurrent_requests_per_worker or 1)
+    )
+    _ocr_request_slots = threading.BoundedSemaphore(limit)
     yield
 
 
@@ -651,25 +667,33 @@ def _run_cdm_band_ocr(
     left: float,
     scales: tuple,
     heavy: bool = False,
+    stop_when: Optional[Callable[[List[OcrLine]], bool]] = None,
 ) -> List[OcrLine]:
     found: List[OcrLine] = []
     crop_img, top, left = _pad_crop_for_ocr(crop_img, top, left)
-    for prep in _cdm_band_prep_variants(crop_img, heavy=heavy):
-        for scale in scales:
-            work = prep
-            if scale != 1.0:
-                work = cv2.resize(
-                    prep, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+    parent_operation = current_operation()
+    with operation(f"{parent_operation}:band"):
+        for prep in _cdm_band_prep_variants(crop_img, heavy=heavy):
+            for scale in scales:
+                work = prep
+                if scale != 1.0:
+                    work = cv2.resize(
+                        prep, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+                    )
+                raw = engine.recognize(work)
+                found = dedup_lines(
+                    found + _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
                 )
-            raw = engine.recognize(work)
-            found = dedup_lines(
-                found + _offset_ocr_lines(raw, dy=top, dx=left, scale=scale)
-            )
+                if stop_when is not None and stop_when(found):
+                    return found
     return found
 
 
 def _run_cdm_direct_line_windows(
-    engine, img: np.ndarray, windows: List[tuple]
+    engine,
+    img: np.ndarray,
+    windows: List[tuple],
+    prep_indices: tuple = (0, 1),
 ) -> List[OcrLine]:
     """对已知单行窗口跳过 detector，直接调用 Paddle recognition model。"""
     recognize_line = getattr(engine, "recognize_line", None)
@@ -677,26 +701,31 @@ def _run_cdm_direct_line_windows(
         return []
     h, w = img.shape[:2]
     found: List[OcrLine] = []
-    for x0, y0, x1, y1 in windows:
-        left, right = max(0, int(x0)), min(w, int(x1))
-        top, bottom = max(0, int(y0)), min(h, int(y1))
-        if right - left < 40 or bottom - top < 24:
-            continue
-        crop = img[top:bottom, left:right]
-        if crop.size == 0:
-            continue
-        # recognition-only 不需要 detector 的大白边；小图大 padding 会把 10px 字体压得更小。
-        line_pad = max(2, min(16, int(crop.shape[0] * 0.12)))
-        padded, ptop, pleft = _pad_crop_for_ocr(
-            crop, top, left, pad=line_pad
-        )
-        # 原图与 CLAHE 各直读一次；检测器路径再负责其它增强，避免过多调用。
-        preps = _cdm_band_prep_variants(padded, heavy=False)[:2]
-        for prep in preps:
-            raw = recognize_line(prep)
-            found = dedup_lines(
-                found + _offset_ocr_lines(raw, dy=ptop, dx=pleft, scale=1.0)
+    parent_operation = current_operation()
+    with operation(f"{parent_operation}:direct"):
+        for x0, y0, x1, y1 in windows:
+            left, right = max(0, int(x0)), min(w, int(x1))
+            top, bottom = max(0, int(y0)), min(h, int(y1))
+            if right - left < 40 or bottom - top < 24:
+                continue
+            crop = img[top:bottom, left:right]
+            if crop.size == 0:
+                continue
+            # recognition-only 不需要 detector 的大白边；小图大 padding 会把 10px 字体压得更小。
+            line_pad = max(2, min(16, int(crop.shape[0] * 0.12)))
+            padded, ptop, pleft = _pad_crop_for_ocr(
+                crop, top, left, pad=line_pad
             )
+            # 原图与 CLAHE 各直读一次；检测器路径再负责其它增强，避免过多调用。
+            preps = _cdm_band_prep_variants(padded, heavy=False)[:2]
+            for prep_index in prep_indices:
+                if prep_index >= len(preps):
+                    continue
+                prep = preps[prep_index]
+                raw = recognize_line(prep)
+                found = dedup_lines(
+                    found + _offset_ocr_lines(raw, dy=ptop, dx=pleft, scale=1.0)
+                )
     return found
 
 
@@ -948,21 +977,56 @@ def _priority_cdm_amount_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tu
     return out
 
 
-def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
-    """对 CDM 的 TRANSACTION~NARRATION 中间带二次 OCR，补账号/户名。"""
+def _probe_cdm_result(
+    base_lines: List[OcrLine], extras: List[OcrLine], pass_name: str
+):
+    probe = dedup_lines(base_lines + extras)
+    with stage("field_extraction", pass_name=pass_name, line_count=len(probe)):
+        return extract(probe, include_lines=False)
+
+
+def _cdm_amount_fields_complete(
+    base_lines: List[OcrLine], extras: List[OcrLine]
+) -> bool:
+    result = _probe_cdm_result(base_lines, extras, "cdm_amount_early_stop")
+    if _cdm_missing_deposit_amount(result):
+        return False
+    headers = {
+        (
+            "notes"
+            if _looks_like_notes_header_text(
+                ln.text.strip().lower().rstrip(": .")
+            )
+            else ln.text.strip().lower().rstrip(": .")
+        )
+        for ln in base_lines
+    }
+    if {"notes", "value", "amount"}.issubset(headers):
+        fields = result.fields or {}
+        return (
+            bool(result.deposit_breakdown)
+            and all(fields.get(key) for key in ("NOTES", "VALUE", "AMOUNT"))
+        )
+    return True
+
+
+def _ocr_cdm_party_band_legacy(
+    engine, img: np.ndarray, lines: List[OcrLine]
+) -> List[OcrLine]:
     found = _run_cdm_direct_line_windows(
         engine, img, _cdm_party_direct_windows(img, lines)
     )
     if _has_strong_cdm_account(found):
         return found
-    # 1) 中高优先裁 + 轻量预处理（原先细条×重预处理把账号跑丢且极慢）
     for crop, top, left in _priority_cdm_party_crops(img, lines):
         found = dedup_lines(
-            found + _run_cdm_band_ocr(engine, crop, top, left, (1.5, 2.0, 2.5))
+            found
+            + _run_cdm_band_ocr(
+                engine, crop, top, left, (1.5, 2.0, 2.5)
+            )
         )
         if _has_strong_cdm_account(found):
             return found
-    # 2) 细条/宽窗兜底，仍限轻量
     for crop, top, left in _prepare_cdm_band_crops(img, lines)[:10]:
         scales = (2.0, 2.5) if crop.shape[0] < 220 else (1.5, 2.0)
         found = dedup_lines(
@@ -970,20 +1034,27 @@ def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
         )
         if _has_strong_cdm_account(found):
             return found
-    # 3) 仍无账号时对优先裁加重预处理一次
     if not _has_strong_cdm_account(found):
         for crop, top, left in _priority_cdm_party_crops(img, lines)[:2]:
             found = dedup_lines(
                 found
-                + _run_cdm_band_ocr(engine, crop, top, left, (2.0, 2.5), heavy=True)
+                + _run_cdm_band_ocr(
+                    engine,
+                    crop,
+                    top,
+                    left,
+                    (2.0, 2.5),
+                    heavy=True,
+                )
             )
             if _has_strong_cdm_account(found):
                 return found
     return found
 
 
-def _ocr_cdm_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
-    """复检 CDM DEPOSIT AMOUNT / 面额表区域。"""
+def _ocr_cdm_amount_band_legacy(
+    engine, img: np.ndarray, lines: List[OcrLine]
+) -> List[OcrLine]:
     found = _run_cdm_direct_line_windows(
         engine,
         img,
@@ -994,13 +1065,17 @@ def _ocr_cdm_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
         return found
     for crop, top, left in _priority_cdm_amount_crops(img, lines):
         found = dedup_lines(
-            found + _run_cdm_band_ocr(engine, crop, top, left, (1.5, 2.0, 2.5))
+            found
+            + _run_cdm_band_ocr(
+                engine, crop, top, left, (1.5, 2.0, 2.5)
+            )
         )
         if _has_cdm_deposit_amount_text(found):
             return found
     for crop, top, left in _prepare_cdm_amount_band_crops(img, lines)[:8]:
         found = dedup_lines(
-            found + _run_cdm_band_ocr(engine, crop, top, left, (2.0, 2.5))
+            found
+            + _run_cdm_band_ocr(engine, crop, top, left, (2.0, 2.5))
         )
         if _has_cdm_deposit_amount_text(found):
             return found
@@ -1008,9 +1083,185 @@ def _ocr_cdm_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
         for crop, top, left in _priority_cdm_amount_crops(img, lines)[:2]:
             found = dedup_lines(
                 found
-                + _run_cdm_band_ocr(engine, crop, top, left, (2.0, 2.5), heavy=True)
+                + _run_cdm_band_ocr(
+                    engine,
+                    crop,
+                    top,
+                    left,
+                    (2.0, 2.5),
+                    heavy=True,
+                )
             )
             if _has_cdm_deposit_amount_text(found):
+                return found
+    return found
+
+
+def _ocr_cdm_header_band_legacy(
+    engine, img: np.ndarray, lines: List[OcrLine]
+) -> List[OcrLine]:
+    found = _run_cdm_direct_line_windows(
+        engine,
+        img,
+        _cdm_header_direct_windows(img, lines)
+        + _cdm_branch_direct_windows(img, lines),
+    )
+    if _has_cdm_terminal_text(found):
+        return found
+    for crop, top, left in _prepare_cdm_header_band_crops(img, lines)[:6]:
+        found = dedup_lines(
+            found
+            + _run_cdm_band_ocr(
+                engine, crop, top, left, (1.5, 2.0, 2.5)
+            )
+        )
+        if _has_cdm_terminal_text(found):
+            return found
+    return found
+
+
+def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
+    """对 CDM 的 TRANSACTION~NARRATION 中间带二次 OCR，补账号/户名。"""
+    if not get_settings().cdm_adaptive_early_stop:
+        return _ocr_cdm_party_band_legacy(engine, img, lines)
+    windows = _cdm_party_direct_windows(img, lines)
+    found = _run_cdm_direct_line_windows(
+        engine, img, windows, prep_indices=(0,)
+    )
+    if not _cdm_missing_party_fields(
+        _probe_cdm_result(lines, found, "cdm_party_direct_raw")
+    ):
+        return found
+    found = dedup_lines(
+        found
+        + _run_cdm_direct_line_windows(
+            engine, img, windows, prep_indices=(1,)
+        )
+    )
+    if not _cdm_missing_party_fields(
+        _probe_cdm_result(lines, found, "cdm_party_direct_clahe")
+    ):
+        return found
+    # 两种直读均未补齐户名时，沿用旧版“强账号即可停止”的门槛；
+    # 不为单个缺失字段触发数百次 detector OCR。
+    if _has_strong_cdm_account(found):
+        return found
+
+    def complete(extras: List[OcrLine]) -> bool:
+        return _has_strong_cdm_account(found + extras)
+
+    # 1) 中高优先裁 + 轻量预处理（原先细条×重预处理把账号跑丢且极慢）
+    for crop, top, left in _priority_cdm_party_crops(img, lines):
+        found = dedup_lines(
+            found
+            + _run_cdm_band_ocr(
+                engine,
+                crop,
+                top,
+                left,
+                (1.5, 2.0, 2.5),
+                stop_when=complete,
+            )
+        )
+        if complete([]):
+            return found
+    # 2) 细条/宽窗兜底，仍限轻量
+    for crop, top, left in _prepare_cdm_band_crops(img, lines)[:10]:
+        scales = (2.0, 2.5) if crop.shape[0] < 220 else (1.5, 2.0)
+        found = dedup_lines(
+            found
+            + _run_cdm_band_ocr(
+                engine, crop, top, left, scales, stop_when=complete
+            )
+        )
+        if complete([]):
+            return found
+    # 3) 仍无强账号时，对优先裁加重预处理一次
+    if not _has_strong_cdm_account(found):
+        for crop, top, left in _priority_cdm_party_crops(img, lines)[:2]:
+            found = dedup_lines(
+                found
+                + _run_cdm_band_ocr(
+                    engine,
+                    crop,
+                    top,
+                    left,
+                    (2.0, 2.5),
+                    heavy=True,
+                    stop_when=complete,
+                )
+            )
+            if complete([]):
+                return found
+    return found
+
+
+def _ocr_cdm_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
+    """复检 CDM DEPOSIT AMOUNT / 面额表区域。"""
+    if not get_settings().cdm_adaptive_early_stop:
+        return _ocr_cdm_amount_band_legacy(engine, img, lines)
+    windows = (
+        _cdm_amount_direct_windows(img, lines)
+        + _cdm_table_direct_windows(img, lines)
+    )
+    found = _run_cdm_direct_line_windows(
+        engine, img, windows, prep_indices=(0,)
+    )
+    if _cdm_amount_fields_complete(lines, found):
+        return found
+    found = dedup_lines(
+        found
+        + _run_cdm_direct_line_windows(
+            engine, img, windows, prep_indices=(1,)
+        )
+    )
+    if _cdm_amount_fields_complete(lines, found):
+        return found
+    # 完整表格未恢复时沿用旧版总额门槛，避免为了表格单元格进入重型风暴。
+    if _has_cdm_deposit_amount_text(found):
+        return found
+
+    def complete(extras: List[OcrLine]) -> bool:
+        return _has_cdm_deposit_amount_text(found + extras)
+
+    for crop, top, left in _priority_cdm_amount_crops(img, lines):
+        found = dedup_lines(
+            found
+            + _run_cdm_band_ocr(
+                engine,
+                crop,
+                top,
+                left,
+                (1.5, 2.0, 2.5),
+                stop_when=complete,
+            )
+        )
+        if complete([]):
+            return found
+    for crop, top, left in _prepare_cdm_amount_band_crops(img, lines)[:8]:
+        found = dedup_lines(
+            found
+            + _run_cdm_band_ocr(
+                engine, crop, top, left, (2.0, 2.5), stop_when=complete
+            )
+        )
+        if complete([]):
+            return found
+    if not _has_cdm_deposit_amount_text(found):
+        for crop, top, left in _priority_cdm_amount_crops(img, lines)[:2]:
+            found = dedup_lines(
+                found
+                + _run_cdm_band_ocr(
+                    engine,
+                    crop,
+                    top,
+                    left,
+                    (2.0, 2.5),
+                    heavy=True,
+                    stop_when=complete,
+                )
+            )
+            if complete([]):
                 return found
     return found
 
@@ -1027,19 +1278,49 @@ def _has_cdm_terminal_text(lines: List[OcrLine]) -> bool:
 
 def _ocr_cdm_header_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     """复检 TERMINAL ID / BRANCH。"""
-    found = _run_cdm_direct_line_windows(
-        engine,
-        img,
+    if not get_settings().cdm_adaptive_early_stop:
+        return _ocr_cdm_header_band_legacy(engine, img, lines)
+    windows = (
         _cdm_header_direct_windows(img, lines)
-        + _cdm_branch_direct_windows(img, lines),
+        + _cdm_branch_direct_windows(img, lines)
     )
+    found = _run_cdm_direct_line_windows(
+        engine, img, windows, prep_indices=(0,)
+    )
+    if not _cdm_missing_header_fields(
+        _probe_cdm_result(lines, found, "cdm_header_direct_raw")
+    ):
+        return found
+    found = dedup_lines(
+        found
+        + _run_cdm_direct_line_windows(
+            engine, img, windows, prep_indices=(1,)
+        )
+    )
+    if not _cdm_missing_header_fields(
+        _probe_cdm_result(lines, found, "cdm_header_direct_clahe")
+    ):
+        return found
+    # 两种直读后仍缺 BRANCH 时，沿用旧版 TERMINAL 门槛。
     if _has_cdm_terminal_text(found):
         return found
+
+    def complete(extras: List[OcrLine]) -> bool:
+        return _has_cdm_terminal_text(found + extras)
+
     for crop, top, left in _prepare_cdm_header_band_crops(img, lines)[:6]:
         found = dedup_lines(
-            found + _run_cdm_band_ocr(engine, crop, top, left, (1.5, 2.0, 2.5))
+            found
+            + _run_cdm_band_ocr(
+                engine,
+                crop,
+                top,
+                left,
+                (1.5, 2.0, 2.5),
+                stop_when=complete,
+            )
         )
-        if _has_cdm_terminal_text(found):
+        if complete([]):
             return found
     return found
 
@@ -1287,118 +1568,261 @@ def _ocr_ntb_description_band(engine, img, lines: List[OcrLine]) -> List[OcrLine
     return found
 
 
-def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
+def _extract_timed(lines: List[OcrLine], *, include_lines: bool, pass_name: str):
+    with stage("field_extraction", pass_name=pass_name, line_count=len(lines)):
+        return extract(lines, include_lines=include_lines)
+
+
+def _recognize_impl(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     settings = get_settings()
     if len(buf) > settings.max_upload_bytes:
         raise HTTPException(status_code=413, detail="文件过大")
     t0 = time.perf_counter()
-    img = load_image(buf)
-    variants = build_variants(img)
+    with stage("image_decode", image_bytes=len(buf)):
+        img = load_image(buf)
+    with stage("image_preprocess", width=img.shape[1], height=img.shape[0]):
+        variants = build_variants(
+            img, fast_denoise=settings.fast_preprocessing
+        )
     lines: List[OcrLine] = []
+    primary_lines: Dict[str, List[OcrLine]] = {}
     for variant in variants:
-        lines.extend(_engine.recognize(variant["img"]))
+        name = str(variant.get("name") or "unknown")
+        with operation(f"primary:{name}"):
+            with stage("ocr_primary_variant", variant=name):
+                recognized = _engine.recognize(variant["img"])
+        primary_lines[name] = recognized
+        lines.extend(recognized)
 
-    unique = dedup_lines(lines)
+    with stage("line_dedup", input_lines=len(lines)):
+        unique = dedup_lines(lines)
 
-    result = extract(unique, include_lines=False)
+    result = _extract_timed(unique, include_lines=False, pass_name="initial")
+    # 快速二值图在极少数低对比大票上会漏 DATE。仅在该强类型字段缺失时，
+    # 补跑一次原 NLM 二值 variant；正常图片不支付数秒 NLM 成本。
+    if (
+        settings.fast_preprocessing
+        and _is_cdm_result(result)
+        and not (result.fields or {}).get("DATE")
+    ):
+        with stage("image_preprocess_slow_binarized"):
+            slow_binarized = build_binarized_variant(
+                img, fast_denoise=False
+            )
+        with operation("primary:binarized_slow_fallback"):
+            with stage(
+                "ocr_primary_variant", variant="binarized_slow_fallback"
+            ):
+                slow_lines = _engine.recognize(slow_binarized)
+        # 用慢速二值结果替换快速二值结果；两者同时参与 dedup 时，高置信错误
+        # （如 10,000 被读成 1,000）可能压过正确的慢速结果。
+        non_binarized = [
+            line
+            for name, variant_lines in primary_lines.items()
+            if name != "binarized"
+            for line in variant_lines
+        ]
+        unique = dedup_lines(non_binarized + slow_lines)
+        result = _extract_timed(
+            unique,
+            include_lines=False,
+            pass_name="slow_binarized_fallback",
+        )
     # CDM 复检只用未纠偏原图：框坐标来自多 variant 混合，套到 rotate 后的 color 会裁空
     _cdm_band_variants = ("color_raw", "enhanced")
     # CDM 中间段（ACCOUNT/CUSTOMER）易被拇指/倾角/合成截图漏检或截断：对中间带复检
     if _cdm_missing_party_fields(result):
         extras: List[OcrLine] = []
         for name in _cdm_band_variants:
-            extras.extend(_ocr_cdm_party_band(_engine, _variant_img(variants, name), unique))
+            with operation(f"cdm_party:{name}"):
+                with stage("ocr_band_cdm_party", variant=name):
+                    extras.extend(
+                        _ocr_cdm_party_band(
+                            _engine, _variant_img(variants, name), unique
+                        )
+                    )
             probe = dedup_lines(unique + extras)
-            probe_result = extract(probe, include_lines=False)
+            probe_result = _extract_timed(
+                probe, include_lines=False, pass_name=f"cdm_party_probe:{name}"
+            )
             if not _cdm_missing_party_fields(probe_result):
                 unique = probe
-                result = extract(unique, include_lines=include_lines)
+                result = _extract_timed(
+                    unique,
+                    include_lines=include_lines,
+                    pass_name="cdm_party_final",
+                )
                 break
         else:
             if extras:
                 unique = dedup_lines(unique + extras)
-                result = extract(unique, include_lines=include_lines)
+                result = _extract_timed(
+                    unique,
+                    include_lines=include_lines,
+                    pass_name="cdm_party_fallback",
+                )
             elif include_lines:
-                result = extract(unique, include_lines=True)
+                result = _extract_timed(
+                    unique, include_lines=True, pass_name="cdm_party_lines"
+                )
     # CDM DEPOSIT AMOUNT：远距/竖排常漏总额，对金额带复检
     if _cdm_missing_deposit_amount(result):
         extras = []
         for name in _cdm_band_variants:
-            extras.extend(_ocr_cdm_amount_band(_engine, _variant_img(variants, name), unique))
+            with operation(f"cdm_amount:{name}"):
+                with stage("ocr_band_cdm_amount", variant=name):
+                    extras.extend(
+                        _ocr_cdm_amount_band(
+                            _engine, _variant_img(variants, name), unique
+                        )
+                    )
             probe = dedup_lines(unique + extras)
-            probe_result = extract(probe, include_lines=False)
+            probe_result = _extract_timed(
+                probe, include_lines=False, pass_name=f"cdm_amount_probe:{name}"
+            )
             if not _cdm_missing_deposit_amount(probe_result):
                 unique = probe
-                result = extract(unique, include_lines=include_lines)
+                result = _extract_timed(
+                    unique,
+                    include_lines=include_lines,
+                    pass_name="cdm_amount_final",
+                )
                 break
         else:
             if extras:
                 unique = dedup_lines(unique + extras)
-                result = extract(unique, include_lines=include_lines)
+                result = _extract_timed(
+                    unique,
+                    include_lines=include_lines,
+                    pass_name="cdm_amount_fallback",
+                )
     # CDM TERMINAL ID / BRANCH：并排表头右侧与网点行常漏
     if _cdm_missing_header_fields(result):
         extras = []
         for name in _cdm_band_variants:
-            extras.extend(_ocr_cdm_header_band(_engine, _variant_img(variants, name), unique))
+            with operation(f"cdm_header:{name}"):
+                with stage("ocr_band_cdm_header", variant=name):
+                    extras.extend(
+                        _ocr_cdm_header_band(
+                            _engine, _variant_img(variants, name), unique
+                        )
+                    )
             probe = dedup_lines(unique + extras)
-            probe_result = extract(probe, include_lines=False)
+            probe_result = _extract_timed(
+                probe, include_lines=False, pass_name=f"cdm_header_probe:{name}"
+            )
             if not _cdm_missing_header_fields(probe_result):
                 unique = probe
-                result = extract(unique, include_lines=include_lines)
+                result = _extract_timed(
+                    unique,
+                    include_lines=include_lines,
+                    pass_name="cdm_header_final",
+                )
                 break
         else:
             if extras:
                 unique = dedup_lines(unique + extras)
-                result = extract(unique, include_lines=include_lines)
+                result = _extract_timed(
+                    unique,
+                    include_lines=include_lines,
+                    pass_name="cdm_header_fallback",
+                )
     # BOC Transaction Details：顶部 LKR 大额常被反光漏读
     if _boc_missing_hero_amount(result):
         extras = []
         for name in ("color_raw", "enhanced", "color"):
-            extras.extend(_ocr_boc_amount_band(_engine, _variant_img(variants, name), unique))
+            with operation(f"boc_amount:{name}"):
+                with stage("ocr_band_boc_amount", variant=name):
+                    extras.extend(
+                        _ocr_boc_amount_band(
+                            _engine, _variant_img(variants, name), unique
+                        )
+                    )
             probe = dedup_lines(unique + extras)
-            probe_result = extract(probe, include_lines=False)
+            probe_result = _extract_timed(
+                probe, include_lines=False, pass_name=f"boc_amount_probe:{name}"
+            )
             if not _boc_missing_hero_amount(probe_result):
                 unique = probe
-                result = extract(unique, include_lines=include_lines)
+                result = _extract_timed(
+                    unique,
+                    include_lines=include_lines,
+                    pass_name="boc_amount_final",
+                )
                 break
         else:
             if extras:
                 unique = dedup_lines(unique + extras)
-                result = extract(unique, include_lines=False)
+                result = _extract_timed(
+                    unique,
+                    include_lines=False,
+                    pass_name="boc_amount_fallback",
+                )
     # NTB：斜向水印粘进 Description（NatiPU8QAW），对描述行复检
     if _ntb_needs_description_band(result, unique):
         extras = []
         for name in ("color_raw", "enhanced", "color"):
-            extras.extend(
-                _ocr_ntb_description_band(_engine, _variant_img(variants, name), unique)
-            )
+            with operation(f"ntb_description:{name}"):
+                with stage("ocr_band_ntb_description", variant=name):
+                    extras.extend(
+                        _ocr_ntb_description_band(
+                            _engine, _variant_img(variants, name), unique
+                        )
+                    )
             probe = dedup_lines(unique + extras)
-            probe_result = extract(probe, include_lines=False)
+            probe_result = _extract_timed(
+                probe,
+                include_lines=False,
+                pass_name=f"ntb_description_probe:{name}",
+            )
             desc = (probe_result.fields or {}).get("Description")
             if desc and not _ntb_description_contaminated(desc) and len(str(desc)) >= 4:
                 # 复检得到更完整描述时采用
                 cur = (result.fields or {}).get("Description") or ""
                 if len(str(desc)) >= len(str(cur)):
                     unique = probe
-                    result = extract(unique, include_lines=include_lines)
+                    result = _extract_timed(
+                        unique,
+                        include_lines=include_lines,
+                        pass_name="ntb_description_final",
+                    )
                     break
         else:
             if extras:
                 unique = dedup_lines(unique + extras)
-                result = extract(unique, include_lines=include_lines)
+                result = _extract_timed(
+                    unique,
+                    include_lines=include_lines,
+                    pass_name="ntb_description_fallback",
+                )
     if include_lines and not result.lines:
-        result = extract(unique, include_lines=True)
+        result = _extract_timed(
+            unique, include_lines=True, pass_name="include_lines_final"
+        )
 
     result.elapsed_ms = (time.perf_counter() - t0) * 1000
-    out: Dict[str, Any] = {"success": result.success}
-    out.update(result.fields if result.fields else _structured_fallback(result))
-    out["bank"] = result.bank.upper() if result.bank else ""
-    _add_cdm_explicit_nulls(out, result, unique)
-    if result.warnings:
-        out["warnings"] = result.warnings
-    if include_lines:
-        out["lines"] = [l.dict() for l in result.lines]
+    with stage("result_assembly"):
+        out: Dict[str, Any] = {"success": result.success}
+        out.update(result.fields if result.fields else _structured_fallback(result))
+        out["bank"] = result.bank.upper() if result.bank else ""
+        _add_cdm_explicit_nulls(out, result, unique)
+        if result.warnings:
+            out["warnings"] = result.warnings
+        if include_lines:
+            out["lines"] = [l.dict() for l in result.lines]
     return out
+
+
+def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
+    slots = _ocr_request_slots
+    if slots is None:
+        return _recognize_impl(buf, include_lines=include_lines)
+    with stage("request_slot_wait"):
+        slots.acquire()
+    try:
+        return _recognize_impl(buf, include_lines=include_lines)
+    finally:
+        slots.release()
 
 
 @app.get("/health")
@@ -1408,23 +1832,38 @@ def health():
 
 @app.post("/ocr", response_model=Dict[str, Any])
 async def ocr(file: UploadFile = File(...), include_lines: bool = False):
-    buf = await file.read()
-    return _recognize(buf, include_lines=include_lines)
+    settings = get_settings()
+    with request_timing(
+        settings.stage_timing_log, service="repayment", route="ocr"
+    ):
+        with stage("upload_read"):
+            buf = await file.read()
+        return _recognize(buf, include_lines=include_lines)
 
 
 @app.post("/ocr_base64", response_model=Dict[str, Any])
 async def ocr_base64(req: Base64Request, include_lines: bool = False):
-    try:
-        buf = base64.b64decode(req.image_base64, validate=True)
-    except (binascii.Error, ValueError):
-        raise HTTPException(status_code=400, detail="无效的 base64 图片数据")
-    return _recognize(buf, include_lines=include_lines)
+    settings = get_settings()
+    with request_timing(
+        settings.stage_timing_log, service="repayment", route="ocr_base64"
+    ):
+        try:
+            with stage("base64_decode"):
+                buf = base64.b64decode(req.image_base64, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(status_code=400, detail="无效的 base64 图片数据")
+        return _recognize(buf, include_lines=include_lines)
 
 
 @app.post("/ocr_url", response_model=Dict[str, Any])
 def ocr_url(req: UrlRequest, include_lines: bool = False):
-    try:
-        buf = fetch_image_bytes(req.image_url, get_settings())
-    except UrlFetchError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return _recognize(buf, include_lines=include_lines)
+    settings = get_settings()
+    with request_timing(
+        settings.stage_timing_log, service="repayment", route="ocr_url"
+    ):
+        try:
+            with stage("image_download"):
+                buf = fetch_image_bytes(req.image_url, settings)
+        except UrlFetchError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return _recognize(buf, include_lines=include_lines)

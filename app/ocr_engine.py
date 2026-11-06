@@ -8,11 +8,14 @@ from __future__ import annotations
 import gc
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import List
 
 import cv2
 import numpy as np
+
+from .stage_timing import log_duration, timing_enabled
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +26,24 @@ class OcrLine:
     text: str
     confidence: float
     box: List[List[float]]
+
+
+class _TimedPredictorProxy:
+    """Transparent timer around PaddleOCR detector/recognizer components."""
+
+    def __init__(self, target, phase: str):
+        self._target = target
+        self._phase = phase
+
+    def __call__(self, *args, **kwargs):
+        started = time.perf_counter()
+        try:
+            return self._target(*args, **kwargs)
+        finally:
+            log_duration(self._phase, (time.perf_counter() - started) * 1000)
+
+    def __getattr__(self, name):
+        return getattr(self._target, name)
 
 
 class PaddleOcrEngine:
@@ -36,12 +57,33 @@ class PaddleOcrEngine:
     def _new_ocr(self):
         from paddleocr import PaddleOCR
 
-        return PaddleOCR(
+        kwargs = dict(
             use_angle_cls=self._settings.paddle_use_angle_cls,
             lang=self._settings.ocr_lang,
             use_gpu=self._settings.paddle_use_gpu,
             show_log=False,
         )
+        cpu_threads = int(getattr(self._settings, "paddle_cpu_threads", 0) or 0)
+        if cpu_threads > 0:
+            kwargs["cpu_threads"] = cpu_threads
+        enable_mkldnn = getattr(
+            self._settings, "paddle_enable_mkldnn", None
+        )
+        if enable_mkldnn is not None:
+            kwargs["enable_mkldnn"] = bool(enable_mkldnn)
+        ocr = PaddleOCR(**kwargs)
+        if getattr(self._settings, "stage_timing_log", False):
+            for attr, phase in (
+                ("text_detector", "ocr_detection"),
+                ("text_recognizer", "ocr_recognition"),
+                ("text_classifier", "ocr_angle_classification"),
+            ):
+                component = getattr(ocr, attr, None)
+                if component is not None and not isinstance(
+                    component, _TimedPredictorProxy
+                ):
+                    setattr(ocr, attr, _TimedPredictorProxy(component, phase))
+        return ocr
 
     def _ensure(self):
         if self._ocr is None:
@@ -103,10 +145,26 @@ class PaddleOcrEngine:
             self._ocr = self._new_ocr()
             return runner(self._ocr, image)
 
+    def _locked_inference(self, runner, image):
+        wait_started = time.perf_counter()
+        with self._lock:
+            if timing_enabled():
+                log_duration(
+                    "ocr_lock_wait",
+                    (time.perf_counter() - wait_started) * 1000,
+                )
+            infer_started = time.perf_counter()
+            try:
+                return self._with_primitive_retry(runner, image)
+            finally:
+                log_duration(
+                    "ocr_inference_total",
+                    (time.perf_counter() - infer_started) * 1000,
+                )
+
     def recognize(self, image) -> List[OcrLine]:
         bounded, restore = self._bounded_image(image)
-        with self._lock:
-            result = self._with_primitive_retry(self._run, bounded)
+        result = self._locked_inference(self._run, bounded)
         lines: List[OcrLine] = []
         for page in result or []:
             if not page:
@@ -133,8 +191,7 @@ class PaddleOcrEngine:
         recognition model，避免检测阶段漏掉 ACCOUNT / 11,400。
         """
         bounded, _ = self._bounded_image(image, max_side=3200, max_pixels=4_000_000)
-        with self._lock:
-            result = self._with_primitive_retry(self._run_line, bounded)
+        result = self._locked_inference(self._run_line, bounded)
 
         pairs = []
 
@@ -264,6 +321,9 @@ class TesseractNameEngine:
 
 
 def create_engine(settings):
+    opencv_threads = int(getattr(settings, "opencv_threads", 0) or 0)
+    if opencv_threads > 0:
+        cv2.setNumThreads(opencv_threads)
     if settings.ocr_engine == "tesseract":
         return TesseractOcrEngine(settings)
     return PaddleOcrEngine(settings)

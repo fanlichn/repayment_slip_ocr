@@ -51,7 +51,9 @@ def _rotate(img: np.ndarray, angle: float) -> np.ndarray:
     )
 
 
-def build_variants(img: np.ndarray) -> list[dict]:
+def build_variants(
+    img: np.ndarray, *, fast_denoise: bool = False
+) -> list[dict]:
     """Return ``[{"name": ..., "img": ndarray}, ...]`` candidates for OCR."""
     img = _ensure_min_size(img)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -60,7 +62,13 @@ def build_variants(img: np.ndarray) -> list[dict]:
     color = _rotate(img, angle)
     gray = _rotate(gray, angle)
 
-    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    # NLM 在 12MP 小票上可单独耗时数秒，而结果只供 binarized variant 使用。
+    # repayment 服务可选择轻量高斯降噪；保留 NLM 回滚路径供其它版式比较。
+    denoised = (
+        cv2.GaussianBlur(gray, (3, 3), 0)
+        if fast_denoise
+        else cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    )
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
@@ -76,3 +84,25 @@ def build_variants(img: np.ndarray) -> list[dict]:
         {"name": "enhanced", "img": enhanced},
         {"name": "binarized", "img": binarized},
     ]
+
+
+def build_binarized_variant(
+    img: np.ndarray, *, fast_denoise: bool = False
+) -> np.ndarray:
+    """Build only the binarized candidate for an adaptive slow-path retry."""
+    img = _ensure_min_size(img)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = _rotate(gray, _estimate_skew(gray))
+    denoised = (
+        cv2.GaussianBlur(gray, (3, 3), 0)
+        if fast_denoise
+        else cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    )
+    return cv2.adaptiveThreshold(
+        denoised,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        15,
+    )

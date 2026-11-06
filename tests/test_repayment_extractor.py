@@ -1750,6 +1750,23 @@ def test_madawala_cdm_typed_fields_single_row_breakdown_and_rm_branch():
     assert not r.warnings
 
 
+def test_cdm_customer_name_never_backfills_narration_label():
+    """户名漏读时宁可缺失，也不能把下一行 NARRAT1ON 值回填为户名。"""
+    rows = [
+        ("COMMERCIAL BANK OF CEYLON PLC", 100),
+        ("TRANSACTION CARDLESS DEPOSIT", 200),
+        ("ACCOUNT NUMBER 1001096962", 260),
+        ("CUSTOMER NAME", 320),
+        ("NARRAT1ON:BKS47D", 380),
+        ("SOURCE OF FUNDS UNKNOWN", 440),
+    ]
+
+    r = extract(_make(rows))
+
+    assert r.fields.get("CUSTOMER NAME") != "NARRAT1ON:BKS47D"
+    assert r.payee.name != "NARRAT1ON:BKS47D"
+
+
 def test_cdm_breakdown_mismatch_keeps_ocr_values_and_warns():
     """明细不一致时保留 OCR 的行金额和总额，只告警，不静默改写。"""
     L = lambda txt, x0, x1, y: _lr(txt, x0, y - 10, x1, y + 10)

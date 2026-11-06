@@ -248,3 +248,21 @@ def test_madawala_small_image_direct_windows_follow_table_cells():
     assert qty[0] <= 300 <= qty[2] and qty[1] <= 786 <= qty[3]
     assert value[0] <= 350 <= value[2] and value[1] <= 786 <= value[3]
     assert amount[0] <= 500 <= amount[2] and amount[1] <= 795 <= amount[3]
+
+
+def test_table_direct_windows_stop_before_deposit_amount_row():
+    img = np.zeros((2000, 1200, 3), dtype=np.uint8)
+    lines = [
+        _lr("NOTES", 150, 900, 300, 940),
+        _lr("VALUE", 380, 900, 530, 940),
+        _lr("AMOUNT", 720, 900, 920, 940),
+        _lr("4", 210, 980, 250, 1020),
+        _lr("DEPOSIT AMOUNT", 100, 1080, 430, 1120),
+        # 总额带的噪声数字不能触发第二组三列 OCR。
+        _lr("1", 210, 1082, 250, 1118),
+    ]
+
+    windows = _cdm_table_direct_windows(img, lines)
+
+    assert len(windows) == 3
+    assert all((top + bottom) / 2 < 1080 for _, top, _, bottom in windows)

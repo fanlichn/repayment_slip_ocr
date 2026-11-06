@@ -1580,6 +1580,76 @@ def test_cdm_crease_sparse_ocr_not_row_amount():
     assert r.fields.get("DEPOSIT AMOUNT") != "400.00"
 
 
+def test_cdm_single_row_stops_before_deposit_total_and_keeps_blank_mobile():
+    """总额行不得成为第二张纸币明细；空手机号不得串入账号行。"""
+    L = lambda txt, x0, x1, y, conf=0.95: _lr(
+        txt, x0, y - 16, x1, y + 16, conf
+    )
+    lines = [
+        L("COMMERCIAL BANK", 100, 500, 100),
+        L("BRANCH", 100, 260, 280),
+        L("MATARACIT-CRM2BR", 320, 720, 280),
+        L("DATE", 100, 230, 400),
+        L("02/11/26", 260, 480, 400),
+        L("TIME", 520, 650, 400),
+        L("19:28", 680, 820, 400),
+        L("TERMINAL ID", 860, 1100, 400),
+        L("RMATCIT2HT", 1130, 1400, 400),
+        L("TRACE", 100, 250, 500),
+        L("2197", 300, 420, 500),
+        L("TRANSACTION CARDLESS DEPOSIT", 100, 900, 650),
+        L("ACCOUNT NUMBER 1001096962", 100, 750, 850),
+        L("CUSTOMER NAME LAK ARTHA SERVICES", 100, 950, 950),
+        L("MOBILE NO.", 100, 330, 1100),
+        L("ACC0UNT NUMBER1001096962", 360, 920, 1100, 0.70),
+        L("SOURCE OF FUNDS UNKNONN", 100, 800, 1250),
+        L("NOTES", 150, 300, 1500),
+        L("VALUE", 380, 530, 1500),
+        L("AMOUNT", 720, 920, 1500),
+        L("4", 210, 250, 1570),
+        L("LKR 1,000.00", 350, 600, 1570),
+        L("4,000.00", 730, 940, 1570),
+        L("DEPOSIT AMOUNT", 100, 430, 1640),
+        L("LKR", 500, 580, 1640),
+        L("4,000.00", 730, 940, 1640),
+        # 分栏直读曾把总额带误生成为第二张纸币行。
+        L("1", 210, 250, 1642, 0.70),
+        L("LKR 10,000.00", 350, 640, 1642, 0.70),
+        L("TRANSACTION STATUS SUCCESSFUL", 100, 900, 1720),
+    ]
+
+    r = extract(lines)
+
+    assert r.fields["BRANCH"] == "MATARACIT-CRM2BR"
+    assert r.fields["CUSTOMER NAME"] == "LAK ARTHA SERVICES"
+    assert r.fields["SOURCE OF FUNDS"] == "UNKNOWN"
+    assert r.fields.get("MOBILE NO.") in (None, "")
+    assert r.fields["NOTES"] == "4"
+    assert r.fields["VALUE"] == "LKR 1,000.00"
+    assert r.fields["AMOUNT"] == "4,000.00"
+    assert r.fields["DEPOSIT AMOUNT"] == "LKR 4,000.00"
+    assert r.amount == 4000.0
+    assert r.warnings == []
+
+
+def test_cdm_recovers_narration_when_label_and_value_are_fused():
+    lines = _make(
+        [
+            ("COMMERCIAL BANK", 100),
+            ("TRANSACTION CARDLESS DEPOSIT", 200),
+            ("ACCOUNT NUMBER 1001096962", 300),
+            ("CUSTOMER NAME LAK ARTHA SERVICES", 400),
+            ("NARRATIONBKS47D", 500),
+            ("DEPOSIT AMOUNT LKR 5,000.00", 600),
+            ("TRANSACTION STATUS SUCCESSFUL", 700),
+        ]
+    )
+
+    r = extract(lines)
+
+    assert r.fields["NARRATION"] == "BKS47D"
+
+
 def test_cdm_sum_amount_column_when_value_col_missing():
     """VALUE 列漏 5000 但 AMOUNT 列有 400+1000+10000 时，加总得 11400。"""
     L = lambda txt, x0, x1, y: _lr(txt, x0, y - 16, x1, y + 16)

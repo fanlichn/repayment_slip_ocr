@@ -827,11 +827,25 @@ def _cdm_table_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tup
         "amount": (b2, rx1),
     }
     base_header_y = header_ys["notes"]
+    deposit_label_ys = [
+        _line_center_y(ln.box)
+        for ln in lines
+        if "amount" in re.sub(r"[^a-z]", "", ln.text.lower())
+        and any(
+            token in re.sub(r"[^a-z]", "", ln.text.lower())
+            for token in ("deposit", "eposit", "deposi")
+        )
+    ]
+    table_end_y = (
+        min(deposit_label_ys) - 2
+        if deposit_label_ys
+        else base_header_y + h * 0.18
+    )
     qty_ys = sorted(
         _line_center_y(ln.box)
         for ln in lines
         if re.fullmatch(r"\s*\d{1,3}\s*", ln.text)
-        and base_header_y + 5 < _line_center_y(ln.box) < base_header_y + h * 0.18
+        and base_header_y + 5 < _line_center_y(ln.box) < table_end_y
         and _line_center_x(ln.box) < b1
     )
     unique_qty_ys = []

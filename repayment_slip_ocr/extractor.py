@@ -648,6 +648,9 @@ def _sum_cdm_notes_amount_column(lines) -> Optional[float]:
     ]
     # 最底部独立 LKR 是 DEPOSIT AMOUNT 行；它及其误读总额不能混入行小计。
     row_y_max = max(total_lkr_ys) - 45 if total_lkr_ys else float("inf")
+    deposit_label_y = _cdm_deposit_label_y(ordered)
+    if deposit_label_y is not None:
+        row_y_max = min(row_y_max, deposit_label_y - 2)
     for ln in ordered:
         y = _line_center_y(ln.box)
         if y <= header_y + 2:
@@ -1768,6 +1771,18 @@ def _parse_denomination(s: str) -> Optional[float]:
     return val
 
 
+def _cdm_deposit_label_y(lines) -> Optional[float]:
+    """Return the first DEPOSIT AMOUNT label row, including cropped OCR variants."""
+    ys = []
+    for ln in lines:
+        compact = re.sub(r"[^a-z]", "", ln.text.lower())
+        if "amount" not in compact:
+            continue
+        if "deposit" in compact or "eposit" in compact or "deposi" in compact:
+            ys.append(_line_center_y(ln.box))
+    return min(ys) if ys else None
+
+
 def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[DenominationOut]:
     """三栏式 NOTES/VALUE/AMOUNT 布局：按表头 x 分列，各列按 y 排序后逐行配对。"""
     ordered = _sorted_by_y(lines)
@@ -1796,6 +1811,9 @@ def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[Denomi
         and _line_center_y(ln.box) > header_y + 180
     ]
     row_y_max = max(total_lkr_ys) - 45 if total_lkr_ys else float("inf")
+    deposit_label_y = _cdm_deposit_label_y(ordered)
+    if deposit_label_y is not None:
+        row_y_max = min(row_y_max, deposit_label_y - 2)
 
     qty_rows: List[tuple] = []
     denom_rows: List[tuple] = []
@@ -3935,9 +3953,9 @@ def _recover_cdm_customer_name(lines) -> Optional[str]:
 
 
 def _recover_cdm_narration(lines) -> Optional[str]:
-    """容忍标签内部空格：``NARRAT ION : BKS47D``。空值不回填。"""
+    """容忍标签内部空格或和值粘连：``NARRATIONBKS47D``。空值不回填。"""
     for ln in _sorted_by_y(lines):
-        m = re.search(r"(?i)\bnarrat\s*ion\b\s*[:\-]?\s*(.*)$", ln.text.strip())
+        m = re.search(r"(?i)^\s*narrat\s*ion\s*[:\-]?\s*(.*)$", ln.text.strip())
         if not m:
             continue
         value = _clean(m.group(1))
@@ -4081,6 +4099,12 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
             "S",
             str(fields["NARRATION"]),
         )
+    source_value = fields.get("SOURCE OF FUNDS")
+    if source_value:
+        source_letters = re.sub(r"[^a-z]", "", str(source_value).lower())
+        # 字段限定纠错：UNKNOWN 尾部的 W/N 在热敏票上经常粘连。
+        if source_letters.startswith("unkno") and 6 <= len(source_letters) <= 9:
+            fields["SOURCE OF FUNDS"] = "UNKNOWN"
     # SOURCE OF FUNDS 折痕直读常变成 SOURCEFFUNDNN，值侧单独仍可读到 UNKNOWN。
     # 仅在同一视觉行有明确 UNKNOWN 证据时回填，不推测空字段。
     if not fields.get("SOURCE OF FUNDS"):
@@ -4125,7 +4149,12 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
     acct = re.sub(r"\D", "", str(fields.get("ACCOUNT NUMBER") or ""))
     if mob:
         mob_digits = re.sub(r"\D", "", mob)
-        if acct and mob_digits == acct:
+        mob_label = _norm_label(mob)
+        if (
+            "accountnumber" in mob_label
+            or "accnumber" in mob_label
+            or (acct and acct in mob_digits)
+        ):
             fields.pop("MOBILE NO.", None)
         elif not _is_plausible_cdm_field_value("MOBILE NO.", mob):
             fields.pop("MOBILE NO.", None)
@@ -4176,10 +4205,21 @@ def _looks_like_cdm_notes_row_amount(amount: float, lines) -> bool:
         return False
     moneys: list = []
     qty_ys: list = []
+    deposit_label_y = _cdm_deposit_label_y(lines)
+    notes_header_ys = [
+        _line_center_y(ln.box)
+        for ln in lines
+        if _looks_like_notes_header(ln.text.strip().lower().rstrip(":."))
+    ]
+    table_header_y = min(notes_header_ys) if notes_header_ys else None
     for ln in lines:
+        y = _line_center_y(ln.box)
+        if table_header_y is not None and y <= table_header_y + 2:
+            continue
+        if deposit_label_y is not None and y >= deposit_label_y - 2:
+            continue
         t = ln.text.strip()
         if re.fullmatch(r"\d{1,3}", t):
-            y = _line_center_y(ln.box)
             if not any(abs(y - seen_y) < 15 for seen_y in qty_ys):
                 qty_ys.append(y)
             continue
@@ -4713,7 +4753,7 @@ def _build_peoples_pay_fields(lines, payer, payee) -> dict:
     return fields
 
 
-_BRANCH_RE = re.compile(r"(?i)^[a-z0-9][a-z0-9\-./ ]*\b(?:br|rm)\b$")
+_BRANCH_RE = re.compile(r"(?i)^[a-z0-9][a-z0-9\-./ ]*(?:br|rm)$")
 
 
 def _normalize_cdm_branch(value: str) -> str:

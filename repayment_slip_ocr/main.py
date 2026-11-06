@@ -183,11 +183,14 @@ def _cdm_missing_deposit_amount(result) -> bool:
 
 
 def _cdm_missing_header_fields(result) -> bool:
-    """缺 TERMINAL ID / BRANCH 时复检日期行右侧与银行名下方。"""
+    """缺 DATE/TIME/TERMINAL ID/BRANCH 时复检票头。"""
     if not _is_cdm_result(result):
         return False
     fields = result.fields or {}
-    return not fields.get("TERMINAL ID") or not fields.get("BRANCH")
+    return any(
+        not fields.get(key)
+        for key in ("DATE", "TIME", "TERMINAL ID", "BRANCH")
+    )
 
 
 def _looks_like_row_subtotal_deposit(amount: float, fields: dict) -> bool:
@@ -1291,7 +1294,7 @@ def _has_cdm_terminal_text(lines: List[OcrLine]) -> bool:
 
 
 def _ocr_cdm_header_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
-    """复检 TERMINAL ID / BRANCH。"""
+    """复检 DATE / TIME / TERMINAL ID / BRANCH。"""
     if not get_settings().cdm_adaptive_early_stop:
         return _ocr_cdm_header_band_legacy(engine, img, lines)
     windows = (
@@ -1315,12 +1318,12 @@ def _ocr_cdm_header_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
         _probe_cdm_result(lines, found, "cdm_header_direct_clahe")
     ):
         return found
-    # 两种直读后仍缺 BRANCH 时，沿用旧版 TERMINAL 门槛。
-    if _has_cdm_terminal_text(found):
-        return found
 
     def complete(extras: List[OcrLine]) -> bool:
-        return _has_cdm_terminal_text(found + extras)
+        probe = _probe_cdm_result(
+            lines, found + extras, "cdm_header_band_complete"
+        )
+        return not _cdm_missing_header_fields(probe)
 
     for crop, top, left in _prepare_cdm_header_band_crops(img, lines)[:6]:
         found = dedup_lines(

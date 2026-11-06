@@ -13,6 +13,7 @@ from repayment_slip_ocr.main import (
     _cdm_account_digits_weak,
     _cdm_branch_direct_windows,
     _cdm_header_direct_windows,
+    _cdm_missing_header_fields,
     _cdm_party_direct_windows,
     _cdm_table_direct_windows,
     _has_cdm_deposit_amount_text,
@@ -266,3 +267,22 @@ def test_table_direct_windows_stop_before_deposit_amount_row():
 
     assert len(windows) == 3
     assert all((top + bottom) / 2 < 1080 for _, top, _, bottom in windows)
+
+
+def test_header_retry_requires_date_and_time_not_only_terminal_and_branch():
+    base = {
+        "TIME": "10:45",
+        "TERMINAL ID": "RKEGALL2HT",
+        "BRANCH": "KEGALLE-CRM2 BR",
+        "TRANSACTION": "CARDLESS DEPOSIT",
+    }
+    missing_date = SimpleNamespace(
+        doc_type="cash_deposit_slip", fields=base
+    )
+    complete = SimpleNamespace(
+        doc_type="cash_deposit_slip",
+        fields={**base, "DATE": "2026-10-30 00:00:00"},
+    )
+
+    assert _cdm_missing_header_fields(missing_date) is True
+    assert _cdm_missing_header_fields(complete) is False

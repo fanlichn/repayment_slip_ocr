@@ -685,7 +685,11 @@ def _run_cdm_direct_line_windows(
         crop = img[top:bottom, left:right]
         if crop.size == 0:
             continue
-        padded, ptop, pleft = _pad_crop_for_ocr(crop, top, left, pad=16)
+        # recognition-only 不需要 detector 的大白边；小图大 padding 会把 10px 字体压得更小。
+        line_pad = max(2, min(16, int(crop.shape[0] * 0.12)))
+        padded, ptop, pleft = _pad_crop_for_ocr(
+            crop, top, left, pad=line_pad
+        )
         # 原图与 CLAHE 各直读一次；检测器路径再负责其它增强，避免过多调用。
         preps = _cdm_band_prep_variants(padded, heavy=False)[:2]
         for prep in preps:
@@ -710,11 +714,11 @@ def _cdm_party_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tup
         default=h * 0.71,
     )
     span = y_notes - y_txn
-    if span < 300:
+    if span < max(60.0, h * 0.07):
         span = h * 0.28
         y_notes = min(h, y_txn + span)
-    # 单行直读不得夹入下一行；热敏字高约 70–90px。
-    half = max(52.0, min(68.0, span * 0.05))
+    # 单行直读不得夹入下一行；按票面缩放，兼容 1024px 远拍与 4096px 原图。
+    half = max(14.0, min(68.0, span * 0.05))
     centers = (0.15, 0.28, 0.49, 0.69, 0.84)
     full_rows = [
         (rx0, y_txn + span * frac - half, party_x1, y_txn + span * frac + half)
@@ -745,11 +749,79 @@ def _cdm_amount_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tu
     left = max(rx0, int(w * 0.34))
     # 以票高归一化，覆盖 400/1000/10000、11,400 和状态行。
     offsets = (0.040, 0.065, 0.090, 0.132, 0.170)
-    half = max(50.0, min(62.0, h * 0.0135))
+    half = max(12.0, min(62.0, h * 0.0135))
     return [
         (left, y_notes + h * frac - half, rx1, y_notes + h * frac + half)
         for frac in offsets
     ]
+
+
+def _cdm_table_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    """按 NOTES/VALUE/AMOUNT 三列逐格直读，保留多行纸币明细。"""
+    h, w = img.shape[:2]
+    rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
+    header_lines = {}
+    for ln in lines:
+        key = ln.text.strip().lower().rstrip(": .")
+        if _looks_like_notes_header_text(key):
+            key = "notes"
+        if key in {"notes", "value", "amount"} and key not in header_lines:
+            header_lines[key] = ln
+
+    if all(key in header_lines for key in ("notes", "value", "amount")):
+        centers_x = {
+            key: _line_center_x(header_lines[key].box)
+            for key in ("notes", "value", "amount")
+        }
+        header_ys = {
+            key: _line_center_y(header_lines[key].box)
+            for key in ("notes", "value", "amount")
+        }
+    else:
+        span = rx1 - rx0
+        centers_x = {
+            "notes": rx0 + span * 0.18,
+            "value": rx0 + span * 0.43,
+            "amount": rx0 + span * 0.78,
+        }
+        base_y = min(
+            _anchor_ys(lines, ["notes", "hotes", "value", "amount"]),
+            default=h * 0.68,
+        )
+        header_ys = {"notes": base_y, "value": base_y, "amount": base_y}
+
+    b1 = (centers_x["notes"] + centers_x["value"]) / 2
+    b2 = (centers_x["value"] + centers_x["amount"]) / 2
+    x_windows = {
+        "notes": (max(rx0, centers_x["notes"] - (b1 - centers_x["notes"]) * 0.9), b1),
+        "value": (b1, b2),
+        "amount": (b2, rx1),
+    }
+    base_header_y = header_ys["notes"]
+    qty_ys = sorted(
+        _line_center_y(ln.box)
+        for ln in lines
+        if re.fullmatch(r"\s*\d{1,3}\s*", ln.text)
+        and base_header_y + 5 < _line_center_y(ln.box) < base_header_y + h * 0.18
+        and _line_center_x(ln.box) < b1
+    )
+    unique_qty_ys = []
+    for y in qty_ys:
+        if not unique_qty_ys or abs(y - unique_qty_ys[-1]) > max(4.0, h * 0.006):
+            unique_qty_ys.append(y)
+    if unique_qty_ys:
+        row_offsets = [y - base_header_y for y in unique_qty_ys[:8]]
+    else:
+        row_offsets = [h * frac for frac in (0.040, 0.065, 0.090)]
+
+    half = max(10.0, min(56.0, h * 0.012))
+    windows = []
+    for offset in row_offsets:
+        for key in ("notes", "value", "amount"):
+            center_y = header_ys[key] + offset
+            x0, x1 = x_windows[key]
+            windows.append((x0, center_y - half, x1, center_y + half))
+    return windows
 
 
 def _cdm_header_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
@@ -766,7 +838,7 @@ def _cdm_header_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tu
     # 各列标签有倾斜，取最早底边并上扩，避免切掉 08:03 / TERMINAL 首行。
     y0 = min(label_bottoms, default=y_trace - h * 0.075) - 15
     # TRACE 数值在标签上方，至少留约 2% 票高间隔，避免和 TIME 合成一行。
-    y1 = y_trace - max(35.0, h * 0.02)
+    y1 = y_trace - max(10.0, h * 0.02)
     if y1 - y0 < 50:
         y0, y1 = y_trace - h * 0.07, y_trace - 10
     date_lines = [ln for ln in labels if _norm_main_label(ln.text) == "date"]
@@ -774,7 +846,7 @@ def _cdm_header_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tu
     if date_lines and time_lines:
         date_cx = _line_center_x(date_lines[0].box)
         time_cx = _line_center_x(time_lines[0].box)
-        gap = max(180.0, time_cx - date_cx)
+        gap = max(w * 0.08, time_cx - date_cx)
         boundary = (date_cx + time_cx) / 2
         # TERMINAL 列约在 TIME 右一列；允许与 TIME 少量重叠，避免 ID 首字被切。
         return [
@@ -800,16 +872,17 @@ def _cdm_branch_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tu
     h, w = img.shape[:2]
     rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
     y_date = min(_anchor_ys(lines, ["date"]), default=h * 0.31)
-    center = y_date - h * 0.06
-    half = max(50.0, min(68.0, h * 0.014))
+    half = max(12.0, min(68.0, h * 0.014))
     span_x = rx1 - rx0
+    # 不同拍摄留白比例不同，网点行距 DATE 约 4.5%–9.5% 票高。
     return [
         (
             rx0 + span_x * 0.16,
-            center - half,
+            y_date - h * frac - half,
             rx0 + span_x * 0.84,
-            center + half,
+            y_date - h * frac + half,
         )
+        for frac in (0.045, 0.070, 0.095)
     ]
 
 
@@ -912,7 +985,10 @@ def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
 def _ocr_cdm_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     """复检 CDM DEPOSIT AMOUNT / 面额表区域。"""
     found = _run_cdm_direct_line_windows(
-        engine, img, _cdm_amount_direct_windows(img, lines)
+        engine,
+        img,
+        _cdm_amount_direct_windows(img, lines)
+        + _cdm_table_direct_windows(img, lines),
     )
     if _has_cdm_deposit_amount_text(found):
         return found
@@ -1318,6 +1394,8 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     out.update(result.fields if result.fields else _structured_fallback(result))
     out["bank"] = result.bank.upper() if result.bank else ""
     _add_cdm_explicit_nulls(out, result, unique)
+    if result.warnings:
+        out["warnings"] = result.warnings
     if include_lines:
         out["lines"] = [l.dict() for l in result.lines]
     return out

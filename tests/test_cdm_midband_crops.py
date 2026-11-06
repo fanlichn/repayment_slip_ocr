@@ -14,6 +14,7 @@ from repayment_slip_ocr.main import (
     _cdm_branch_direct_windows,
     _cdm_header_direct_windows,
     _cdm_party_direct_windows,
+    _cdm_table_direct_windows,
     _has_cdm_deposit_amount_text,
     _pad_crop_for_ocr,
     _prepare_cdm_amount_band_crops,
@@ -197,3 +198,27 @@ def test_cdm_visible_blank_labels_are_returned_as_null():
 
     assert "NARRATION" in out and out["NARRATION"] is None
     assert "MOBILE NO." in out and out["MOBILE NO."] is None
+
+
+def test_madawala_small_image_direct_windows_follow_table_cells():
+    """1024px 远拍图不能套用 4096px 绝对高度；三列窗口应各自覆盖同一纸币行。"""
+    img = np.zeros((1024, 768, 3), dtype=np.uint8)
+    lines = [
+        _lr("TRANSACTION", 270, 552, 355, 568),
+        _lr("NOTES", 260, 747, 310, 763),
+        _lr("VALUE", 325, 747, 370, 763),
+        _lr("AMOUNT", 485, 747, 540, 763),
+        _lr("1", 295, 778, 305, 794),
+    ]
+
+    party = _cdm_party_direct_windows(img, lines)
+    # 第一/二行分别覆盖 ACCOUNT(~587) 与 CUSTOMER(~615)，不整体下移。
+    assert party[0][1] <= 587 <= party[0][3]
+    assert party[1][1] <= 615 <= party[1][3]
+
+    table = _cdm_table_direct_windows(img, lines)
+    assert len(table) == 3
+    qty, value, amount = table
+    assert qty[0] <= 300 <= qty[2] and qty[1] <= 786 <= qty[3]
+    assert value[0] <= 350 <= value[2] and value[1] <= 786 <= value[3]
+    assert amount[0] <= 500 <= amount[2] and amount[1] <= 795 <= amount[3]

@@ -449,12 +449,12 @@ def test_cdm_rotated_photo_values_left_of_tall_labels():
 
     assert r.fields["DATE"] == "2026-11-02 00:00:00"
     assert r.fields["TIME"] == "14:13"
-    assert r.fields["TERMINAL ID"] == "RCINNAMTHT"
+    assert r.fields["TERMINAL ID"] == "RCINNAM1HT"
     assert r.fields["TRACE"] == "3760"
     assert r.fields["TRANSACTION STATUS"] == "SUCCESSFUL"
     assert r.fields["Date & Time"] == "2026-11-02 14:13:00"
     assert r.datetime == "2026-11-02T14:13:00"
-    assert r.terminal_id == "RCINNAMTHT"
+    assert r.terminal_id == "RCINNAM1HT"
     assert r.trace_no == "3760"
     assert r.amount == 5000.0
     assert r.fields["ACCOUNT NUMBER"] == "1001096962"
@@ -665,7 +665,7 @@ def test_cdm_incomplete_notes_table_should_not_invent_amount():
     assert r.bank == "commercial_bank"
     assert r.fields["DATE"] == "2026-11-03 00:00:00"
     assert r.fields["TIME"] == "09:30"
-    assert r.fields["TERMINAL ID"] == "RPOLGAHIHT"
+    assert r.fields["TERMINAL ID"] == "RPOLGAH1HT"
     assert r.fields["TRACE"] == "6157"
     assert r.fields["TRANSACTION"] == "CARDLESS DEPOSIT"
     # 面额表不完整时不得捏造 2,000.00
@@ -1641,6 +1641,7 @@ def test_cdm_sum_fused_direct_amount_rows_when_total_reads_as_400():
         L("00.0010.000.0", 1028, 2717, 3170, 0.83),
         L("LKR", 1413, 1561, 3350, 0.99),
         L("OUNTLKR.400.", 1028, 2717, 3340, 0.84),
+        L("1", 327, 367, 3400, 0.82),  # 表格下方噪声，不应导致明细行数失配
         L("TION STATUSSUCCESSFUL", 1028, 2717, 3500, 0.87),
     ]
 
@@ -1652,6 +1653,123 @@ def test_cdm_sum_fused_direct_amount_rows_when_total_reads_as_400():
     assert r.fields["SOURCE OF FUNDS"] == "UNKNOWN"
     assert "NARRATION" not in r.fields
     assert "MOBILE NO." not in r.fields
+
+
+def test_cdm_nawalapi_direct_cells_build_three_breakdown_rows():
+    """NAWALAPI 单元格直读：容忍 KR/TKR 币种残片、粘连 VALUE+AMOUNT 和表外数字。"""
+    L = lambda txt, x0, x1, y, conf=0.95: _lr(
+        txt, x0, y - 20, x1, y + 20, conf
+    )
+    lines = [
+        L("COMMERCIAL BANK", 500, 1700, 800),
+        L("CARDLESS DEPOSIT", 500, 1300, 1700),
+        L("NOTES", 604, 831, 2913),
+        L("VALUE", 979, 1198, 2880),
+        L("AMOUNT", 1873, 2131, 2804),
+        L("4", 829, 881, 3065),
+        L("1", 833, 890, 3149),
+        L("2", 847, 895, 3232),
+        L("KR100.00", 896, 1561, 3029),
+        L("KR1.000.00", 896, 1561, 3115),
+        L("TKR5.000.00", 896, 1561, 3196),
+        L("400.00", 1888, 2156, 2968, 0.99),
+        L("1.000.00", 1813, 2160, 3068, 0.99),
+        L("5000.0010.000.00", 1031, 2714, 3171, 0.89),
+        L("LKR", 1413, 1561, 3343, 0.99),
+        L("1", 327, 367, 3396, 0.82),
+        L("TRANSACTION STATUS SUCCESSFUL", 1031, 2714, 3500),
+    ]
+
+    r = extract(lines)
+
+    assert [(row.quantity, row.denomination, row.amount) for row in r.deposit_breakdown] == [
+        (4, 100.0, 400.0),
+        (1, 1000.0, 1000.0),
+        (2, 5000.0, 10000.0),
+    ]
+    assert r.fields["NOTES"] == "4 | 1 | 2"
+    assert r.fields["VALUE"] == "LKR 100.00 | LKR 1,000.00 | LKR 5,000.00"
+    assert r.fields["AMOUNT"] == "400.00 | 1,000.00 | 10,000.00"
+    assert r.fields["DEPOSIT AMOUNT"] == "11,400.00"
+
+
+def test_madawala_cdm_typed_fields_single_row_breakdown_and_rm_branch():
+    """MADAWALA：字段类型纠错、客户名防错位、RM 网点和单行纸币明细。"""
+    L = lambda txt, x0, x1, y, conf=0.95: _lr(
+        txt, x0, y - 10, x1, y + 10, conf
+    )
+    lines = [
+        L("COMMERCIAL BANK OF CEYLON PLC", 295, 500, 414),
+        L("MADAWALA-CRMI RM", 345, 465, 442),
+        L("DATE", 274, 310, 478),
+        L("02/11/26", 274, 330, 496),
+        L("TIME", 357, 390, 478),
+        L("16:19", 357, 395, 496),
+        L("TERMINAL ID", 433, 510, 478),
+        L("ORMADAWIHT", 433, 515, 496),  # 机号位 1 被 OCR 读成 I
+        L("TRACE", 273, 310, 520),
+        L("6084", 356, 390, 520),
+        L("TRANSACTION", 270, 355, 560),
+        L("CARDLESS DEPOSIT", 380, 505, 560),
+        L("ACCOUNT NUMBER", 270, 370, 587),
+        L("1001096962", 380, 455, 587),
+        L("CUSTOMER NAME", 270, 365, 615),
+        L("LAK ARTHA SERVICES", 380, 510, 615, 0.82),
+        L("NARRAT ION : BK$47D", 267, 430, 653, 0.98),
+        L("MOBILE NO.", 267, 340, 683),
+        L("SOURCE OF FUNDS", 265, 375, 713),
+        L("UNKNOWN", 380, 445, 713),
+        L("NOTES", 260, 310, 755),
+        L("VALUE", 325, 370, 755),
+        L("AMOUNT", 485, 540, 755),
+        L("1", 295, 305, 786),
+        L("LKR 5,000.00", 325, 415, 786),
+        L("5,000.00", 470, 535, 795),
+        L("DEPOSIT AMOUNT", 258, 365, 815),
+        L("000.00", 395, 535, 823),  # 总额左侧数字被裁掉，完整明细可校验恢复
+        L("TRANSACTION STATUS", 275, 410, 850),
+        L("SUCCESSFUL", 430, 510, 850),
+    ]
+
+    r = extract(lines)
+
+    assert r.fields["CUSTOMER NAME"] == "LAK ARTHA SERVICES"
+    assert r.fields["NARRATION"] == "BKS47D"
+    assert r.fields["TERMINAL ID"] == "ORMADAW1HT"
+    assert r.fields["BRANCH"] == "MADAWALA-CRM1 RM"
+    assert r.fields["NOTES"] == "1"
+    assert r.fields["VALUE"] == "LKR 5,000.00"
+    assert r.fields["AMOUNT"] == "5,000.00"
+    assert "5,000.00" in r.fields["DEPOSIT AMOUNT"]
+    assert r.fields["TRANSACTION STATUS"] == "SUCCESSFUL"
+    assert len(r.deposit_breakdown) == 1
+    assert r.deposit_breakdown[0].quantity == 1
+    assert r.deposit_breakdown[0].denomination == 5000.0
+    assert r.deposit_breakdown[0].amount == 5000.0
+    assert not r.warnings
+
+
+def test_cdm_breakdown_mismatch_keeps_ocr_values_and_warns():
+    """明细不一致时保留 OCR 的行金额和总额，只告警，不静默改写。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 10, x1, y + 10)
+    lines = [
+        L("CARDLESS DEPOSIT", 350, 500, 560),
+        L("NOTES", 260, 310, 755),
+        L("VALUE", 325, 370, 755),
+        L("AMOUNT", 485, 540, 755),
+        L("1", 295, 305, 786),
+        L("LKR 5,000.00", 325, 415, 786),
+        L("4,500.00", 470, 535, 795),
+        L("DEPOSIT AMOUNT", 258, 365, 815),
+        L("LKR 5,000.00", 395, 535, 823),
+    ]
+
+    r = extract(lines)
+
+    assert r.amount == 5000.0
+    assert r.deposit_breakdown[0].amount == 4500.0
+    assert any("纸币明细校验不一致" in warning for warning in r.warnings)
+    assert any("存款金额校验不一致" in warning for warning in r.warnings)
 
 
 def test_cdm_deposit_label_must_not_take_nearest_row_amount():

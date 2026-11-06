@@ -657,6 +657,8 @@ def _sum_cdm_notes_amount_column(lines) -> Optional[float]:
         if low in ("notes", "value", "amount") or "deposit" in low:
             continue
         cx = _line_center_x(ln.box)
+        if y >= row_y_max:
+            continue
         if cx < b_amt and re.fullmatch(r"\d{1,3}", t):
             conf = float(getattr(ln, "confidence", 0.0) or 0.0)
             if qty_rows and abs(y - qty_rows[-1][0]) < 15:
@@ -665,8 +667,6 @@ def _sum_cdm_notes_amount_column(lines) -> Optional[float]:
             else:
                 qty_rows.append((y, int(t), conf))
         elif cx >= b_amt:
-            if y >= row_y_max:
-                continue
             # 宽框是 direct-recognition 行，最右 token 才是 AMOUNT；
             # 普通窄框仍按原始金额解析。
             box_w = max(p[0] for p in ln.box) - min(p[0] for p in ln.box)
@@ -1670,6 +1670,38 @@ def _find_deposit_breakdown(lines, total_amount: Optional[float] = None) -> List
     return _breakdown_single_line(lines)
 
 
+def _reliable_explicit_cdm_deposit_amount(lines) -> Optional[float]:
+    """只取 DEPOSIT AMOUNT 同行右侧、带小数格式的明确总额证据。"""
+    ordered = _sorted_by_y(lines)
+    for label in ordered:
+        norm = _norm_label(label.text)
+        if "depositamount" not in norm:
+            continue
+        label_cy = _line_center_y(label.box)
+        label_right = max(p[0] for p in label.box)
+        label_h = max(p[1] for p in label.box) - min(p[1] for p in label.box)
+        best = None
+        for other in ordered:
+            if other is label:
+                continue
+            if min(p[0] for p in other.box) < label_right - 20:
+                continue
+            dy = abs(_line_center_y(other.box) - label_cy)
+            if dy > max(45.0, label_h * 1.4):
+                continue
+            if not re.search(r"[.,]\s*\d{2}\b", other.text):
+                continue
+            val = _parse_money(other.text)
+            if val is None or val < 100 or val >= 50_000_000:
+                continue
+            score = (dy, -float(getattr(other, "confidence", 0.0) or 0.0))
+            if best is None or score < best[0]:
+                best = (score, val)
+        if best:
+            return best[1]
+    return None
+
+
 def _parse_denomination(s: str) -> Optional[float]:
     """解析纸币面额（VALUE 列），容忍 OCR 千分位分隔符的混合写法。
 
@@ -1682,7 +1714,8 @@ def _parse_denomination(s: str) -> Optional[float]:
     但部分字母是数字的常见 OCR 误读（Q/O→0、I/l→1、Z→2、S→5、B→8），
     先还原再判断。
     """
-    s = re.sub(r"(?i)lkr", "", s).strip()
+    # 直读单元格常裁掉 L，或把 L 读成 T：KR100 / TKR5,000。
+    s = re.sub(r"(?i)^[LT]?KR", "", s).strip()
     s = re.sub(r"(?i)\brs\.?", "", s).strip()
     # OCR 常见数字→字母误读还原（仅在还原后无字母时才使用）
     restored = s.translate(str.maketrans({"Q": "0", "q": "0", "O": "0", "o": "0",
@@ -1728,13 +1761,23 @@ def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[Denomi
     b1 = (notes_cx + value_cx) / 2
     b2 = (value_cx + amount_cx) / 2
     header_y = min(headers[k][2] for k in headers)
+    notes_header_y = headers["notes"][2]
+    value_header_y = headers["value"][2]
+    amount_header_y = headers["amount"][2]
+    total_lkr_ys = [
+        _line_center_y(ln.box)
+        for ln in ordered
+        if re.fullmatch(r"(?i)\s*lkr\s*", ln.text)
+        and _line_center_y(ln.box) > header_y + 180
+    ]
+    row_y_max = max(total_lkr_ys) - 45 if total_lkr_ys else float("inf")
 
     qty_rows: List[tuple] = []
     denom_rows: List[tuple] = []
     amount_rows: List[tuple] = []
     for ln in ordered:
         y = _line_center_y(ln.box)
-        if y <= header_y + 2:
+        if y <= header_y + 2 or y >= row_y_max:
             continue
         t = ln.text.strip().lower().rstrip(":.")
         if t in ("notes", "value", "amount") or "deposit amount" in t:
@@ -1744,15 +1787,16 @@ def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[Denomi
         if cx < b1:
             m = re.fullmatch(r"\d{1,3}", text)
             if m:
-                qty_rows.append((y, int(m.group(0)), ln.confidence))
+                qty_rows.append((y - notes_header_y, int(m.group(0)), ln.confidence))
         elif cx < b2:
             val = _parse_denomination(text)
             if val is not None and val in _COMMON_DENOMS:
-                denom_rows.append((y, val))
+                denom_rows.append((y - value_header_y, val))
         else:
-            val = _parse_denomination(text)
+            box_w = max(p[0] for p in ln.box) - min(p[0] for p in ln.box)
+            val = _last_cdm_fused_money(text) if box_w > 700 else _parse_denomination(text)
             if val is not None:
-                amount_rows.append((y, val))
+                amount_rows.append((y - amount_header_y, val, ln.confidence))
 
     if not denom_rows:
         return []
@@ -1769,8 +1813,17 @@ def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[Denomi
     qty_rows = [(y, qty) for y, qty, _ in unique_qty]
     denom_rows.sort()
     amount_rows.sort()
-    if total_amount is not None:
-        amount_rows = [(y, m) for y, m in amount_rows if abs(m - total_amount) > 0.01]
+
+    # AMOUNT 同行 OCR 变体去重；保留原始行金额，即使与 qty×denom 不一致，
+    # 由后续一致性校验告警，不能静默篡改 OCR 值。
+    unique_amounts: List[tuple] = []
+    for y, amount, conf in amount_rows:
+        if unique_amounts and abs(y - unique_amounts[-1][0]) < 15:
+            if conf > unique_amounts[-1][2]:
+                unique_amounts[-1] = (y, amount, conf)
+        else:
+            unique_amounts.append((y, amount, conf))
+    amount_rows = [(y, amount) for y, amount, _ in unique_amounts]
 
     # 面额去重：OCR 常把同一面额识别成 "100.00" / "100. 00" 等多个变体行
     seen_denoms = set()
@@ -1804,10 +1857,15 @@ def _breakdown_from_columns(lines, total_amount: Optional[float]) -> List[Denomi
         if best_i is not None:
             used_qty.add(best_i)
         amount = denom * qty
-        for _, amt in amount_rows:
-            if abs(amt - denom * qty) < 0.05:
-                amount = amt
-                break
+        nearest_amount = None
+        nearest_dy = 55.0
+        for y_a, amt in amount_rows:
+            dy = abs(y_a - y_d)
+            if dy < nearest_dy:
+                nearest_dy = dy
+                nearest_amount = amt
+        if nearest_amount is not None:
+            amount = nearest_amount
         breakdown.append(DenominationOut(denomination=denom, quantity=qty, amount=amount))
     return breakdown
 
@@ -3435,6 +3493,19 @@ def _looks_like_terminal_id_value(value: str) -> bool:
     return bool(re.match(r"(?i)^R?[A-Z]{3,}\d*[A-Z]*HT$", compact))
 
 
+def _normalize_cdm_terminal_id(value: str) -> Optional[str]:
+    """Terminal ID 字段内纠错；仅修正末尾机号位，不全局替换 O/I/T。"""
+    compact = re.sub(r"[^A-Za-z0-9]", "", value or "").upper()
+    if not compact:
+        return None
+    # Commercial CDM ID 通常是字母站点码 + 数字机号 + HT。
+    # OCR 常把机号 1 读成 T/I/L：ORMADAWTHT -> ORMADAW1HT。
+    m = re.fullmatch(r"([A-Z]{5,12})([TIL])HT", compact)
+    if m and not re.search(r"\d", m.group(1)):
+        compact = f"{m.group(1)}1HT"
+    return compact if _looks_like_terminal_id_value(compact) else None
+
+
 def _normalize_cdm_time(value: str) -> Optional[str]:
     """归一化 CDM TIME：19.11 / 19:11 / 0803 → 19:11；拒绝日期误读 01:11.26 / 01/11/26。"""
     v = _clean(value or "")
@@ -3468,7 +3539,7 @@ def _is_plausible_cdm_field_value(key: str, value: str) -> bool:
     if kn == "time":
         return _normalize_cdm_time(v) is not None
     if kn == "terminalid":
-        return _looks_like_terminal_id_value(v)
+        return _normalize_cdm_terminal_id(v) is not None
     if kn == "trace":
         return bool(re.match(r"^\d{3,6}$", v)) and not re.search(r"[/.\-]", v)
     if kn == "transactionstatus":
@@ -3491,7 +3562,11 @@ def _is_plausible_cdm_field_value(key: str, value: str) -> bool:
             re.fullmatch(r"(?i)deposit", v)
         )
     if kn == "customername":
-        if re.search(r"(?i)narration|mobile|account|bank|source", v):
+        compact = _norm_label(v)
+        if any(
+            token in compact
+            for token in ("narration", "narration", "mobileno", "account", "bank", "sourceoffunds")
+        ):
             return False
         return len(re.findall(r"[A-Za-z]", v)) >= 6
     if kn == "mobileno":
@@ -3600,8 +3675,9 @@ def _extract_cdm_typed_substring(key: str, text: str) -> Optional[str]:
         return _normalize_cdm_time(text)
     if kn == "terminalid":
         for tok in re.findall(r"[A-Za-z0-9]{6,}", text):
-            if _looks_like_terminal_id_value(tok):
-                return tok.upper()
+            normalized = _normalize_cdm_terminal_id(tok)
+            if normalized:
+                return normalized
         return None
     if kn == "trace":
         # 日期残片 D0710/26... 里的 0710 不是 TRACE；660f6 也不是
@@ -3796,6 +3872,16 @@ def _recover_cdm_customer_name(lines) -> Optional[str]:
             k in low for k in ("narration", "mobile", "source of funds", "notes")
         ):
             y1 = _line_center_y(ln.box)
+    # 机构名强证据优先，避免先遇到下一行 NARRAT ION : BKS47D 就错位。
+    for ln in ordered:
+        cy = _line_center_y(ln.box)
+        if y0 is not None and cy < y0 - 20:
+            continue
+        if y1 is not None and cy > y1 + 20:
+            continue
+        compact = re.sub(r"[^a-z]", "", ln.text.lower())
+        if "lakartha" in compact:
+            return "LAK ARTHA SERVICES" if "service" in compact else _clean(ln.text)
     for ln in ordered:
         cy = _line_center_y(ln.box)
         if y0 is not None and cy < y0 - 20:
@@ -3808,17 +3894,31 @@ def _recover_cdm_customer_name(lines) -> Optional[str]:
             if inline and not _looks_like_label_text(inline):
                 return _clean(inline)
         low = text.lower()
-        if any(k in low for k in ("account", "transaction", "cardless", "narration", "mobile", "source")):
+        compact = re.sub(r"[^a-z]", "", low)
+        if any(
+            k in compact
+            for k in ("account", "transaction", "cardless", "narration", "mobile", "source")
+        ):
             continue
         if _looks_like_label_text(text) or re.search(r"\d{5,}", text):
             continue
         letters = re.findall(r"[A-Za-z]{2,}", text)
         if len(letters) >= 2:
             name = _clean(text)
-            compact = re.sub(r"[^a-z]", "", name.lower())
-            if "lakartha" in compact:
-                return "LAK ARTHA SERVICES" if "service" in compact or "lak" in low else name
             return name
+    return None
+
+
+def _recover_cdm_narration(lines) -> Optional[str]:
+    """容忍标签内部空格：``NARRAT ION : BKS47D``。空值不回填。"""
+    for ln in _sorted_by_y(lines):
+        m = re.search(r"(?i)\bnarrat\s*ion\b\s*[:\-]?\s*(.*)$", ln.text.strip())
+        if not m:
+            continue
+        value = _clean(m.group(1))
+        if value and not _looks_like_label_text(value):
+            # Narration/参考码允许字母数字；OCR 常把夹在字母数字间的 S 读成 $。
+            return re.sub(r"(?<=[A-Za-z0-9])\$(?=[A-Za-z0-9])", "S", value)
     return None
 
 
@@ -3838,6 +3938,11 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
     ordered = _sorted_by_y(lines)
     for key in typed_keys:
         cur = fields.get(key)
+        if key == "TERMINAL ID" and cur:
+            normalized_terminal = _normalize_cdm_terminal_id(str(cur))
+            if normalized_terminal:
+                fields[key] = normalized_terminal
+                cur = normalized_terminal
         # DATE：全卡多候选优选（02/11/20 截断不得压过 l2 11 26）
         if key == "DATE":
             best_date = _pick_best_cdm_date(lines)
@@ -3913,6 +4018,8 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
         if found:
             if key == "TIME":
                 found = _normalize_cdm_time(found) or found
+            elif key == "TERMINAL ID":
+                found = _normalize_cdm_terminal_id(found) or found
             fields[key] = found
         elif key in fields and not _is_plausible_cdm_field_value(key, fields[key]):
             fields.pop(key, None)
@@ -3930,6 +4037,25 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
     )
     if completed:
         fields["ACCOUNT NUMBER"] = completed
+    recovered_customer = _recover_cdm_customer_name(lines)
+    if recovered_customer and (
+        not fields.get("CUSTOMER NAME")
+        or (
+            _looks_like_lak_artha_name(recovered_customer)
+            and not _looks_like_lak_artha_name(str(fields.get("CUSTOMER NAME") or ""))
+        )
+    ):
+        fields["CUSTOMER NAME"] = recovered_customer
+    if not fields.get("NARRATION"):
+        recovered_narration = _recover_cdm_narration(lines)
+        if recovered_narration:
+            fields["NARRATION"] = recovered_narration
+    elif fields.get("NARRATION"):
+        fields["NARRATION"] = re.sub(
+            r"(?<=[A-Za-z0-9])\$(?=[A-Za-z0-9])",
+            "S",
+            str(fields["NARRATION"]),
+        )
     # SOURCE OF FUNDS 折痕直读常变成 SOURCEFFUNDNN，值侧单独仍可读到 UNKNOWN。
     # 仅在同一视觉行有明确 UNKNOWN 证据时回填，不推测空字段。
     if not fields.get("SOURCE OF FUNDS"):
@@ -4024,11 +4150,13 @@ def _looks_like_cdm_notes_row_amount(amount: float, lines) -> bool:
     if not _has_notes_value_table(lines):
         return False
     moneys: list = []
-    qty_like = 0
+    qty_ys: list = []
     for ln in lines:
         t = ln.text.strip()
         if re.fullmatch(r"\d{1,3}", t):
-            qty_like += 1
+            y = _line_center_y(ln.box)
+            if not any(abs(y - seen_y) < 15 for seen_y in qty_ys):
+                qty_ys.append(y)
             continue
         if _looks_like_label_text(t) or _looks_like_notes_header(t):
             continue
@@ -4037,7 +4165,7 @@ def _looks_like_cdm_notes_row_amount(amount: float, lines) -> bool:
         if val is None or val < 100 or val >= 50_000_000:
             continue
         moneys.append(val)
-    if qty_like < 2 or not moneys:
+    if len(qty_ys) < 2 or not moneys:
         return False
     # 多行张数 + 金额恰为常见面额面值（含 10,000）→ 行 AMOUNT，非存款总额
     if amount in _COMMON_DENOMS:
@@ -4560,7 +4688,12 @@ def _build_peoples_pay_fields(lines, payer, payee) -> dict:
     return fields
 
 
-_BRANCH_RE = re.compile(r"(?i)^[a-z0-9][a-z0-9\-./ ]*\bbr\b$")
+_BRANCH_RE = re.compile(r"(?i)^[a-z0-9][a-z0-9\-./ ]*\b(?:br|rm)\b$")
+
+
+def _normalize_cdm_branch(value: str) -> str:
+    """仅在 Commercial Bank 的 CRM 机器编号槽修正常见 I/l→1。"""
+    return re.sub(r"(?i)\bCRM\s*[Il](?=\s*(?:BR|RM)\b)", "CRM1", value.strip())
 
 
 def _branch_quality(text: str, conf: float = 0.0) -> tuple:
@@ -4571,7 +4704,7 @@ def _branch_quality(text: str, conf: float = 0.0) -> tuple:
 
 
 def _extract_branch(lines) -> Optional[str]:
-    """存款凭条网点：通常以 "BR"（branch）结尾，如 "BANDARAG-CRM2 BR"。
+    """存款凭条网点：以 BR/RM 结尾，如 BANDARAG-CRM2 BR / MADAWALA-CRM1 RM。
 
     OCR 常把 "EKALA-CRM1 BR" 拆成同行的 "EKALA-CRM1" + "BR"，需拼接。
     多候选时偏好无字母位数字串位者（KALUTARA 优于 KAI U1ARA）。
@@ -4579,12 +4712,13 @@ def _extract_branch(lines) -> Optional[str]:
     ordered = _sorted_by_y(lines)
     candidates = []
     for ln in ordered:
-        t = ln.text.strip()
+        t = _normalize_cdm_branch(ln.text)
         if _BRANCH_RE.fullmatch(t):
             conf = float(getattr(ln, "confidence", 0.0) or 0.0)
             candidates.append((_branch_quality(t, conf), t))
     for ln in ordered:
-        if ln.text.strip().upper() != "BR":
+        suffix = ln.text.strip().upper()
+        if suffix not in {"BR", "RM"}:
             continue
         br_y = _line_center_y(ln.box)
         br_left = min(p[0] for p in ln.box)
@@ -4604,7 +4738,7 @@ def _extract_branch(lines) -> Optional[str]:
                 continue
             gap = br_left - other_right
             conf = float(getattr(other, "confidence", 0.0) or 0.0)
-            cand = f"{text} BR"
+            cand = _normalize_cdm_branch(f"{text} {suffix}")
             score = (_branch_quality(cand, conf), -gap)
             if best is None or score > best[0]:
                 best = (score, cand)
@@ -4662,13 +4796,32 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
 
     # 存款凭条：纸币明细加总校验
     if deposit_breakdown:
+        for row in deposit_breakdown:
+            expected = row.denomination * row.quantity
+            if abs(row.amount - expected) > 0.05:
+                warnings.append(
+                    "纸币明细校验不一致: "
+                    f"notes({row.quantity}) × value({row.denomination:.2f}) "
+                    f"!= amount({row.amount:.2f})"
+                )
         breakdown_sum = sum(d.amount for d in deposit_breakdown)
         if amount is not None and abs(breakdown_sum - amount) > 0.05:
-            # 面额表是逐行扫描的，比总额行的 OCR 更可靠（总额常被读成
-            # "000008" 之类的损坏串），不一致时优先采用明细加总
-            amount = breakdown_sum
-            if total is not None:
-                total = breakdown_sum
+            explicit_deposit = _reliable_explicit_cdm_deposit_amount(lines)
+            if explicit_deposit is None:
+                # 当前 amount 来自面额/噪声而非明确总额（如 000008），可用完整明细合计。
+                amount = breakdown_sum
+                if total is not None:
+                    total = breakdown_sum
+            else:
+                # 有明确总额证据时保留双方原始识别值，只标记异常。
+                amount = explicit_deposit
+                if total is not None:
+                    total = explicit_deposit
+                if abs(breakdown_sum - explicit_deposit) > 0.05:
+                    warnings.append(
+                        f"存款金额校验不一致: 明细合计({breakdown_sum:.2f}) "
+                        f"!= DEPOSIT AMOUNT({explicit_deposit:.2f})"
+                    )
         elif amount is None:
             amount = breakdown_sum
             if total is None:
@@ -4931,6 +5084,15 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
             cur_br = fields.get("BRANCH")
             if not cur_br or _branch_quality(branch) > _branch_quality(str(cur_br)):
                 fields["BRANCH"] = branch
+        if deposit_breakdown:
+            # 保持现有扁平 API；多行用稳定的 " | " 分隔，不丢失任一纸币行。
+            fields["NOTES"] = " | ".join(str(row.quantity) for row in deposit_breakdown)
+            fields["VALUE"] = " | ".join(
+                f"LKR {row.denomination:,.2f}" for row in deposit_breakdown
+            )
+            fields["AMOUNT"] = " | ".join(
+                f"{row.amount:,.2f}" for row in deposit_breakdown
+            )
         # 行小计（400）不得写入 DEPOSIT AMOUNT / 结构化金额
         if amount is not None and _looks_like_cdm_notes_row_amount(amount, lines):
             amount = None
@@ -4939,7 +5101,7 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         # DEPOSIT AMOUNT：结构化总额优先；面额表面值（5000）被误填时用 10,200 覆盖
         if amount is not None:
             dep_amt = _parse_money(fields["DEPOSIT AMOUNT"]) if fields.get("DEPOSIT AMOUNT") else None
-            if dep_amt is None or (
+            if dep_amt is None or dep_amt < 100 or (
                 abs(dep_amt - amount) > 0.01
                 and _has_notes_value_table(lines)
                 and dep_amt in _COMMON_DENOMS
@@ -5040,6 +5202,12 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         narr = fields["NARRATION"]
         if not re.search(r"(?i)cardless\s*deposit|cash\s*deposit", narr):
             fields["Remarks"] = narr
+    elif doc_type == "cash_deposit_slip" and fields.get("Remarks"):
+        fields["Remarks"] = re.sub(
+            r"(?<=[A-Za-z0-9])\$(?=[A-Za-z0-9])",
+            "S",
+            str(fields["Remarks"]),
+        )
     # NTB：Remarks/Description 兜底写入后再剥一次水印乱码（如 NatiPU8QAW）
     if bank == "ntb":
         for key in ("Description", "Remarks"):

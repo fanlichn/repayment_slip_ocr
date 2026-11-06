@@ -654,6 +654,130 @@ def _run_cdm_band_ocr(
     return found
 
 
+def _run_cdm_direct_line_windows(
+    engine, img: np.ndarray, windows: List[tuple]
+) -> List[OcrLine]:
+    """对已知单行窗口跳过 detector，直接调用 Paddle recognition model。"""
+    recognize_line = getattr(engine, "recognize_line", None)
+    if not callable(recognize_line):
+        return []
+    h, w = img.shape[:2]
+    found: List[OcrLine] = []
+    for x0, y0, x1, y1 in windows:
+        left, right = max(0, int(x0)), min(w, int(x1))
+        top, bottom = max(0, int(y0)), min(h, int(y1))
+        if right - left < 40 or bottom - top < 24:
+            continue
+        crop = img[top:bottom, left:right]
+        if crop.size == 0:
+            continue
+        padded, ptop, pleft = _pad_crop_for_ocr(crop, top, left, pad=16)
+        # 原图与 CLAHE 各直读一次；检测器路径再负责其它增强，避免过多调用。
+        preps = _cdm_band_prep_variants(padded, heavy=False)[:2]
+        for prep in preps:
+            raw = recognize_line(prep)
+            found = dedup_lines(
+                found + _offset_ocr_lines(raw, dy=ptop, dx=pleft, scale=1.0)
+            )
+    return found
+
+
+def _cdm_party_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    """TRANSACTION→NOTES 内固定字段行：ACCOUNT/CUSTOMER/NARRATION/MOBILE/SOURCE。"""
+    h, w = img.shape[:2]
+    rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
+    party_x1 = min(rx1, max(rx0 + int((rx1 - rx0) * 0.84), int(w * 0.66)))
+    y_txn = min(
+        _anchor_ys(lines, ["transaction", "cardless"]),
+        default=min(_anchor_ys(lines, ["trace"]), default=h * 0.38) + h * 0.06,
+    )
+    y_notes = min(
+        _anchor_ys(lines, ["notes", "hotes", "value"]),
+        default=h * 0.71,
+    )
+    span = y_notes - y_txn
+    if span < 300:
+        span = h * 0.28
+        y_notes = min(h, y_txn + span)
+    # 单行直读不得夹入下一行；热敏字高约 70–90px。
+    half = max(52.0, min(68.0, span * 0.05))
+    centers = (0.15, 0.28, 0.49, 0.69, 0.84)
+    return [
+        (rx0, y_txn + span * frac - half, party_x1, y_txn + span * frac + half)
+        for frac in centers
+    ]
+
+
+def _cdm_amount_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    """NOTES 后右侧金额行：各面额小计、DEPOSIT AMOUNT、STATUS。"""
+    h, w = img.shape[:2]
+    rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
+    y_notes = min(
+        _anchor_ys(lines, ["notes", "hotes", "value", "amount"]),
+        default=h * 0.68,
+    )
+    left = max(rx0, int(w * 0.34))
+    # 以票高归一化，覆盖 400/1000/10000、11,400 和状态行。
+    offsets = (0.040, 0.065, 0.090, 0.132, 0.170)
+    half = max(50.0, min(62.0, h * 0.0135))
+    return [
+        (left, y_notes + h * frac - half, rx1, y_notes + h * frac + half)
+        for frac in offsets
+    ]
+
+
+def _cdm_header_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    """DATE/TIME/TERMINAL 的值行分三列直读，避免 17:00 噪声抢占 08:03。"""
+    h, w = img.shape[:2]
+    rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
+    labels = [
+        ln
+        for ln in lines
+        if _norm_main_label(ln.text) in {"date", "time", "terminalid", "terminal"}
+    ]
+    label_bottoms = [max(p[1] for p in ln.box) for ln in labels]
+    y_trace = min(_anchor_ys(lines, ["trace"]), default=h * 0.37)
+    # 各列标签有倾斜，取最早底边并上扩，避免切掉 08:03 / TERMINAL 首行。
+    y0 = min(label_bottoms, default=y_trace - h * 0.075) - 15
+    # TRACE 数值在标签上方，至少留约 2% 票高间隔，避免和 TIME 合成一行。
+    y1 = y_trace - max(35.0, h * 0.02)
+    if y1 - y0 < 50:
+        y0, y1 = y_trace - h * 0.07, y_trace - 10
+    date_lines = [ln for ln in labels if _norm_main_label(ln.text) == "date"]
+    time_lines = [ln for ln in labels if _norm_main_label(ln.text) == "time"]
+    if date_lines and time_lines:
+        date_cx = _line_center_x(date_lines[0].box)
+        time_cx = _line_center_x(time_lines[0].box)
+        gap = max(180.0, time_cx - date_cx)
+        boundary = (date_cx + time_cx) / 2
+        # TERMINAL 列约在 TIME 右一列；允许与 TIME 少量重叠，避免 ID 首字被切。
+        return [
+            (max(rx0, date_cx - gap * 0.55), y0, boundary, y1),
+            (boundary, y0, min(rx1, time_cx + gap * 0.65), y1),
+            (max(rx0, time_cx + gap * 0.50), y0, rx1, y1),
+        ]
+    span_x = rx1 - rx0
+    cuts = (0.0, 0.27, 0.50, 1.0)
+    return [
+        (rx0 + span_x * cuts[i], y0, rx0 + span_x * cuts[i + 1], y1)
+        for i in range(3)
+    ]
+
+
+def _cdm_branch_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
+    """银行名下、DATE 上方的网点行（如 NAWALAPI-CRM1 BR）。"""
+    h, w = img.shape[:2]
+    rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
+    y_date = min(_anchor_ys(lines, ["date"]), default=h * 0.31)
+    center = y_date - h * 0.09
+    half = max(55.0, min(80.0, h * 0.017))
+    return [(rx0, center - half, rx1, center + half)]
+
+
+def _norm_main_label(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
 def _priority_cdm_party_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
     """优先中高裁：TRANSACTION→NOTES 整段（诊断 party_mid），Paddle 需要上下文。"""
     h, w = img.shape[:2]
@@ -714,7 +838,11 @@ def _priority_cdm_amount_crops(img: np.ndarray, lines: List[OcrLine]) -> List[tu
 
 def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     """对 CDM 的 TRANSACTION~NARRATION 中间带二次 OCR，补账号/户名。"""
-    found: List[OcrLine] = []
+    found = _run_cdm_direct_line_windows(
+        engine, img, _cdm_party_direct_windows(img, lines)
+    )
+    if _has_strong_cdm_account(found):
+        return found
     # 1) 中高优先裁 + 轻量预处理（原先细条×重预处理把账号跑丢且极慢）
     for crop, top, left in _priority_cdm_party_crops(img, lines):
         found = dedup_lines(
@@ -744,7 +872,11 @@ def _ocr_cdm_party_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
 
 def _ocr_cdm_amount_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     """复检 CDM DEPOSIT AMOUNT / 面额表区域。"""
-    found: List[OcrLine] = []
+    found = _run_cdm_direct_line_windows(
+        engine, img, _cdm_amount_direct_windows(img, lines)
+    )
+    if _has_cdm_deposit_amount_text(found):
+        return found
     for crop, top, left in _priority_cdm_amount_crops(img, lines):
         found = dedup_lines(
             found + _run_cdm_band_ocr(engine, crop, top, left, (1.5, 2.0, 2.5))
@@ -780,7 +912,14 @@ def _has_cdm_terminal_text(lines: List[OcrLine]) -> bool:
 
 def _ocr_cdm_header_band(engine, img, lines: List[OcrLine]) -> List[OcrLine]:
     """复检 TERMINAL ID / BRANCH。"""
-    found: List[OcrLine] = []
+    found = _run_cdm_direct_line_windows(
+        engine,
+        img,
+        _cdm_header_direct_windows(img, lines)
+        + _cdm_branch_direct_windows(img, lines),
+    )
+    if _has_cdm_terminal_text(found):
+        return found
     for crop, top, left in _prepare_cdm_header_band_crops(img, lines)[:6]:
         found = dedup_lines(
             found + _run_cdm_band_ocr(engine, crop, top, left, (1.5, 2.0, 2.5))

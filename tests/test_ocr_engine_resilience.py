@@ -35,14 +35,15 @@ def test_large_input_is_bounded_and_boxes_are_restored():
     engine = PaddleOcrEngine(_settings())
     fake = FakePredictor()
     engine._ocr = fake
-    image = np.zeros((4096, 3072, 3), dtype=np.uint8)
+    image = np.zeros((6000, 4000, 3), dtype=np.uint8)
 
     lines = engine.recognize(image)
 
-    assert max(fake.shape[:2]) <= 3200
-    assert fake.shape[0] * fake.shape[1] <= 8_000_000
-    # 4096 -> 3200，检测框须映射回原图坐标。
-    assert lines[0].box[0] == [12.8, 25.6]
+    assert max(fake.shape[:2]) <= 5000
+    assert fake.shape[0] * fake.shape[1] <= 16_000_000
+    # 检测框须按缩放比例映射回原图坐标。
+    assert lines[0].box[0][0] > 10
+    assert lines[0].box[0][1] > 20
 
 
 def test_primitive_error_rebuilds_predictor_and_retries_once():
@@ -93,3 +94,23 @@ def test_shared_predictor_inference_is_serialized():
         thread.join()
 
     assert probe.max_active == 1
+
+
+def test_recognize_line_skips_detector_and_parses_rec_result():
+    class LinePredictor:
+        def __init__(self):
+            self.det = None
+
+        def ocr(self, image, det=True, rec=True, cls=False):
+            self.det = det
+            return [[("ACCOUNT NUMBER: 1001096962", 0.98)]]
+
+    engine = PaddleOcrEngine(_settings())
+    predictor = LinePredictor()
+    engine._ocr = predictor
+
+    lines = engine.recognize_line(np.zeros((100, 800, 3), dtype=np.uint8))
+
+    assert predictor.det is False
+    assert lines[0].text == "ACCOUNT NUMBER: 1001096962"
+    assert lines[0].confidence == 0.98

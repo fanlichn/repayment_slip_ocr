@@ -6,7 +6,11 @@ import numpy as np
 from app.ocr_engine import OcrLine
 from repayment_slip_ocr.main import (
     _anchor_scale_y,
+    _cdm_amount_direct_windows,
     _cdm_account_digits_weak,
+    _cdm_branch_direct_windows,
+    _cdm_header_direct_windows,
+    _cdm_party_direct_windows,
     _has_cdm_deposit_amount_text,
     _pad_crop_for_ocr,
     _prepare_cdm_amount_band_crops,
@@ -157,3 +161,19 @@ def test_nawalapi_sparse_crops_cover_party_amount_terminal():
     padded, top2, left2 = _pad_crop_for_ocr(pri_party[0][0], pri_party[0][1], pri_party[0][2], pad=24)
     assert padded.shape[0] == pri_party[0][0].shape[0] + 48
     assert top2 == pri_party[0][1] - 24
+
+    direct_party = _cdm_party_direct_windows(img, lines)
+    assert any(y0 <= 1950 <= y1 for _, y0, _, y1 in direct_party)
+    assert any(y0 <= 2100 <= y1 for _, y0, _, y1 in direct_party)
+
+    direct_amount = _cdm_amount_direct_windows(img, lines)
+    assert any(y0 <= 2980 <= y1 for _, y0, _, y1 in direct_amount)
+    assert any(y0 <= 3350 <= y1 for _, y0, _, y1 in direct_amount)
+
+    direct_header = _cdm_header_direct_windows(img, lines)
+    assert len(direct_header) == 3
+    # 中列覆盖 TIME 值，右列覆盖 TERMINAL ID。
+    assert direct_header[1][0] <= 1080 <= direct_header[1][2]
+    assert direct_header[2][0] <= 1700 <= direct_header[2][2]
+    direct_branch = _cdm_branch_direct_windows(img, lines)
+    assert any(y0 <= 920 <= y1 for _, y0, _, y1 in direct_branch)

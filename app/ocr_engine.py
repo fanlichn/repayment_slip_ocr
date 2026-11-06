@@ -54,12 +54,11 @@ class PaddleOcrEngine:
         self._ensure()
 
     @staticmethod
-    def _bounded_image(image, max_side: int = 3200, max_pixels: int = 8_000_000):
+    def _bounded_image(image, max_side: int = 5000, max_pixels: int = 16_000_000):
         """限制 Paddle 输入，返回 ``(连续数组, 坐标恢复倍率)``。
 
-        高分辨率原图和 2.5x CDM 裁剪可超过 12MP，CPU oneDNN/Paddle 偶发
-        ``could not execute a primitive``。检测本身会缩放，预先限幅不会损失
-        实际检测分辨率；输出框再映射回原坐标。
+        保留常见 4096×3072 原图的原始清晰度；只限制超过 16MP 的异常输入。
+        检测输出框再映射回原坐标。
         """
         arr = np.asarray(image)
         if arr.ndim not in (2, 3) or arr.size == 0:
@@ -73,7 +72,8 @@ class PaddleOcrEngine:
         if scale < 0.999:
             arr = cv2.resize(
                 arr,
-                (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                # floor，避免两个维度各自 round 后略超 max_pixels。
+                (max(1, int(w * scale)), max(1, int(h * scale))),
                 interpolation=cv2.INTER_AREA,
             )
         return np.ascontiguousarray(arr), (1.0 / scale if scale else 1.0)
@@ -81,23 +81,32 @@ class PaddleOcrEngine:
     def _run(self, ocr, image):
         return ocr.ocr(image, cls=self._settings.paddle_use_angle_cls)
 
+    def _run_line(self, ocr, image):
+        return ocr.ocr(
+            image,
+            det=False,
+            rec=True,
+            cls=self._settings.paddle_use_angle_cls,
+        )
+
+    def _with_primitive_retry(self, runner, image):
+        ocr = self._ensure()
+        try:
+            return runner(ocr, image)
+        except RuntimeError as exc:
+            if "could not execute a primitive" not in str(exc).lower():
+                raise
+            logger.warning("Paddle primitive 执行失败，重建 predictor 后重试一次")
+            self._ocr = None
+            del ocr
+            gc.collect()
+            self._ocr = self._new_ocr()
+            return runner(self._ocr, image)
+
     def recognize(self, image) -> List[OcrLine]:
         bounded, restore = self._bounded_image(image)
         with self._lock:
-            ocr = self._ensure()
-            try:
-                result = self._run(ocr, bounded)
-            except RuntimeError as exc:
-                # oneDNN primitive/predictor 状态错误可污染当前实例。只对这一类
-                # 底层错误重建并重试一次；其它 RuntimeError 保留原堆栈。
-                if "could not execute a primitive" not in str(exc).lower():
-                    raise
-                logger.warning("Paddle primitive 执行失败，重建 predictor 后重试一次")
-                self._ocr = None
-                del ocr
-                gc.collect()
-                self._ocr = self._new_ocr()
-                result = self._run(self._ocr, bounded)
+            result = self._with_primitive_retry(self._run, bounded)
         lines: List[OcrLine] = []
         for page in result or []:
             if not page:
@@ -116,6 +125,39 @@ class PaddleOcrEngine:
                     )
                 )
         return lines
+
+    def recognize_line(self, image) -> List[OcrLine]:
+        """跳过文本检测，直接识别一个已裁好的单行区域。
+
+        折痕热敏票常出现“字清晰但检测器不给框”。CDM 已知行带可直接交给
+        recognition model，避免检测阶段漏掉 ACCOUNT / 11,400。
+        """
+        bounded, _ = self._bounded_image(image, max_side=3200, max_pixels=4_000_000)
+        with self._lock:
+            result = self._with_primitive_retry(self._run_line, bounded)
+
+        pairs = []
+
+        def _visit(node):
+            if isinstance(node, (list, tuple)):
+                if (
+                    len(node) == 2
+                    and isinstance(node[0], str)
+                    and isinstance(node[1], (int, float))
+                ):
+                    pairs.append((node[0], float(node[1])))
+                    return
+                for child in node:
+                    _visit(child)
+
+        _visit(result)
+        h, w = np.asarray(image).shape[:2]
+        box = [[0.0, 0.0], [float(w), 0.0], [float(w), float(h)], [0.0, float(h)]]
+        return [
+            OcrLine(text=text or "", confidence=conf, box=box)
+            for text, conf in pairs
+            if (text or "").strip()
+        ]
 
 
 class TesseractOcrEngine:

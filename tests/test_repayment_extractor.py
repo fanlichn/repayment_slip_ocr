@@ -1609,6 +1609,51 @@ def test_cdm_sum_amount_column_when_value_col_missing():
     assert "11,400.00" in str(r.fields.get("DEPOSIT AMOUNT") or "").replace(" ", "")
 
 
+def test_cdm_sum_fused_direct_amount_rows_when_total_reads_as_400():
+    """NAWALAPI 实际回传：总额 11,400 被读成 400，粘连行仍证明三行合计 11,400。"""
+    L = lambda txt, x0, x1, y, conf=0.9: _lr(
+        txt, x0, y - 20, x1, y + 20, conf
+    )
+    lines = [
+        L("DATE", 500, 682, 1280),
+        L("02/11/26", 500, 843, 1360),
+        L("TIME", 981, 1157, 1260),
+        L("08:03", 983, 1193, 1340),
+        L("TRACE", 513, 734, 1500),
+        L("3528", 999, 1183, 1480),
+        L("NUMBER1001096962", 110, 2305, 1840, 0.81),
+        L("CUSTOMFR NAME LAK ARTHA SERVICE", 110, 2305, 2000, 0.86),
+        L("SOURCEFFUNDNN", 110, 2305, 2700, 0.76),
+        L("UNKNOWN", 1250, 1900, 2700, 0.91),
+        L("NOTES", 604, 831, 2900),
+        L("VALUE", 979, 1198, 2880),
+        L("AMOUNT", 1873, 2131, 2820),
+        L("4", 829, 881, 3060),
+        L("1", 833, 890, 3150),
+        L("2", 847, 890, 3230),
+        L("400.00", 1888, 2156, 2970, 0.99),
+        L("0400.00", 1028, 2717, 2970, 0.83),
+        L("10000400.00", 1028, 2717, 2970, 0.82),
+        L("1.000.00", 1813, 2160, 3070, 0.99),
+        L("KR00.001.000.00", 1028, 2717, 3070, 0.81),
+        L("R500.0010.000.00", 1028, 2717, 3170, 0.86),
+        L("KR5000.0010.000.00", 1028, 2717, 3170, 0.83),
+        L("00.0010.000.0", 1028, 2717, 3170, 0.83),
+        L("LKR", 1413, 1561, 3350, 0.99),
+        L("OUNTLKR.400.", 1028, 2717, 3340, 0.84),
+        L("TION STATUSSUCCESSFUL", 1028, 2717, 3500, 0.87),
+    ]
+
+    r = extract(lines)
+
+    assert r.amount == 11400.0
+    assert r.fields["DEPOSIT AMOUNT"] == "11,400.00"
+    assert r.fields["ACCOUNT NUMBER"] == "1001096962"
+    assert r.fields["SOURCE OF FUNDS"] == "UNKNOWN"
+    assert "NARRATION" not in r.fields
+    assert "MOBILE NO." not in r.fields
+
+
 def test_cdm_deposit_label_must_not_take_nearest_row_amount():
     """DEPOSIT AMOUNT 标签右侧若最近是行小计 400，应改取更大的 11,400。"""
     L = lambda txt, x0, x1, y: _lr(txt, x0, y - 16, x1, y + 16)

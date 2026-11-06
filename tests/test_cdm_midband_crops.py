@@ -1,11 +1,14 @@
 """CDM 中间带裁剪坐标单测：禁止把账号带错映射到 NOTES 表。"""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from app.ocr_engine import OcrLine
 from repayment_slip_ocr.main import (
     _anchor_scale_y,
+    _add_cdm_explicit_nulls,
     _cdm_amount_direct_windows,
     _cdm_account_digits_weak,
     _cdm_branch_direct_windows,
@@ -176,4 +179,21 @@ def test_nawalapi_sparse_crops_cover_party_amount_terminal():
     assert direct_header[1][0] <= 1080 <= direct_header[1][2]
     assert direct_header[2][0] <= 1700 <= direct_header[2][2]
     direct_branch = _cdm_branch_direct_windows(img, lines)
-    assert any(y0 <= 920 <= y1 for _, y0, _, y1 in direct_branch)
+    assert any(y0 <= 1030 <= y1 for _, y0, _, y1 in direct_branch)
+
+
+def test_cdm_visible_blank_labels_are_returned_as_null():
+    result = SimpleNamespace(
+        doc_type="cash_deposit_slip",
+        fields={"TRANSACTION": "CARDLESS DEPOSIT"},
+    )
+    out = {"TRANSACTION": "CARDLESS DEPOSIT"}
+    lines = [
+        _lr("ARRATION", 100, 2100, 800, 2180),
+        _lr("MOBILENO.", 100, 2400, 800, 2480),
+    ]
+
+    _add_cdm_explicit_nulls(out, result, lines)
+
+    assert "NARRATION" in out and out["NARRATION"] is None
+    assert "MOBILE NO." in out and out["MOBILE NO."] is None

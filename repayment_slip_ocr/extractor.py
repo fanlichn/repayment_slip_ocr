@@ -514,6 +514,11 @@ def _recover_cdm_deposit_amount_from_notes_band(lines) -> Optional[float]:
     """
     if not lines:
         return None
+    # 面额表三条 AMOUNT 行齐全时，列加总比被折痕误读的总额行更可靠。
+    # 例如总额 11,400 被识别成 400，但行小计仍是 400+1,000+10,000。
+    summed = _sum_cdm_notes_amount_column(lines)
+    if summed is not None:
+        return summed
     anchor_ys = []
     for ln in lines:
         low = " ".join(ln.text.lower().split())
@@ -592,6 +597,22 @@ def _recover_cdm_deposit_amount_from_notes_band(lines) -> Optional[float]:
     return picked
 
 
+def _last_cdm_fused_money(text: str) -> Optional[float]:
+    """取直读粘连行最右金额：``LKR5000.0010.000.00`` → 10,000。
+
+    CDM 行直读会把 VALUE 与 AMOUNT 两列粘在一起；票面 AMOUNT 在最右侧，
+    因而只能在 NOTES 表上下文中使用这个规则。
+    """
+    compact = re.sub(r"\s+", "", text or "")
+    tokens = re.findall(r"\d{1,3}(?:[.,]\d{3})*[.,]\d{1,2}", compact)
+    if not tokens:
+        return None
+    val = _parse_money(tokens[-1])
+    if val is None or val < 100 or val >= 50_000_000:
+        return None
+    return val
+
+
 def _sum_cdm_notes_amount_column(lines) -> Optional[float]:
     """NOTES/VALUE/AMOUNT 表：张数行与 AMOUNT 列一一对应时加总为存款额。
 
@@ -618,7 +639,15 @@ def _sum_cdm_notes_amount_column(lines) -> Optional[float]:
     b_amt = (value_cx + amount_cx) / 2 if "value" in headers else (notes_cx + amount_cx) / 2
     header_y = min(headers[k][2] for k in headers)
     qty_rows: list = []
-    amount_rows: list = []
+    amount_cands: list = []
+    total_lkr_ys = [
+        _line_center_y(ln.box)
+        for ln in ordered
+        if re.fullmatch(r"(?i)\s*lkr\s*", ln.text)
+        and _line_center_y(ln.box) > header_y + 180
+    ]
+    # 最底部独立 LKR 是 DEPOSIT AMOUNT 行；它及其误读总额不能混入行小计。
+    row_y_max = max(total_lkr_ys) - 45 if total_lkr_ys else float("inf")
     for ln in ordered:
         y = _line_center_y(ln.box)
         if y <= header_y + 2:
@@ -636,14 +665,40 @@ def _sum_cdm_notes_amount_column(lines) -> Optional[float]:
             else:
                 qty_rows.append((y, int(t), conf))
         elif cx >= b_amt:
-            val = _parse_money(t)
+            if y >= row_y_max:
+                continue
+            # 宽框是 direct-recognition 行，最右 token 才是 AMOUNT；
+            # 普通窄框仍按原始金额解析。
+            box_w = max(p[0] for p in ln.box) - min(p[0] for p in ln.box)
+            val = _last_cdm_fused_money(t) if box_w > 700 else _parse_money(t)
             if val is None or val < 100 or val >= 50_000_000:
                 continue
-            if amount_rows and abs(y - amount_rows[-1][0]) < 15:
-                if val > amount_rows[-1][1]:
-                    amount_rows[-1] = (y, val)
-            else:
-                amount_rows.append((y, val))
+            conf = float(getattr(ln, "confidence", 0.0) or 0.0)
+            amount_cands.append((y, val, conf))
+
+    # 同行多个 OCR 变体按 y 聚类，再取金额众数（拒绝 KR881.000.80 等单次噪声）。
+    amount_groups: list = []
+    for y, val, conf in sorted(amount_cands):
+        if amount_groups and abs(y - amount_groups[-1][0][0]) < 40:
+            amount_groups[-1].append((y, val, conf))
+        else:
+            amount_groups.append([(y, val, conf)])
+    amount_rows: list = []
+    for group in amount_groups:
+        counts = Counter(round(item[1], 2) for item in group)
+        picked_val = max(
+            counts,
+            key=lambda value: (
+                counts[value],
+                max(item[2] for item in group if round(item[1], 2) == value),
+            ),
+        )
+        matching = [item for item in group if round(item[1], 2) == picked_val]
+        best = max(matching, key=lambda item: item[2])
+        amount_rows.append((sum(item[0] for item in matching) / len(matching), best[1]))
+
+    if len(amount_rows) > len(qty_rows) >= 2:
+        amount_rows = amount_rows[: len(qty_rows)]
     if len(qty_rows) < 2 or len(qty_rows) != len(amount_rows):
         return None
     total = sum(v for _, v in amount_rows)
@@ -1275,8 +1330,13 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
     # CDM 漏读 DEPOSIT AMOUNT 标签：从 NOTES/AMOUNT 带回收（如仅有 15.000.00）
     low_all = "\n".join(ln.text.lower() for ln in lines)
     is_cdm_amt = "cardless" in low_all or "deposit" in low_all or _has_notes_value_table(lines)
-    if amount is None and is_cdm_amt and fee is None:
-        amount = _recover_cdm_deposit_amount_from_notes_band(lines)
+    if is_cdm_amt and fee is None:
+        summed_rows = _sum_cdm_notes_amount_column(lines)
+        if summed_rows is not None:
+            # 三行 AMOUNT 与张数行一一对应时，列加总覆盖被折痕截成 400 的总额。
+            amount = summed_rows
+        elif amount is None:
+            amount = _recover_cdm_deposit_amount_from_notes_band(lines)
     # 现金存款（CDM）无 TOTAL 行，DEPOSIT AMOUNT 即总额。
     # 注意：若已识别到 fee（转账收据），不应把 total 设为 amount，
     # 否则 amount+fee != total 会产生误报。
@@ -3870,6 +3930,31 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
     )
     if completed:
         fields["ACCOUNT NUMBER"] = completed
+    # SOURCE OF FUNDS 折痕直读常变成 SOURCEFFUNDNN，值侧单独仍可读到 UNKNOWN。
+    # 仅在同一视觉行有明确 UNKNOWN 证据时回填，不推测空字段。
+    if not fields.get("SOURCE OF FUNDS"):
+        source_lines = []
+        unknown_lines = []
+        for ln in lines:
+            compact = re.sub(r"[^a-z]", "", ln.text.lower())
+            if "source" in compact and "fund" in compact:
+                source_lines.append(ln)
+                if "unknown" in compact:
+                    fields["SOURCE OF FUNDS"] = "UNKNOWN"
+                    break
+            if re.search(r"(?i)\bunknown\b", ln.text):
+                unknown_lines.append(ln)
+        if not fields.get("SOURCE OF FUNDS"):
+            for source_ln in source_lines:
+                sy = _line_center_y(source_ln.box)
+                nearby = [
+                    ln
+                    for ln in unknown_lines
+                    if abs(_line_center_y(ln.box) - sy) <= 90
+                ]
+                if nearby:
+                    fields["SOURCE OF FUNDS"] = "UNKNOWN"
+                    break
     # 空字段 OCR 残片：NARRATION/MOBILE 读成 IARRATION: / IOBILE NO.: 时清空
     for blank_key in ("NARRATION", "MOBILE NO.", "SOURCE OF FUNDS", "CUSTOMER NAME"):
         val = fields.get(blank_key)
@@ -3947,7 +4032,8 @@ def _looks_like_cdm_notes_row_amount(amount: float, lines) -> bool:
             continue
         if _looks_like_label_text(t) or _looks_like_notes_header(t):
             continue
-        val = _parse_money(t)
+        box_w = max(p[0] for p in ln.box) - min(p[0] for p in ln.box)
+        val = _last_cdm_fused_money(t) if box_w > 700 else _parse_money(t)
         if val is None or val < 100 or val >= 50_000_000:
             continue
         moneys.append(val)

@@ -72,7 +72,7 @@ def _structured_fallback(result) -> Dict[str, Any]:
         or refs.retrieval_ref or refs.e_receipt_reference or refs.my_ref
         or refs.receiver_ref
     )
-    return {
+    values = {
         "status": result.status,
         "bank": result.bank,
         "amount": result.amount,
@@ -89,6 +89,20 @@ def _structured_fallback(result) -> Dict[str, Any]:
         "transaction_reference": transaction_reference,
         "remarks": refs.remarks,
     }
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _add_cdm_explicit_nulls(
+    out: Dict[str, Any], result, lines: List[OcrLine]
+) -> None:
+    """票面有空标签时明确返回 null；仅依据识别到的标签，不臆造字段。"""
+    if not _is_cdm_result(result):
+        return
+    compacts = [re.sub(r"[^a-z]", "", ln.text.lower()) for ln in lines]
+    if any("narration" in text or "arration" in text for text in compacts):
+        out.setdefault("NARRATION", None)
+    if any("mobileno" in text or "obileno" in text for text in compacts):
+        out.setdefault("MOBILE NO.", None)
 
 
 def _line_center_y(box) -> float:
@@ -702,10 +716,22 @@ def _cdm_party_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tup
     # 单行直读不得夹入下一行；热敏字高约 70–90px。
     half = max(52.0, min(68.0, span * 0.05))
     centers = (0.15, 0.28, 0.49, 0.69, 0.84)
-    return [
+    full_rows = [
         (rx0, y_txn + span * frac - half, party_x1, y_txn + span * frac + half)
         for frac in centers
     ]
+    # 右侧值单独直读：尤其 SOURCE OF FUNDS: UNKNOWN，整行识别常只剩标签。
+    value_x0 = rx0 + (party_x1 - rx0) * 0.45
+    value_rows = [
+        (
+            value_x0,
+            y_txn + span * frac - half,
+            party_x1,
+            y_txn + span * frac + half,
+        )
+        for frac in centers
+    ]
+    return full_rows + value_rows
 
 
 def _cdm_amount_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:
@@ -754,7 +780,12 @@ def _cdm_header_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tu
         return [
             (max(rx0, date_cx - gap * 0.55), y0, boundary, y1),
             (boundary, y0, min(rx1, time_cx + gap * 0.65), y1),
-            (max(rx0, time_cx + gap * 0.50), y0, rx1, y1),
+            (
+                max(rx0, time_cx + gap * 0.50),
+                y0,
+                min(rx1, time_cx + gap * 1.85),
+                y1,
+            ),
         ]
     span_x = rx1 - rx0
     cuts = (0.0, 0.27, 0.50, 1.0)
@@ -769,9 +800,17 @@ def _cdm_branch_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tu
     h, w = img.shape[:2]
     rx0, rx1 = _cdm_receipt_x_bounds(lines, w)
     y_date = min(_anchor_ys(lines, ["date"]), default=h * 0.31)
-    center = y_date - h * 0.09
-    half = max(55.0, min(80.0, h * 0.017))
-    return [(rx0, center - half, rx1, center + half)]
+    center = y_date - h * 0.06
+    half = max(50.0, min(68.0, h * 0.014))
+    span_x = rx1 - rx0
+    return [
+        (
+            rx0 + span_x * 0.16,
+            center - half,
+            rx0 + span_x * 0.84,
+            center + half,
+        )
+    ]
 
 
 def _norm_main_label(text: str) -> str:
@@ -1278,6 +1317,7 @@ def _recognize(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     out: Dict[str, Any] = {"success": result.success}
     out.update(result.fields if result.fields else _structured_fallback(result))
     out["bank"] = result.bank.upper() if result.bank else ""
+    _add_cdm_explicit_nulls(out, result, unique)
     if include_lines:
         out["lines"] = [l.dict() for l in result.lines]
     return out
@@ -1288,13 +1328,13 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/ocr", response_model=Dict[str, Any], response_model_exclude_none=True)
+@app.post("/ocr", response_model=Dict[str, Any])
 async def ocr(file: UploadFile = File(...), include_lines: bool = False):
     buf = await file.read()
     return _recognize(buf, include_lines=include_lines)
 
 
-@app.post("/ocr_base64", response_model=Dict[str, Any], response_model_exclude_none=True)
+@app.post("/ocr_base64", response_model=Dict[str, Any])
 async def ocr_base64(req: Base64Request, include_lines: bool = False):
     try:
         buf = base64.b64decode(req.image_base64, validate=True)
@@ -1303,7 +1343,7 @@ async def ocr_base64(req: Base64Request, include_lines: bool = False):
     return _recognize(buf, include_lines=include_lines)
 
 
-@app.post("/ocr_url", response_model=Dict[str, Any], response_model_exclude_none=True)
+@app.post("/ocr_url", response_model=Dict[str, Any])
 def ocr_url(req: UrlRequest, include_lines: bool = False):
     try:
         buf = fetch_image_bytes(req.image_url, get_settings())

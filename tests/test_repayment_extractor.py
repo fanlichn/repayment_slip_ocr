@@ -1650,6 +1650,37 @@ def test_cdm_recovers_narration_when_label_and_value_are_fused():
     assert r.fields["NARRATION"] == "BKS47D"
 
 
+def test_cdm_keeps_total_that_is_also_a_common_denomination():
+    """4×500 + 3×1000 = 5000；总额虽等于常见面额，也不能被当作 VALUE 删除。"""
+    L = lambda txt, x0, x1, y: _lr(txt, x0, y - 16, x1, y + 16)
+    lines = [
+        L("COMMERCIAL BANK", 100, 500, 100),
+        L("TRANSACTION CARDLESS DEPOSIT", 100, 900, 300),
+        L("NOTES", 150, 300, 500),
+        L("VALUE", 380, 530, 500),
+        L("AMOUNT", 720, 920, 500),
+        L("4", 210, 250, 570),
+        L("LKR 500.00", 350, 600, 570),
+        L("2,000.00", 730, 940, 570),
+        L("3", 210, 250, 630),
+        L("LKR 1,000.00", 350, 620, 630),
+        L("3,000.00", 730, 940, 630),
+        L("DEPOSIT AMOUNT", 100, 430, 710),
+        L("LKR", 500, 580, 710),
+        L("5,000.00", 730, 940, 710),
+        L("TRANSACTION STATUS SUCCESSFUL", 100, 900, 800),
+    ]
+
+    r = extract(lines)
+
+    assert r.fields["NOTES"] == "4 | 3"
+    assert r.fields["VALUE"] == "LKR 500.00 | LKR 1,000.00"
+    assert r.fields["AMOUNT"] == "2,000.00 | 3,000.00"
+    assert r.fields["DEPOSIT AMOUNT"] == "LKR 5,000.00"
+    assert r.amount == 5000.0
+    assert r.warnings == []
+
+
 def test_cdm_sum_amount_column_when_value_col_missing():
     """VALUE 列漏 5000 但 AMOUNT 列有 400+1000+10000 时，加总得 11400。"""
     L = lambda txt, x0, x1, y: _lr(txt, x0, y - 16, x1, y + 16)

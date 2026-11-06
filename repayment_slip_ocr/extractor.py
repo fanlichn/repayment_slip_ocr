@@ -4203,6 +4203,13 @@ def _looks_like_cdm_notes_row_amount(amount: float, lines) -> bool:
     """
     if not _has_notes_value_table(lines):
         return False
+    breakdown = _breakdown_from_columns(lines, amount)
+    if len(breakdown) >= 2:
+        row_total = sum(float(row.amount) for row in breakdown)
+        # 总额恰好也可能是常见面额（例如 4×500 + 3×1000 = 5,000）。
+        # 明细合计一致是总额强证据，优先于“常见面额”排除规则。
+        if abs(row_total - amount) <= 0.01:
+            return False
     moneys: list = []
     qty_ys: list = []
     deposit_label_y = _cdm_deposit_label_y(lines)

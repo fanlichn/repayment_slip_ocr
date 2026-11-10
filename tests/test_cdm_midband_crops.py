@@ -35,6 +35,29 @@ def _lr(text: str, x0, y0, x1, y1) -> OcrLine:
     )
 
 
+def test_amount_window_covers_sloping_total_when_deposit_label_is_missing():
+    for scale in (1.0, 0.25):
+        img = np.zeros((int(4160 * scale), int(2340 * scale), 3), dtype=np.uint8)
+        lines = [
+            _lr(text, *(v * scale for v in coords))
+            for text, coords in [
+                ("NOTES", (144, 2970, 428, 3062)),
+                ("VALUE", (592, 2952, 849, 3041)),
+                ("LKR", (594, 3146, 753, 3233)),
+                ("LKR", (1050, 3406, 1217, 3510)),
+                (".500.00", (782, 3476, 2031, 3614)),
+            ]
+        ]
+        windows = _cdm_amount_direct_windows(img, lines)
+        # Total slopes down to the right of its currency; thin fixed rows miss it.
+        assert any(
+            x0 <= 1530 * scale and x1 >= 1900 * scale
+            and y0 <= 3500 * scale and y1 >= 3580 * scale
+            and y0 > 3390 * scale  # excludes the 5,000 row subtotal
+            for x0, y0, x1, y1 in windows
+        )
+
+
 def test_direct_line_windows_can_run_one_prep_then_fallback():
     class Engine:
         def __init__(self):

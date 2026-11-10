@@ -1338,8 +1338,10 @@ def _extract_amounts(lines) -> tuple[Optional[float], Optional[float], Optional[
         if summed_rows is not None:
             # 三行 AMOUNT 与张数行一一对应时，列加总覆盖被折痕截成 400 的总额。
             amount = summed_rows
-        elif amount is None:
-            amount = _recover_cdm_deposit_amount_from_notes_band(lines)
+        elif amount is None or _looks_like_cdm_notes_row_amount(amount, lines):
+            recovered = _recover_cdm_deposit_amount_from_notes_band(lines)
+            if recovered is not None:
+                amount = recovered
     # 现金存款（CDM）无 TOTAL 行，DEPOSIT AMOUNT 即总额。
     # 注意：若已识别到 fee（转账收据），不应把 total 设为 amount，
     # 否则 amount+fee != total 会产生误报。

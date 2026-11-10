@@ -35,6 +35,7 @@ from app.stage_timing import (
 from app.url_fetch import UrlFetchError, fetch_image_bytes
 
 from .extractor import (
+    _is_tall_box,
     _is_ntb_description_code,
     _is_ntb_ocr_junk_token,
     _is_ntb_watermark_text,
@@ -782,10 +783,24 @@ def _cdm_amount_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tu
     # 以票高归一化，覆盖 400/1000/10000、11,400 和状态行。
     offsets = (0.040, 0.065, 0.090, 0.132, 0.170)
     half = max(12.0, min(62.0, h * 0.0135))
-    return [
+    windows = [
         (left, y_notes + h * frac - half, rx1, y_notes + h * frac + half)
         for frac in offsets
     ]
+    # 倾斜凭条的总额低于左侧 LKR；固定薄行会截掉千位数字。
+    # 只锚定 NOTES 表下方的独立币种，避开表内各行的 LKR。
+    currencies = [
+        ln for ln in lines
+        if re.fullmatch(r"(?i)\s*lkr\s*", ln.text)
+        and _line_center_y(ln.box) > y_notes + h * 0.08
+        and not _is_tall_box(ln.box)
+    ]
+    if currencies:
+        anchor = max(currencies, key=lambda ln: _line_center_y(ln.box))
+        cy = _line_center_y(anchor.box)
+        x0 = max(left, max(p[0] for p in anchor.box) + w * 0.08)
+        windows.append((x0, cy - h * 0.002, rx1, cy + h * 0.04))
+    return windows
 
 
 def _cdm_table_direct_windows(img: np.ndarray, lines: List[OcrLine]) -> List[tuple]:

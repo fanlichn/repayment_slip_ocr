@@ -10,6 +10,30 @@ from app.ocr_engine import OcrLine
 from repayment_slip_ocr.extractor import extract
 
 
+def test_cdm_mutwal_recovered_total_replaces_partial_row_amount():
+    # Real OCR geometry: deposit/AMOUNT headers are absent; the original total
+    # lost its leading digit. A tight recognition-only crop restores 5.500.00.
+    rows = [
+        ("CARDLESS DEPOSIT", 861, 1616, 1699, 1712),
+        ("NOTES", 144, 2970, 428, 3062),
+        ("VALUE", 592, 2952, 849, 3041),
+        ("1", 404, 3163, 460, 3241),
+        ("5", 391, 3250, 460, 3350),
+        ("LKR500.00", 491, 3120, 1257, 3244),
+        ("LKR1.000.00", 491, 3218, 1257, 3342),
+        ("500.00", 1233, 3168, 2030, 3292),
+        ("5.000.00", 1233, 3266, 2030, 3390),
+        ("LKR", 1050, 3406, 1217, 3510),
+        (".500.00", 782, 3476, 2031, 3614),
+    ]
+    lines = [_lr(*row) for row in rows]
+    assert extract(lines).amount is None  # do not report a denomination as total
+    result = extract(lines + [_lr("5.500.00", 1388, 3433, 2140, 3640)])
+    assert result.amount == 5500.0
+    assert result.total_debit == 5500.0
+    assert result.fields["DEPOSIT AMOUNT"] == "5,500.00"
+
+
 def _line(text: str, y: float, conf: float = 0.9, h: float = 40.0) -> OcrLine:
     box = [
         [100, y - h / 2],

@@ -1836,6 +1836,11 @@ def _recognize_impl(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     with stage("result_assembly"):
         out: Dict[str, Any] = {"success": result.success}
         out.update(result.fields if result.fields else _structured_fallback(result))
+        # 对外统一存款总额格式，不受 OCR 是否读到 LKR 前缀影响。
+        if out.get("DEPOSIT AMOUNT"):
+            deposit_amount = _parse_money(str(out["DEPOSIT AMOUNT"]))
+            if deposit_amount is not None:
+                out["DEPOSIT AMOUNT"] = f"{deposit_amount:,.2f}"
         out["bank"] = result.bank.upper() if result.bank else ""
         _add_cdm_explicit_nulls(out, result, unique)
         if result.warnings:

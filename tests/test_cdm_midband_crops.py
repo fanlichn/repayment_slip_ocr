@@ -13,6 +13,7 @@ from repayment_slip_ocr.main import (
     _cdm_account_digits_weak,
     _cdm_branch_direct_windows,
     _cdm_header_direct_windows,
+    _cdm_missing_deposit_amount,
     _cdm_missing_header_fields,
     _cdm_party_direct_windows,
     _cdm_table_direct_windows,
@@ -33,6 +34,19 @@ def _lr(text: str, x0, y0, x1, y1) -> OcrLine:
         confidence=0.9,
         box=[[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
     )
+
+
+def test_single_note_total_stops_amount_retry_only_with_total_row_evidence():
+    result = SimpleNamespace(
+        doc_type="cash_deposit_slip", amount=1000.0,
+        fields={"DEPOSIT AMOUNT": "1,000.00"},
+    )
+    subtotal = _lr("1.000.00", 1194, 2457, 1438, 2503)
+    label = _lr("DEPOSIT AMOUNT:", 352, 2587, 803, 2673)
+    total = _lr("1.000.00", 1194, 2557, 1435, 2599)
+
+    assert _cdm_missing_deposit_amount(result, [subtotal, label])
+    assert not _cdm_missing_deposit_amount(result, [subtotal, label, total])
 
 
 def test_amount_window_covers_sloping_total_when_deposit_label_is_missing():

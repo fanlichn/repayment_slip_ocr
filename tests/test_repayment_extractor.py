@@ -9,6 +9,25 @@ from __future__ import annotations
 from app.ocr_engine import OcrLine
 from repayment_slip_ocr.extractor import extract
 
+def test_cdm_trace_digits_do_not_override_time():
+    lines = [
+        _lr("COMMERCIAL BANK OF CEYLON PLC", 340, 870, 1250, 930),
+        _lr("DATE", 280, 1190, 400, 1255),
+        _lr("11/11/26", 280, 1260, 535, 1320),
+        _lr("TIME", 650, 1180, 786, 1248),
+        _lr("12:12", 659, 1248, 818, 1308, 0.98),
+        _lr("TRACE", 304, 1373, 466, 1435),
+        _lr("1600", 663, 1364, 794, 1424, 0.999),
+        _lr("CARDLESS DEPOSIT", 726, 1533, 1268, 1575),
+    ]
+
+    result = extract(lines)
+
+    assert result.fields["TRACE"] == "1600"
+    assert result.fields["TIME"] == "12:12"
+    assert result.fields["Transaction Date/Time"] == "2026-11-11 12:12:00"
+    assert "TIME" not in extract([ln for ln in lines if ln.text != "12:12"]).fields
+
 
 def test_cdm_mutwal_recovered_total_replaces_partial_row_amount():
     # Real OCR geometry: deposit/AMOUNT headers are absent; the original total

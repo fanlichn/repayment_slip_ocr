@@ -3971,9 +3971,9 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
     """纠正竖拍/串列导致的 CDM DATE/TIME/TERMINAL/TRACE/ACCOUNT 等错绑。"""
     typed_keys = (
         "DATE",
+        "TRACE",
         "TIME",
         "TERMINAL ID",
-        "TRACE",
         "TRANSACTION STATUS",
         "ACCOUNT NUMBER",
         "TRANSACTION",
@@ -4005,7 +4005,24 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
         label_i = None
         label_ln = None
         target = _norm_label(key)
-        for i, ln in enumerate(ordered):
+        candidates = ordered
+        rejected_time = None
+        if key == "TIME" and fields.get("TRACE"):
+            trace = str(fields["TRACE"])
+            trace_rows = [
+                (_line_center_y(ln.box), max(p[1] for p in ln.box) - min(p[1] for p in ln.box))
+                for ln in ordered if _norm_label(ln.text) == "trace"
+            ]
+            # 例如 TRACE 1600 可以通过无冒号时间校验，但不能作为 TIME 的证据。
+            candidates = [
+                ln for ln in ordered
+                if ln.text.strip() != trace or not any(
+                    abs(_line_center_y(ln.box) - y) <= height for y, height in trace_rows
+                )
+            ]
+            if len(candidates) != len(ordered):
+                rejected_time = _normalize_cdm_time(trace)
+        for i, ln in enumerate(candidates):
             # TERMINAL / ERMINAL 等残缺标签
             norm = _norm_label(ln.text)
             if norm == target or (
@@ -4018,7 +4035,7 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
                 break
         found = None
         if label_ln is not None:
-            found = _pick_cdm_typed_near(label_i, ordered, label_ln, key)
+            found = _pick_cdm_typed_near(label_i, candidates, label_ln, key)
         if found is None and key in (
             "TIME",
             "TRACE",
@@ -4028,7 +4045,7 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
         ):
             # 标签漏读时：全卡扫描，TIME/TRACE 取置信度最高者
             best = None
-            for ln in ordered:
+            for ln in candidates:
                 low = ln.text.lower()
                 if key == "TRACE":
                     # 面额表/金额带噪点（8888、18.88）不当 TRACE
@@ -4066,7 +4083,10 @@ def _repair_cdm_typed_fields(fields: dict, lines) -> dict:
             elif key == "TERMINAL ID":
                 found = _normalize_cdm_terminal_id(found) or found
             fields[key] = found
-        elif key in fields and not _is_plausible_cdm_field_value(key, fields[key]):
+        elif key in fields and (
+            not _is_plausible_cdm_field_value(key, fields[key])
+            or (rejected_time is not None and _normalize_cdm_time(fields[key]) == rejected_time)
+        ):
             fields.pop(key, None)
     # ACCOUNT：弱截断号时用更长候选 / Lak Artha 入账号补全覆盖
     cur_acct = fields.get("ACCOUNT NUMBER")

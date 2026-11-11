@@ -41,6 +41,7 @@ from .extractor import (
     _is_ntb_watermark_text,
     _ntb_description_contaminated,
     _parse_money,
+    _reliable_explicit_cdm_deposit_amount,
     _scrub_ntb_watermark_glue,
     dedup_lines,
     extract,
@@ -162,20 +163,25 @@ def _cdm_missing_party_fields(result) -> bool:
     return _cdm_account_digits_weak(fields.get("ACCOUNT NUMBER"))
 
 
-def _cdm_missing_deposit_amount(result) -> bool:
+def _cdm_missing_deposit_amount(result, lines: List[OcrLine]) -> bool:
     """CDM 缺存款总额时，对金额带（DEPOSIT AMOUNT / 面额表）复检。"""
     if not _is_cdm_result(result):
         return False
     fields = result.fields or {}
     amt = result.amount
     dep = fields.get("DEPOSIT AMOUNT")
+    parsed = _parse_money(str(dep)) if dep else None
     # 行小计（如 400=4×100）被当成总额时仍须复检
-    if amt is not None and _looks_like_row_subtotal_deposit(amt, fields):
-        return True
-    if dep:
-        parsed = _parse_money(str(dep))
-        if parsed is not None and _looks_like_row_subtotal_deposit(parsed, fields):
-            return True
+    if any(
+        value is not None and _looks_like_row_subtotal_deposit(value, fields)
+        for value in (amt, parsed)
+    ):
+        # 单张存款的总额本来就等于面额，有明确总额行时无需反复 OCR。
+        return (
+            amt is None
+            or parsed != amt
+            or _reliable_explicit_cdm_deposit_amount(lines) != amt
+        )
     if dep and amt is not None:
         return False
     if amt is not None and amt >= 100:
@@ -1021,7 +1027,7 @@ def _cdm_amount_fields_complete(
     base_lines: List[OcrLine], extras: List[OcrLine]
 ) -> bool:
     result = _probe_cdm_result(base_lines, extras, "cdm_amount_early_stop")
-    if _cdm_missing_deposit_amount(result):
+    if _cdm_missing_deposit_amount(result, base_lines + extras):
         return False
     headers = {
         (
@@ -1698,7 +1704,7 @@ def _recognize_impl(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
                     unique, include_lines=True, pass_name="cdm_party_lines"
                 )
     # CDM DEPOSIT AMOUNT：远距/竖排常漏总额，对金额带复检
-    if _cdm_missing_deposit_amount(result):
+    if _cdm_missing_deposit_amount(result, unique):
         extras = []
         for name in _cdm_band_variants:
             with operation(f"cdm_amount:{name}"):
@@ -1712,7 +1718,7 @@ def _recognize_impl(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
             probe_result = _extract_timed(
                 probe, include_lines=False, pass_name=f"cdm_amount_probe:{name}"
             )
-            if not _cdm_missing_deposit_amount(probe_result):
+            if not _cdm_missing_deposit_amount(probe_result, probe):
                 unique = probe
                 result = _extract_timed(
                     unique,
@@ -1728,6 +1734,31 @@ def _recognize_impl(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
                     include_lines=include_lines,
                     pass_name="cdm_amount_fallback",
                 )
+    elif (
+        _is_cdm_result(result)
+        and result.amount is not None
+        and _looks_like_row_subtotal_deposit(result.amount, result.fields)
+        and (not result.deposit_breakdown or not result.fields.get("TRANSACTION STATUS"))
+    ):
+        # 总额已有证据。只补读表格和状态，避免因单张存款扫遍所有金额裁剪。
+        img_raw = _variant_img(variants, "color_raw")
+        crops = []
+        if not result.deposit_breakdown:
+            # 第二个裁剪从 NOTES 行开始，左侧留有 VALUE 列的空间。
+            crops.extend(_prepare_cdm_amount_band_crops(img_raw, unique)[1:2])
+        if not result.fields.get("TRANSACTION STATUS"):
+            crops.extend(_priority_cdm_amount_crops(img_raw, unique)[:1])
+        extras = []
+        with stage("ocr_band_cdm_amount_details"):
+            for crop, top, left in crops:
+                extras.extend(_run_cdm_band_ocr(_engine, crop, top, left, (1.5,)))
+        if extras:
+            probe = dedup_lines(unique + extras)
+            candidate = _extract_timed(
+                probe, include_lines=include_lines, pass_name="cdm_amount_details"
+            )
+            if candidate.amount == result.amount and result.fields.keys() <= candidate.fields.keys():
+                unique, result = probe, candidate
     # CDM TERMINAL ID / BRANCH：并排表头右侧与网点行常漏
     if _cdm_missing_header_fields(result):
         extras = []

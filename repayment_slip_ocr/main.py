@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import asyncio
 import re
-import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Optional
@@ -16,11 +16,13 @@ from typing import Any, Callable, Dict, List, Optional
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.config import get_settings
 from app.logging_setup import setup_logging
-from app.ocr_engine import OcrLine, create_engine
+from app.ocr_engine import OcrLine
 from app.preprocessing import (
     build_binarized_variant,
     build_variants,
@@ -32,7 +34,6 @@ from app.stage_timing import (
     request_timing,
     stage,
 )
-from app.url_fetch import UrlFetchError, fetch_image_bytes
 
 from .extractor import (
     _is_tall_box,
@@ -46,24 +47,23 @@ from .extractor import (
     dedup_lines,
     extract,
 )
+from .worker import OcrTimeout, OcrWorker
 
 setup_logging("repayment_ocr")
 
 _engine = None
 _ocr_request_slots = None
+_ocr_worker = None
+_REQUEST_TIMEOUT_SECONDS = 180
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _engine, _ocr_request_slots
-    settings = get_settings()
-    _engine = create_engine(settings)
-    _engine.warmup()
-    limit = max(
-        1, int(settings.ocr_max_concurrent_requests_per_worker or 1)
-    )
-    _ocr_request_slots = threading.BoundedSemaphore(limit)
+    global _ocr_worker
+    _ocr_worker = OcrWorker()
     yield
+    await run_in_threadpool(_ocr_worker.close)
+    _ocr_worker = None
 
 
 app = FastAPI(
@@ -1900,19 +1900,40 @@ def health():
     return {"status": "ok"}
 
 
+async def _run_request(kind, payload, include_lines, deadline):
+    if _ocr_worker is None:
+        raise HTTPException(status_code=503, detail="OCR 服务尚未启动")
+    try:
+        status, result = await asyncio.wait_for(
+            run_in_threadpool(_ocr_worker.run, kind, payload, include_lines, deadline),
+            timeout=max(0, deadline - time.monotonic()),
+        )
+    except (OcrTimeout, asyncio.TimeoutError):
+        return JSONResponse(status_code=504, content={"success": False, "error": "OCR 识别超时，已超过 180 秒"})
+    if status == "error":
+        code, detail = result
+        raise HTTPException(status_code=code, detail=detail)
+    return result
+
+
 @app.post("/ocr", response_model=Dict[str, Any])
 async def ocr(file: UploadFile = File(...), include_lines: bool = False):
+    deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
     settings = get_settings()
     with request_timing(
         settings.stage_timing_log, service="repayment", route="ocr"
     ):
         with stage("upload_read"):
-            buf = await file.read()
-        return _recognize(buf, include_lines=include_lines)
+            try:
+                buf = await asyncio.wait_for(file.read(), timeout=max(0, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                return JSONResponse(status_code=504, content={"success": False, "error": "OCR 识别超时，已超过 180 秒"})
+        return await _run_request("ocr", buf, include_lines, deadline)
 
 
 @app.post("/ocr_base64", response_model=Dict[str, Any])
 async def ocr_base64(req: Base64Request, include_lines: bool = False):
+    deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
     settings = get_settings()
     with request_timing(
         settings.stage_timing_log, service="repayment", route="ocr_base64"
@@ -1922,18 +1943,14 @@ async def ocr_base64(req: Base64Request, include_lines: bool = False):
                 buf = base64.b64decode(req.image_base64, validate=True)
         except (binascii.Error, ValueError):
             raise HTTPException(status_code=400, detail="无效的 base64 图片数据")
-        return _recognize(buf, include_lines=include_lines)
+        return await _run_request("ocr_base64", buf, include_lines, deadline)
 
 
 @app.post("/ocr_url", response_model=Dict[str, Any])
-def ocr_url(req: UrlRequest, include_lines: bool = False):
+async def ocr_url(req: UrlRequest, include_lines: bool = False):
+    deadline = time.monotonic() + _REQUEST_TIMEOUT_SECONDS
     settings = get_settings()
     with request_timing(
         settings.stage_timing_log, service="repayment", route="ocr_url"
     ):
-        try:
-            with stage("image_download"):
-                buf = fetch_image_bytes(req.image_url, settings)
-        except UrlFetchError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        return _recognize(buf, include_lines=include_lines)
+        return await _run_request("ocr_url", req.image_url, include_lines, deadline)

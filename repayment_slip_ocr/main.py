@@ -133,6 +133,8 @@ def _line_center_x(box) -> float:
 
 def _is_cdm_result(result) -> bool:
     fields = result.fields or {}
+    if getattr(result, "bank", None) == "sampath_bank":
+        return False
     return (
         result.doc_type == "cash_deposit_slip"
         or str(fields.get("TRANSACTION", "")).upper().find("CARDLESS") >= 0

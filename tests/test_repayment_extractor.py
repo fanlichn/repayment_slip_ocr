@@ -9,6 +9,38 @@ from __future__ import annotations
 from app.ocr_engine import OcrLine
 from repayment_slip_ocr.extractor import extract
 
+def test_sampath_cash_deposit_fields_and_date_time():
+    lines = [
+        _lr("Sampath Bank PLC", 600, 1250, 1150, 1330),
+        _lr("DATE", 170, 1500, 350, 1560),
+        _lr("15-11-2026", 450, 1490, 820, 1550),
+        _lr("TIME", 170, 1580, 350, 1640),
+        _lr("9:30 PM", 560, 1570, 830, 1630),
+        _lr("ATM ID", 980, 1480, 1200, 1540),
+        _lr("A0013021", 1400, 1460, 1710, 1520),
+        _lr("TRX ID", 980, 1560, 1200, 1620),
+        _lr("292131", 1470, 1540, 1720, 1600),
+        _lr("TRANSACTION", 170, 1710, 640, 1770),
+        _lr("CARDLESS CASH DEPOSIT", 850, 1700, 1700, 1760),
+        _lr("CUSTOMER NAME", 170, 1860, 700, 1920),
+        _lr("LAK ARTHA SERVICES (P)", 860, 1850, 1690, 1910),
+        _lr("ACCOUNT NUMBER", 170, 1950, 760, 2010),
+        _lr("000911004008", 860, 1940, 1330, 2000),
+        _lr("REMARK", 170, 2610, 470, 2670),
+        _lr("MAHENDRAN", 590, 2600, 900, 2660),
+        _lr("TOTAL", 170, 2760, 430, 2820),
+        _lr("LKR 1,500.00", 590, 2750, 1040, 2810),
+        _lr("STATUS", 170, 2830, 440, 2890),
+        _lr("SUCCESS", 590, 2820, 850, 2880),
+    ]
+    result = extract(lines)
+    assert result.bank == "sampath_bank"
+    assert result.fields["ACCOUNT NUMBER"] == "000911004008"
+    assert result.fields["TOTAL"] == "1,500.00"
+    assert result.fields["Date & Time"] == "2026-11-15 21:30:00"
+    assert result.fields["REMARK"] == "MAHENDRAN"
+    assert result.fields["TRX ID"] == "292131"
+
 def test_cdm_trace_digits_do_not_override_time():
     lines = [
         _lr("COMMERCIAL BANK OF CEYLON PLC", 340, 870, 1250, 930),

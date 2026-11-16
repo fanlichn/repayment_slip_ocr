@@ -4844,9 +4844,61 @@ def _extract_branch(lines) -> Optional[str]:
     return _match_label_value(lines, ["branch", "branch name"])
 
 
+def _is_sampath_cash_deposit(lines) -> bool:
+    text = " ".join(line.text.lower() for line in lines)
+    return bool(re.search(r"\bsampath\s+bank\b", text)) and bool(
+        re.search(r"\bcardless\s+cash\s+deposit\b", text)
+    )
+
+
+def _extract_sampath_cash_deposit(lines, include_lines: bool) -> RepaymentResult:
+    labels = (
+        "DATE", "TIME", "ATM ID", "TRX ID", "TRANSACTION", "CUSTOMER NAME",
+        "ACCOUNT NUMBER", "REMARK", "TOTAL", "STATUS", "REFNO",
+    )
+    fields = _build_label_fields(lines, labels, same_row=True)
+    for key in labels:
+        value = _match_label_value(lines, [key])
+        if value:
+            fields[key] = value
+
+    amount = _parse_money(fields.get("TOTAL", ""))
+    if amount is not None:
+        fields["TOTAL"] = f"{amount:,.2f}"
+
+    date_value = fields.get("DATE", "")
+    time_value = fields.get("TIME", "")
+    combined = _parse_datetime(f"{date_value} {time_value}") if time_value else None
+    if combined:
+        fields["Date & Time"] = combined.replace("T", " ")
+    elif date_value:
+        date_only = _parse_datetime(date_value)
+        if date_only:
+            fields["Date & Time"] = date_only.replace("T", " ")
+
+    status_value = fields.get("STATUS", "").upper()
+    status = "success" if status_value in {"SUCCESS", "SUCCESSFUL"} else None
+    return RepaymentResult(
+        success=bool(amount is not None or fields.get("ACCOUNT NUMBER")),
+        doc_type="cash_deposit_slip",
+        status=status,
+        bank="sampath_bank",
+        payee=PartyOut(name=fields.get("CUSTOMER NAME"), account=fields.get("ACCOUNT NUMBER")),
+        amount=amount,
+        total_debit=amount,
+        datetime=combined,
+        fields=fields,
+        terminal_id=fields.get("ATM ID"),
+        references=ReferencesOut(transaction_id=fields.get("TRX ID"), remarks=fields.get("REMARK")),
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
 def extract(lines, include_lines: bool = False) -> RepaymentResult:
     warnings: List[str] = []
 
+    if _is_sampath_cash_deposit(lines):
+        return _extract_sampath_cash_deposit(lines, include_lines)
     # 先剔除旋转文本框（截图上的斜向水印/批注），避免其大范围 box 抢占字段值
     lines = [ln for ln in lines if not _is_rotated_box(ln.box)]
 

@@ -4844,6 +4844,68 @@ def _extract_branch(lines) -> Optional[str]:
     return _match_label_value(lines, ["branch", "branch name"])
 
 
+def _is_ndb_receipt(lines) -> bool:
+    text = " ".join(line.text.lower() for line in lines)
+    return bool(re.search(r"\bnational\s+development\s+bank\b|\bndb\s*bank\b", text)) and all(
+        re.search(pattern, text)
+        for pattern in (r"\bpay\s+to\b", r"\bpay\s+from\b", r"\breceipt\s+id\b")
+    )
+
+
+def _extract_ndb_receipt(lines, include_lines: bool) -> RepaymentResult:
+    labels = (
+        "Pay To", "Bank Name", "Pay From", "Service Charge", "Date & Time",
+        "Receipt ID", "Beneficiary Remarks", "Transaction Status",
+    )
+    fields = _build_label_fields(lines, labels, same_row=True)
+    amount_text = _match_label_value(lines, ["Amount"])
+    amount = None
+    if amount_text and re.fullmatch(
+        r"(?i)\s*(?:(?:lkr|rs\.?)\s*)?\d[\d,. ]*\s*", amount_text
+    ):
+        candidate = _parse_money(amount_text)
+        if candidate is not None and 0 < candidate < 50_000_000:
+            amount = candidate
+    if amount is not None:
+        fields["Amount"] = f"{amount:,.2f}"
+
+    pay_to = fields.get("Pay To", "")
+    account_match = re.search(r"(?<!\d)\d{8,14}(?!\d)", pay_to)
+    account = account_match.group() if account_match else None
+    name = pay_to[:account_match.start()].strip() if account_match else pay_to.strip()
+    if name:
+        fields["Beneficiary Name"] = name
+    if account:
+        fields["Beneficiary Account Number"] = account
+
+    pay_from = fields.get("Pay From", "")
+    masked_match = re.search(r"[\*xX][\*xX\d\s]*\d{2,}", pay_from)
+    payer_account = masked_match.group().strip() if masked_match else None
+    payer_name = pay_from[masked_match.end():].strip() if masked_match else None
+    if payer_account:
+        fields["Payer Account Number"] = payer_account
+    if payer_name:
+        fields["Payer Name"] = payer_name
+
+    dt = _parse_datetime(fields.get("Date & Time", ""))
+    if dt:
+        fields["Date & Time"] = dt.replace("T", " ")
+    status = _detect_status(" ".join(line.text for line in lines))
+    return RepaymentResult(
+        success=bool(amount is not None or account),
+        doc_type="fund_transfer_receipt",
+        status=status,
+        bank="ndb",
+        payer=PartyOut(name=payer_name, account=payer_account),
+        payee=PartyOut(name=name or None, account=account, bank=fields.get("Bank Name")),
+        amount=amount,
+        datetime=dt,
+        fields=fields,
+        references=ReferencesOut(transaction_id=fields.get("Receipt ID"), remarks=fields.get("Beneficiary Remarks")),
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
 def _is_sampath_cash_deposit(lines) -> bool:
     text = " ".join(line.text.lower() for line in lines)
     return bool(re.search(r"\bsampath\s+bank\b", text)) and bool(
@@ -4897,6 +4959,8 @@ def _extract_sampath_cash_deposit(lines, include_lines: bool) -> RepaymentResult
 def extract(lines, include_lines: bool = False) -> RepaymentResult:
     warnings: List[str] = []
 
+    if _is_ndb_receipt(lines):
+        return _extract_ndb_receipt(lines, include_lines)
     if _is_sampath_cash_deposit(lines):
         return _extract_sampath_cash_deposit(lines, include_lines)
     # 先剔除旋转文本框（截图上的斜向水印/批注），避免其大范围 box 抢占字段值

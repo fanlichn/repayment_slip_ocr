@@ -9,6 +9,42 @@ from __future__ import annotations
 from app.ocr_engine import OcrLine
 from repayment_slip_ocr.extractor import extract
 
+def test_ndb_receipt_extracts_transfer_fields_from_two_column_layout():
+    lines = [
+        _lr("NDB bank", 60, 520, 290, 580),
+        _lr("National Development Bank PLC", 70, 590, 460, 650),
+        _lr("Amount", 540, 790, 650, 835),
+        _lr("LKR 6,000.00", 425, 855, 770, 920),
+        _lr("Pay To", 100, 1000, 200, 1040),
+        _lr("Lak Artha Pvt Ltd", 880, 1000, 1120, 1040),
+        _lr("1001096962", 970, 1050, 1120, 1090),
+        _lr("Bank Name", 100, 1140, 260, 1180),
+        _lr("Commercial Bank", 880, 1140, 1120, 1180),
+        _lr("Pay From", 100, 1220, 230, 1270),
+        _lr("**** **** 6966", 950, 1220, 1120, 1270),
+        _lr("U H P UDAWATTA", 880, 1280, 1120, 1320),
+        _lr("Service Charge", 100, 1360, 300, 1400),
+        _lr("LKR.00", 1020, 1360, 1120, 1400),
+        _lr("Date & Time", 100, 1450, 270, 1500),
+        _lr("2026-11-16 09:05:22", 850, 1450, 1120, 1500),
+        _lr("Receipt ID", 100, 1540, 250, 1590),
+        _lr("324937", 1020, 1540, 1120, 1590),
+        _lr("Beneficiary Remarks", 100, 1630, 380, 1680),
+        _lr("5939PD", 1020, 1630, 1120, 1680),
+        _lr("Transaction Status", 100, 1720, 350, 1770),
+        _lr("Success", 1010, 1720, 1120, 1770),
+    ]
+    result = extract(lines)
+    assert result.bank == "ndb"
+    assert result.fields["Amount"] == "6,000.00"
+    assert result.fields["Date & Time"] == "2026-11-16 09:05:22"
+    assert result.fields["Beneficiary Account Number"] == "1001096962"
+    assert result.fields["Beneficiary Name"] == "Lak Artha Pvt Ltd"
+    assert result.fields["Payer Name"] == "U H P UDAWATTA"
+    assert result.fields["Bank Name"] == "Commercial Bank"
+    assert result.fields["Receipt ID"] == "324937"
+    assert result.fields["Beneficiary Remarks"] == "5939PD"
+
 def test_sampath_cash_deposit_fields_and_date_time():
     lines = [
         _lr("Sampath Bank PLC", 600, 1250, 1150, 1330),

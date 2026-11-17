@@ -9,6 +9,112 @@ from __future__ import annotations
 from app.ocr_engine import OcrLine
 from repayment_slip_ocr.extractor import extract
 
+def test_dialog_pay_submitted_receipt_preserves_bank_and_masked_account():
+    lines = [
+        _lr("Transaction Submitted", 550, 310, 950, 360),
+        _lr("Total Amount", 100, 400, 310, 450),
+        _lr("Rs.2,200.00", 1200, 400, 1400, 450),
+        _lr("Transfer Amount", 100, 510, 320, 560),
+        _lr("Rs.2,200.00", 1200, 510, 1400, 560),
+        _lr("Payment Method", 100, 585, 330, 630),
+        _lr("DF Savings 00** **** **88", 1030, 585, 1400, 630),
+        _lr("Bank", 100, 660, 180, 700),
+        _lr("SampathBank PLC", 1130, 660, 1400, 700),
+        _lr("Account Number", 100, 730, 330, 770),
+        _lr("********4008", 1200, 730, 1400, 770),
+        _lr("Account Holder's Name", 100, 800, 430, 840),
+        _lr("Wd", 1360, 800, 1400, 840),
+        _lr("Date and Time", 100, 870, 300, 910),
+        _lr("14/11/202608:36AM", 1090, 870, 1400, 910),
+        _lr("Transaction ID", 100, 940, 310, 980),
+        _lr("17946255839426457", 1080, 940, 1400, 980),
+        _lr("Empower your finances with Dialog Pay", 350, 1040, 1100, 1080),
+    ]
+    result = extract(lines)
+    assert result.bank == "dialog_pay"
+    assert result.amount == 2200
+    assert result.fields["Bank"] == "Sampath Bank PLC"
+    assert result.fields["Account Number"] == "********4008"
+    assert result.fields["Transaction Status"] == "Submitted"
+    assert result.fields["Date & Time"] == "2026-11-14 08:36:00"
+    assert result.fields["Transaction Reference"] == "17946255839426457"
+    assert result.status is None
+
+def test_seylan_cash_deposit_uses_total_and_masked_account():
+    lines = [
+        _lr("SEYLAN", 450, 410, 750, 455),
+        _lr("CASH DEPOSIT", 450, 630, 700, 675),
+        _lr("DATE/TIME", 230, 735, 375, 775),
+        _lr("16.11.2026", 480, 730, 620, 770),
+        _lr("15:19", 680, 725, 760, 765),
+        _lr("SEQ#", 230, 780, 300, 810),
+        _lr("290428", 475, 775, 560, 805),
+        _lr("ATM", 230, 815, 300, 845),
+        _lr("CRMHTN1B", 475, 810, 590, 840),
+        _lr("REF#", 230, 850, 300, 880),
+        _lr("RO000001666280", 475, 845, 660, 875),
+        _lr("ACCOUNT DETAILS", 450, 890, 720, 930),
+        _lr("ACC NO", 230, 1000, 350, 1040),
+        _lr("***08001", 560, 990, 710, 1030),
+        _lr("NAME", 230, 1040, 320, 1080),
+        _lr("LAK ARTHA SERVI", 480, 1025, 710, 1065),
+        _lr("AMOUNT DENOMINATIONS", 410, 1090, 790, 1130),
+        _lr("5.000.00", 350, 1190, 475, 1220),
+        _lr("TOTAL DEPOSIT", 230, 1255, 500, 1295),
+        _lr("Rs.", 510, 1250, 550, 1280),
+        _lr("5.000.00", 605, 1240, 720, 1270),
+        _lr("TRANSACTION SUCCESSFUL", 420, 1340, 800, 1380),
+    ]
+    result = extract(lines)
+    assert result.bank == "seylan_bank"
+    assert result.fields["Date & Time"] == "2026-11-16 15:19:00"
+    assert result.fields["TOTAL DEPOSIT"] == "5,000.00"
+    assert result.fields["ACC NO"] == "***08001"
+    assert result.fields["REF#"] == "RO000001666280"
+    assert result.fields["TRANSACTION STATUS"] == "SUCCESSFUL"
+    without_total = [line for line in lines if line.text != "TOTAL DEPOSIT"]
+    assert extract(without_total).fields.get("TOTAL DEPOSIT") is None
+
+def test_paymaster_transfer_receipt_retains_time_and_payment_details():
+    lines = [
+        _lr("PayMaster", 120, 45, 270, 80),
+        _lr("Money Transfer", 60, 145, 300, 185),
+        _lr("Amount Transfer", 60, 235, 230, 270),
+        _lr("Rs.6600.00", 60, 280, 325, 320),
+        _lr("Account No", 90, 370, 190, 400),
+        _lr("1001096962", 90, 405, 260, 435),
+        _lr("LAK ARTHA PVT", 90, 440, 275, 470),
+        _lr("Commercial Bank", 90, 475, 280, 505),
+        _lr("Receipt", 75, 580, 170, 610),
+        _lr("#1794890689312", 940, 580, 1130, 610),
+        _lr("Date", 75, 640, 150, 670),
+        _lr("2026-11-17 10:14", 955, 640, 1140, 670),
+        _lr("Reference No", 75, 695, 240, 725),
+        _lr("37039428", 1050, 695, 1140, 725),
+        _lr("@From", 75, 750, 150, 780),
+        _lr("**3058", 1050, 750, 1140, 780),
+        _lr("Relerence note", 75, 825, 260, 855),
+        _lr("926724401v", 1030, 825, 1140, 855),
+        _lr("TransferAmount", 75, 895, 225, 925),
+        _lr("6600.00", 1040, 895, 1140, 925),
+        _lr("ServiceFee", 75, 940, 190, 970),
+        _lr("45.00", 1070, 940, 1140, 970),
+        _lr("Total Paid", 75, 1020, 200, 1050),
+        _lr("Rs.6645.00", 970, 1020, 1140, 1050),
+    ]
+    result = extract(lines)
+    assert result.bank == "pay_master"
+    assert result.amount == 6600.0
+    assert result.fee == 45.0
+    assert result.total_debit == 6645.0
+    assert result.fields["Date & Time"] == "2026-11-17 10:14:00"
+    assert result.fields["Beneficiary Account Number"] == "1001096962"
+    assert result.fields["Beneficiary Name"] == "LAK ARTHA PVT"
+    assert result.fields["Beneficiary Bank"] == "Commercial Bank"
+    assert result.fields["Receipt"] == "#1794890689312"
+    assert result.fields["Reference note"] == "926724401v"
+    assert result.fields["From"] == "**3058"
+
 def test_ndb_receipt_extracts_transfer_fields_from_two_column_layout():
     lines = [
         _lr("NDB bank", 60, 520, 290, 580),

@@ -1415,6 +1415,10 @@ def _parse_datetime(s: str) -> Optional[str]:
     s = re.sub(r"(?i)(\d{1,2}:\d{2})(am|pm)", r"\1 \2", s)
     s = re.sub(r"\s+", " ", s).strip()
     formats = [
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M",
+        "%d/%m/%Y %H:%M",
+        "%d-%m-%Y %H:%M",
         "%Y/%m/%d %H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
         "%d/%m/%Y %H:%M:%S",
@@ -4844,6 +4848,190 @@ def _extract_branch(lines) -> Optional[str]:
     return _match_label_value(lines, ["branch", "branch name"])
 
 
+def _is_dialog_pay_receipt(lines) -> bool:
+    text = " ".join(line.text.lower() for line in lines)
+    return bool(re.search(r"\bdialog\s+pay\b", text)) and all(
+        re.search(pattern, text)
+        for pattern in (r"\btransaction\s+submitted\b", r"\btransfer\s+amount\b", r"\btransaction\s*id\b")
+    )
+
+
+def _extract_dialog_pay_receipt(lines, include_lines: bool) -> RepaymentResult:
+    labels = (
+        "Total Amount", "Transfer Amount", "Payment Method", "Bank", "Account Number",
+        "Account Holder's Name", "Date and Time", "Transaction ID",
+    )
+    fields = _build_label_fields(lines, labels, same_row=True)
+    if fields.get("Bank"):
+        fields["Bank"] = re.sub(r"(?i)\bsampath\s*bank\s*plc\b", "Sampath Bank PLC", fields["Bank"])
+    amount, fee, total = _extract_amounts(lines)
+    dt = _parse_datetime(fields.get("Date and Time", ""))
+    if dt:
+        fields["Date & Time"] = dt.replace("T", " ")
+    fields["Transaction Status"] = "Submitted"
+    reference = fields.get("Transaction ID")
+    if reference:
+        fields["Payment Reference"] = reference
+        fields["Transaction Reference"] = reference
+    return RepaymentResult(
+        success=bool(amount is not None or fields.get("Account Number")),
+        doc_type="fund_transfer_receipt",
+        bank="dialog_pay",
+        amount=amount,
+        fee=fee,
+        total_debit=total,
+        datetime=dt,
+        references=ReferencesOut(transaction_id=reference),
+        fields=fields,
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
+def _is_seylan_cash_deposit(lines) -> bool:
+    text = " ".join(line.text.lower() for line in lines)
+    return bool(re.search(r"\bseylan\b", text)) and all(
+        re.search(pattern, text)
+        for pattern in (r"\bcash\s+deposit\b", r"\baccount\s+details\b", r"\btotal\s+deposit\b")
+    )
+
+
+def _extract_seylan_cash_deposit(lines, include_lines: bool) -> RepaymentResult:
+    fields = {}
+    for label in ("SEQ#", "ATM", "REF#", "ACC NO", "NAME"):
+        value = _match_label_value(lines, [label])
+        if value:
+            fields[label] = value
+
+    def right_values(label, pattern):
+        matches = []
+        for anchor in lines:
+            if _norm_label(anchor.text) != _norm_label(label):
+                continue
+            right = max(point[0] for point in anchor.box)
+            center_y = _line_center_y(anchor.box)
+            height = max(point[1] for point in anchor.box) - min(point[1] for point in anchor.box)
+            for line in lines:
+                if min(point[0] for point in line.box) < right - 10:
+                    continue
+                dy = abs(_line_center_y(line.box) - center_y)
+                if dy <= max(30.0, height * 1.5) and re.fullmatch(pattern, line.text.strip(), re.IGNORECASE):
+                    matches.append((dy, -line.confidence, line.text.strip()))
+        return [value for _, _, value in sorted(matches)]
+
+    dates = right_values("DATE/TIME", r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}")
+    times = right_values("DATE/TIME", r"(?:[01]?\d|2[0-3]):[0-5]\d")
+    dt = _parse_datetime(f"{dates[0]} {times[0]}") if dates and times else None
+    if dt:
+        fields["Date & Time"] = dt.replace("T", " ")
+    elif dates:
+        dt = _parse_datetime(dates[0])
+        if dt:
+            fields["Date & Time"] = dt.replace("T", " ")
+
+    totals = right_values("TOTAL DEPOSIT", r"(?:rs\.?\s*|lkr\s*)?\d[\d,. ]*[.,]\s*\d{2}")
+    amount = _parse_money(totals[0]) if totals else None
+    if amount is not None and 0 < amount < 50_000_000:
+        fields["TOTAL DEPOSIT"] = f"{amount:,.2f}"
+    else:
+        amount = None
+    status = _detect_status(" ".join(line.text for line in lines))
+    if status == "success":
+        fields["TRANSACTION STATUS"] = "SUCCESSFUL"
+    return RepaymentResult(
+        success=bool(amount is not None or fields.get("ACC NO")),
+        doc_type="cash_deposit_slip",
+        status=status,
+        bank="seylan_bank",
+        payee=PartyOut(name=fields.get("NAME"), account=fields.get("ACC NO")),
+        amount=amount,
+        total_debit=amount,
+        datetime=dt,
+        references=ReferencesOut(transaction_id=fields.get("REF#")),
+        fields=fields,
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
+def _is_paymaster_transfer_receipt(lines) -> bool:
+    text = " ".join(line.text.lower() for line in lines)
+    return bool(re.search(r"\bpay\s*master\b", text)) and all(
+        re.search(pattern, text)
+        for pattern in (r"\bmoney\s+transfer\b", r"\breceipt\b", r"\btotal\s+paid\b")
+    )
+
+
+def _extract_paymaster_transfer_receipt(lines, include_lines: bool) -> RepaymentResult:
+    labels = (
+        "Receipt", "Date", "Reference No", "From", "Reference note",
+        "Relerence note", "Reterence note", "Transfer Amount", "Service Fee", "Total Paid",
+    )
+    fields = _build_label_fields(lines, labels, same_row=True)
+    for variant in ("Relerence note", "Reterence note"):
+        value = fields.pop(variant, None)
+        if value and not fields.get("Reference note"):
+            fields["Reference note"] = value
+
+    amount, fee, total = _extract_amounts(lines)
+    account = _match_label_value(lines, ["Account No"])
+    if account and re.fullmatch(r"\d{8,14}", account):
+        fields["Account No"] = account
+        fields["Beneficiary Account Number"] = account
+        ordered = _sorted_by_y(lines)
+        for index, line in enumerate(ordered):
+            if line.text.strip() != account:
+                continue
+            name = _value_below(index, ordered, line)
+            if name and re.search(r"[A-Za-z]{2}", name) and not re.search(r"(?i)bank|receipt", name):
+                fields["Beneficiary Name"] = name
+                name_line = next((item for item in ordered if item.text.strip() == name), None)
+                if name_line is not None:
+                    bank = _value_below(ordered.index(name_line), ordered, name_line)
+                    if bank and re.search(r"(?i)\bbank\b", bank):
+                        fields["Beneficiary Bank"] = bank
+            break
+    else:
+        account = None
+
+    # Receipt "From" is a masked account. Preserve masking when OCR sees it.
+    fields.pop("From", None)
+    for label in lines:
+        if _norm_label(label.text) != "from":
+            continue
+        ly = _line_center_y(label.box)
+        candidates = [
+            line for line in lines
+            if re.fullmatch(r"\s*[*xX]+\s*\d{2,}\s*", line.text)
+            and min(p[0] for p in line.box) > max(p[0] for p in label.box)
+            and abs(_line_center_y(line.box) - ly) < 30
+        ]
+        if candidates:
+            fields["From"] = max(candidates, key=lambda line: line.confidence).text.strip()
+            break
+
+    date_value = fields.get("Date", "")
+    dt = _parse_datetime(date_value)
+    if dt:
+        fields["Date & Time"] = dt.replace("T", " ")
+    ref = fields.get("Reference No")
+    if ref:
+        fields["Payment Reference"] = ref
+        fields["Transaction Reference"] = ref
+    return RepaymentResult(
+        success=bool(amount is not None or account),
+        doc_type="fund_transfer_receipt",
+        bank="pay_master",
+        payer=PartyOut(account=fields.get("From")),
+        payee=PartyOut(name=fields.get("Beneficiary Name"), account=account, bank=fields.get("Beneficiary Bank")),
+        amount=amount,
+        fee=fee,
+        total_debit=total,
+        datetime=dt,
+        references=ReferencesOut(transaction_id=ref, remarks=fields.get("Reference note")),
+        fields=fields,
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
 def _is_ndb_receipt(lines) -> bool:
     text = " ".join(line.text.lower() for line in lines)
     return bool(re.search(r"\bnational\s+development\s+bank\b|\bndb\s*bank\b", text)) and all(
@@ -4959,6 +5147,12 @@ def _extract_sampath_cash_deposit(lines, include_lines: bool) -> RepaymentResult
 def extract(lines, include_lines: bool = False) -> RepaymentResult:
     warnings: List[str] = []
 
+    if _is_dialog_pay_receipt(lines):
+        return _extract_dialog_pay_receipt(lines, include_lines)
+    if _is_seylan_cash_deposit(lines):
+        return _extract_seylan_cash_deposit(lines, include_lines)
+    if _is_paymaster_transfer_receipt(lines):
+        return _extract_paymaster_transfer_receipt(lines, include_lines)
     if _is_ndb_receipt(lines):
         return _extract_ndb_receipt(lines, include_lines)
     if _is_sampath_cash_deposit(lines):

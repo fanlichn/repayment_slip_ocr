@@ -4848,6 +4848,94 @@ def _extract_branch(lines) -> Optional[str]:
     return _match_label_value(lines, ["branch", "branch name"])
 
 
+def _is_combank_digital_deposit(lines) -> bool:
+    text = " ".join(line.text.lower() for line in lines)
+    return bool(re.search(r"\bdigital\s+receipt\s*[-–]?\s*atm\s*/\s*crm\b", text)) and all(
+        re.search(pattern, text)
+        for pattern in (r"commercial\s*bank", r"cardless\s*deposit", r"deposit\s*amount")
+    )
+
+
+def _extract_combank_digital_deposit(lines, include_lines: bool) -> RepaymentResult:
+    labels = {
+        "DATE": "Date", "TIME": "Time", "LOCATION": "Location", "TRACE": "Trace",
+        "REFERENCE NUMBER": "Reference Number", "TRANSACTION": "Transaction",
+        "ACCOUNT NUMBER": "Account Number", "CUSTOMER NAME": "Customer Name",
+        "NARRATION": "Narration", "TRANSACTION STATUS": "Transaction Status",
+        "DEPOSIT AMOUNT": "Deposit Amount", "VALUE": "Value (LKR)",
+        "NOTES": "Notes", "AMOUNT": "Amount (LKR)",
+    }
+    fields = {}
+    for key, label in labels.items():
+        anchors = [line for line in lines if _norm_label(line.text) == _norm_label(label)]
+        candidates = []
+        for anchor in anchors:
+            x = max(point[0] for point in anchor.box)
+            top = min(point[1] for point in anchor.box)
+            bottom = max(point[1] for point in anchor.box)
+            for line in lines:
+                if min(point[0] for point in line.box) < x - 10:
+                    continue
+                other_top = min(point[1] for point in line.box)
+                other_bottom = max(point[1] for point in line.box)
+                if max(top, other_top) >= min(bottom, other_bottom):
+                    continue
+                if not line.text.strip() or _looks_like_label_text(line.text):
+                    continue
+                candidates.append(line)
+        if candidates:
+            value = max(candidates, key=lambda line: line.confidence).text.strip()
+            if key == "ACCOUNT NUMBER":
+                value = re.sub(r"\s+", "", value)
+                if not re.fullmatch(r"[\d*xX]{4,}", value):
+                    continue
+            if key in ("CUSTOMER NAME", "NARRATION") and re.fullmatch(
+                r"(?i)successful|success|failed", value
+            ):
+                continue
+            fields[key] = value
+
+    for key in ("DEPOSIT AMOUNT", "VALUE", "AMOUNT"):
+        if key in fields:
+            value = _parse_money(fields[key])
+            if value is None or value >= 50_000_000:
+                fields.pop(key)
+            else:
+                fields[key] = f"{value:,.2f}"
+    amount = _parse_money(fields.get("DEPOSIT AMOUNT", ""))
+    date = fields.get("DATE", "")
+    time_value = fields.get("TIME", "")
+    dt = _parse_datetime(f"{date} {time_value}") if date and time_value else None
+    if dt:
+        fields["Date & Time"] = dt.replace("T", " ")
+    if fields.get("LOCATION"):
+        fields["BRANCH"] = fields["LOCATION"]
+    reference = fields.get("REFERENCE NUMBER")
+    if reference:
+        fields["Payment Reference"] = reference
+        fields["Transaction Reference"] = reference
+    status = fields.get("TRANSACTION STATUS", "")
+    if re.fullmatch(r"(?i)success(?:ful)?", status):
+        status = "success"
+        fields["TRANSACTION STATUS"] = "SUCCESSFUL"
+    else:
+        status = None
+    return RepaymentResult(
+        success=bool(amount is not None or fields.get("ACCOUNT NUMBER") or reference),
+        doc_type="digital_cash_deposit_slip",
+        status=status,
+        bank="commercial_bank",
+        payee=PartyOut(name=fields.get("CUSTOMER NAME"), account=fields.get("ACCOUNT NUMBER")),
+        amount=amount,
+        total_debit=amount,
+        datetime=dt,
+        trace_no=fields.get("TRACE"),
+        references=ReferencesOut(transaction_id=reference),
+        fields=fields,
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
 def _is_dialog_pay_receipt(lines) -> bool:
     text = " ".join(line.text.lower() for line in lines)
     return bool(re.search(r"\bdialog\s+pay\b", text)) and all(
@@ -5147,6 +5235,8 @@ def _extract_sampath_cash_deposit(lines, include_lines: bool) -> RepaymentResult
 def extract(lines, include_lines: bool = False) -> RepaymentResult:
     warnings: List[str] = []
 
+    if _is_combank_digital_deposit(lines):
+        return _extract_combank_digital_deposit(lines, include_lines)
     if _is_dialog_pay_receipt(lines):
         return _extract_dialog_pay_receipt(lines, include_lines)
     if _is_seylan_cash_deposit(lines):

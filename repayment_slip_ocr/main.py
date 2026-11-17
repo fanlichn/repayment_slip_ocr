@@ -114,9 +114,12 @@ def _add_cdm_explicit_nulls(
     out: Dict[str, Any], result, lines: List[OcrLine]
 ) -> None:
     """票面有空标签时明确返回 null；仅依据识别到的标签，不臆造字段。"""
-    if not _is_cdm_result(result):
+    is_digital = getattr(result, "doc_type", None) == "digital_cash_deposit_slip"
+    if not _is_cdm_result(result) and not is_digital:
         return
     compacts = [re.sub(r"[^a-z]", "", ln.text.lower()) for ln in lines]
+    if is_digital and "customername" in compacts:
+        out.setdefault("CUSTOMER NAME", None)
     if any("narration" in text or "arration" in text for text in compacts):
         out.setdefault("NARRATION", None)
     if any("mobileno" in text or "obileno" in text for text in compacts):
@@ -133,6 +136,8 @@ def _line_center_x(box) -> float:
 
 def _is_cdm_result(result) -> bool:
     fields = result.fields or {}
+    if getattr(result, "doc_type", None) == "digital_cash_deposit_slip":
+        return False
     if getattr(result, "bank", None) in {"sampath_bank", "seylan_bank"}:
         return False
     return (

@@ -9,6 +9,53 @@ from __future__ import annotations
 from app.ocr_engine import OcrLine
 from repayment_slip_ocr.extractor import extract
 
+def test_combank_digital_receipt_keeps_masked_account_and_empty_rows():
+    from repayment_slip_ocr.main import _add_cdm_explicit_nulls, _is_cdm_result
+
+    lines = [
+        _lr("COMMERCIAL BANK", 800, 60, 1050, 110),
+        _lr("Digital Receipt - ATM/CRM", 350, 230, 850, 280),
+        _lr("Date", 120, 340, 220, 380),
+        _lr("2026-11-17", 550, 340, 720, 380),
+        _lr("Time", 120, 400, 220, 440),
+        _lr("13:11", 550, 400, 650, 440),
+        _lr("Location", 120, 460, 250, 490),
+        _lr("COLOMBO7 CRM1 BR", 550, 460, 860, 490),
+        _lr("Trace", 120, 520, 220, 550),
+        _lr("5109", 550, 520, 630, 550),
+        _lr("Reference Number", 120, 570, 390, 605),
+        _lr("32968412606", 550, 570, 730, 605),
+        _lr("Transaction", 120, 630, 300, 665),
+        _lr("CARDLESS DEPOSIT", 550, 630, 860, 665),
+        _lr("Account Number", 115, 686, 358, 724),
+        _lr("1 ******962", 553, 686, 691, 725),
+        _lr("Customer Name", 120, 745, 350, 780),
+        _lr("Narration", 120, 805, 270, 840),
+        _lr("Transaction Status", 120, 865, 370, 900),
+        _lr("Successful", 550, 865, 690, 900),
+        _lr("Deposit Amount", 120, 925, 350, 960),
+        _lr("LKR 5,000.00", 550, 925, 730, 960),
+        _lr("Value (LKR)", 120, 1050, 320, 1080),
+        _lr("1,000.00", 550, 1050, 670, 1080),
+        _lr("Notes", 120, 1115, 220, 1145),
+        _lr("5", 550, 1115, 580, 1145),
+        _lr("Amount (LKR)", 120, 1180, 340, 1215),
+        _lr("5,000.00", 550, 1180, 670, 1215),
+    ]
+    result = extract(lines)
+    assert not _is_cdm_result(result)
+    assert result.fields["ACCOUNT NUMBER"] == "1******962"
+    assert result.fields["REFERENCE NUMBER"] == "32968412606"
+    assert result.fields["BRANCH"] == "COLOMBO7 CRM1 BR"
+    assert result.fields["Date & Time"] == "2026-11-17 13:11:00"
+    assert result.fields["DEPOSIT AMOUNT"] == "5,000.00"
+    assert result.fields["VALUE"] == "1,000.00"
+    assert result.fields["NOTES"] == "5"
+    out = dict(result.fields)
+    _add_cdm_explicit_nulls(out, result, lines)
+    assert out["CUSTOMER NAME"] is None
+    assert out["NARRATION"] is None
+
 def test_dialog_pay_submitted_receipt_preserves_bank_and_masked_account():
     lines = [
         _lr("Transaction Submitted", 550, 310, 950, 360),

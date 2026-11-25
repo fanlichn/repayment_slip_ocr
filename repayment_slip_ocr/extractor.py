@@ -1409,6 +1409,7 @@ def _parse_datetime(s: str) -> Optional[str]:
     # "10.08.2026 , 06:45 PM" / "10.08.202606:45PM" 这类带逗号或无空格写法。
     s = s.replace(".", "/")
     s = re.sub(r"\s*,\s*", " ", s)
+    s = re.sub(r"(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)(?=\d)", r"\1 ", s)
     s = re.sub(r"(\d{4}[-/]\d{1,2}[-/]\d{2})(\d{1,2}:\d{2})", r"\1 \2", s)
     s = re.sub(r"(?i)(\d{2,4})(\d{1,2}:\d{2})", r"\1 \2", s)
     # 日期与时间以冒号粘连且为 12 小时制（如 "2026:1:43 PM"）拆开；
@@ -1432,6 +1433,7 @@ def _parse_datetime(s: str) -> Optional[str]:
         "%d-%b-%Y %I:%M %p",
         "%d-%b-%Y %I:%M:%S %p",
         "%d %b %Y %I:%M %p",
+        "%b %d %Y %I:%M %p",
         "%d %b %Y %H:%M",
         "%d-%b-%Y",
         "%d %b %Y",
@@ -4867,6 +4869,93 @@ def _extract_branch(lines) -> Optional[str]:
     return _match_label_value(lines, ["branch", "branch name"])
 
 
+def _is_dfcc_transfer_receipt(lines) -> bool:
+    text = " ".join(line.text.lower() for line in lines)
+    labels = {_norm_label(line.text) for line in lines}
+    reference_ys = [
+        _line_center_y(line.box) for line in lines
+        if re.search(r"(?i)\b(?:txn|receiver)\s*ref\b", line.text)
+    ]
+    footer_bank = any(
+        re.search(r"(?i)\bdfcc\s*bank\b", line.text)
+        and reference_ys and _line_center_y(line.box) > min(reference_ys)
+        for line in lines
+    )
+    return bool(footer_bank) and bool(
+        re.search(r"\bfund\s+tran(?:sfer|ster)\s+receipt\b", text)
+    ) and {"from", "to"}.issubset(labels)
+
+
+def _extract_dfcc_transfer_receipt(lines, include_lines: bool) -> RepaymentResult:
+    ordered = _sorted_by_y(lines)
+    fields = _build_label_fields(lines, ("Txn Ref", "Receiver Ref"), same_row=True)
+    amount, fee, total = _extract_amounts(lines)
+    if amount is not None:
+        fields["Amount"] = f"LKR {amount:,.2f}"
+
+    dt = None
+    for line in ordered:
+        if re.search(r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s*\d", line.text):
+            dt = _parse_datetime(line.text)
+            if dt:
+                fields["Date & Time"] = dt.replace("T", " ")
+                break
+
+    from_ys = [_line_center_y(line.box) for line in ordered if _norm_label(line.text) == "from"]
+    to_ys = [_line_center_y(line.box) for line in ordered if _norm_label(line.text) == "to"]
+    payer_name = payer_account = payee_name = payee_account = payee_bank = None
+    if from_ys and to_ys:
+        from_y, to_y = min(from_ys), min(to_ys)
+        if from_y < to_y:
+            end_y = min(
+                (_line_center_y(line.box) for line in ordered
+                 if re.search(r"(?i)\b(?:txn|receiver)\s*ref\b", line.text)
+                 and _line_center_y(line.box) > to_y),
+                default=float("inf"),
+            )
+            for line in ordered:
+                text = line.text.strip()
+                y = _line_center_y(line.box)
+                if from_y + 5 < y < to_y - 5:
+                    if payer_account is None and re.fullmatch(r"[*xX\s]+\d{2,}", text):
+                        payer_account = re.sub(r"\s+", "", text)
+                    elif payer_name is None and _clean_person_or_org_name(text):
+                        payer_name = text
+                elif to_y + 5 < y < end_y - 5:
+                    if payee_account is None and re.fullmatch(r"\d{8,14}", text):
+                        payee_account = text
+                    elif payee_bank is None and re.search(r"(?i)\bbank\b", text):
+                        payee_bank = text
+                    elif payee_name is None and _clean_person_or_org_name(text):
+                        payee_name = text
+            if payer_name:
+                fields["From"] = payer_name
+                fields["Sender's Name"] = payer_name
+            if payer_account:
+                fields["Sender's Account"] = payer_account
+            if payee_name:
+                fields["Beneficiary Name"] = payee_name
+            if payee_account:
+                fields["Beneficiary Account Number"] = payee_account
+                fields["Account Number"] = payee_account
+            if payee_bank:
+                fields["Beneficiary Bank"] = payee_bank
+    reference = fields.get("Txn Ref")
+    if reference:
+        fields["Payment Reference"] = reference
+        fields["Transaction Reference"] = reference
+    return RepaymentResult(
+        success=bool(amount is not None or payee_account),
+        doc_type="fund_transfer_receipt", bank="dfcc",
+        payer=PartyOut(name=payer_name, account=payer_account),
+        payee=PartyOut(name=payee_name, account=payee_account, bank=payee_bank),
+        amount=amount, fee=fee, total_debit=total, datetime=dt,
+        references=ReferencesOut(transaction_id=reference, receiver_ref=fields.get("Receiver Ref")),
+        fields=fields,
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
 def _is_combank_digital_deposit(lines) -> bool:
     text = " ".join(line.text.lower() for line in lines)
     return bool(re.search(r"\bdigital\s+receipt\s*[-–]?\s*atm\s*/\s*crm\b", text)) and all(
@@ -5254,6 +5343,8 @@ def _extract_sampath_cash_deposit(lines, include_lines: bool) -> RepaymentResult
 def extract(lines, include_lines: bool = False) -> RepaymentResult:
     warnings: List[str] = []
 
+    if _is_dfcc_transfer_receipt(lines):
+        return _extract_dfcc_transfer_receipt(lines, include_lines)
     if _is_combank_digital_deposit(lines):
         return _extract_combank_digital_deposit(lines, include_lines)
     if _is_dialog_pay_receipt(lines):

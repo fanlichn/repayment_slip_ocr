@@ -9,6 +9,39 @@ from __future__ import annotations
 from app.ocr_engine import OcrLine
 from repayment_slip_ocr.extractor import extract
 
+def test_dfcc_receipt_parses_english_month_and_section_values():
+    from repayment_slip_ocr.extractor import _is_dfcc_transfer_receipt, _parse_datetime
+
+    lines = [
+        _lr("Fund Transter Receipt", 300, 130, 950, 200),
+        _lr("LKR1,000.00", 400, 340, 850, 410),
+        _lr("Aug12,202604:38PM", 400, 530, 850, 590),
+        _lr("From", 550, 810, 680, 870),
+        _lr("Amanulla Mohamed Rikas", 250, 910, 990, 980),
+        _lr("**8297", 550, 1010, 750, 1080),
+        _lr("To", 550, 1160, 680, 1220),
+        _lr("Lak Attha Service", 350, 1260, 900, 1320),
+        _lr("1001096962", 450, 1360, 800, 1420),
+        _lr("COMMERCIAL BANK", 350, 1450, 900, 1510),
+        _lr("Txn Ref: 3452341233313", 150, 1720, 800, 1790),
+        _lr("Receiver Ref: G7QXAG", 300, 1810, 900, 1880),
+        _lr("DFCC BANK", 430, 2150, 800, 2210),
+        _lr("This is an auto generated receipt", 270, 2270, 980, 2330),
+    ]
+    result = extract(lines)
+    assert result.bank == "dfcc"
+    assert result.fields["Date & Time"] == "2026-08-12 16:38:00"
+    assert result.fields["Sender's Name"] == "Amanulla Mohamed Rikas"
+    assert result.fields["Sender's Account"] == "**8297"
+    assert result.fields["Beneficiary Account Number"] == "1001096962"
+    assert result.fields["Beneficiary Bank"] == "COMMERCIAL BANK"
+    assert result.fields["Payment Reference"] == "3452341233313"
+    assert _parse_datetime("Aug 12, 2026 04:38 PM") == "2026-08-12T16:38:00"
+    assert _parse_datetime("Aug 12, 2026 04:38 AM") == "2026-08-12T04:38:00"
+    # A DFCC beneficiary bank appearing before the references is not a DFCC footer.
+    without_footer = [line for line in lines if line.text != "DFCC BANK"]
+    assert not _is_dfcc_transfer_receipt(without_footer + [_lr("DFCC BANK", 350, 1450, 800, 1510)])
+
 def test_combank_digital_receipt_keeps_masked_account_and_empty_rows():
     from repayment_slip_ocr.main import _add_cdm_explicit_nulls, _is_cdm_result
 

@@ -1881,8 +1881,6 @@ def _recognize_impl(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
                 out["DEPOSIT AMOUNT"] = f"{deposit_amount:,.2f}"
         out["bank"] = result.bank.upper() if result.bank else ""
         _add_cdm_explicit_nulls(out, result, unique)
-        if result.warnings:
-            out["warnings"] = result.warnings
         if include_lines:
             out["lines"] = [l.dict() for l in result.lines]
     return out

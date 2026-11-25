@@ -34,7 +34,7 @@ def main() -> int:
     unique = dedup_lines(lines)
 
     result = extract(unique)
-    print(json.dumps(result.model_dump(exclude_none=True), ensure_ascii=False, indent=2, default=str))
+    print(json.dumps(result.model_dump(exclude_none=True, exclude={"warnings"}), ensure_ascii=False, indent=2, default=str))
     return 0
 
 

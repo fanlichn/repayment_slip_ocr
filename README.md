@@ -266,7 +266,6 @@ curl -X POST "http://localhost:8001/ocr_url?include_lines=true" \
   "references": {},
   "fields": {},
   "deposit_breakdown": [],
-  "warnings": ["未可靠识别手写纸币明细，未默认补填张数"],
   "lines": [],
   "elapsed_ms": 6491.17
 }

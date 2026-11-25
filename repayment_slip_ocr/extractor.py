@@ -8,6 +8,7 @@ Pan Asia Bank / BOC Flex / Commercial Bank）标签措辞不同，故使用多�
 from __future__ import annotations
 
 import re
+import statistics
 from collections import Counter
 from datetime import datetime
 from typing import List, Optional
@@ -1408,6 +1409,7 @@ def _parse_datetime(s: str) -> Optional[str]:
     # "10.08.2026 , 06:45 PM" / "10.08.202606:45PM" 这类带逗号或无空格写法。
     s = s.replace(".", "/")
     s = re.sub(r"\s*,\s*", " ", s)
+    s = re.sub(r"(\d{4}[-/]\d{1,2}[-/]\d{2})(\d{1,2}:\d{2})", r"\1 \2", s)
     s = re.sub(r"(?i)(\d{2,4})(\d{1,2}:\d{2})", r"\1 \2", s)
     # 日期与时间以冒号粘连且为 12 小时制（如 "2026:1:43 PM"）拆开；
     # 仅限 AM/PM 后缀，避免误拆 24 小时制 "08:08:32"。
@@ -2409,7 +2411,16 @@ def _is_to_only_receipt(lines) -> bool:
 def _is_ipay_receipt(lines) -> bool:
     """iPay Transaction Summary：www.ipay.lk / 文件名 ipay_… / 正文 iPay 标识。"""
     full = " ".join(ln.text for ln in lines).lower()
-    return "www.ipay.lk" in full or "ipay" in full
+    if "www.ipay.lk" in full or "ipay" in full:
+        return True
+    # 屏幕照片可能把 iPay 的 i 漏读成 Pay。须同时有页脚和回单结构。
+    footer = any(
+        re.search(r"(?i)transaction\s+was\s+perform\w*\s+using", ln.text)
+        for ln in lines
+    )
+    website = any(re.search(r"(?i)\bwww\W*pay\b", ln.text) for ln in lines)
+    labels = {_norm_label(ln.text) for ln in lines}
+    return footer and website and {"transactiondate", "transactionid", "from", "to", "recipient"}.issubset(labels)
 
 
 def _is_hnb_app_receipt(lines) -> bool:
@@ -3460,7 +3471,7 @@ def _build_label_fields(lines, labels, same_row: bool = False) -> dict:
     return fields
 
 
-def _right_column_buckets(lines, labels) -> dict:
+def _right_column_buckets(lines, labels, adaptive: bool = False) -> dict:
     """两栏版式（左列标签 / 右列值，值可多行）通用归属。
 
     右列值行按其 y 中心与左列标签行的 y 中心做最近邻归属（阈值 80px），
@@ -3477,6 +3488,12 @@ def _right_column_buckets(lines, labels) -> dict:
             seen.add(k)
             label_lines.append((k, ln))
     buckets = {k: [] for k, _ in label_lines}
+    radius = 80.0
+    if adaptive and len(label_lines) >= 3:
+        ys = sorted(_line_center_y(line.box) for _, line in label_lines)
+        gaps = [b - a for a, b in zip(ys, ys[1:]) if b - a > 20]
+        if gaps:
+            radius = max(radius, min(250.0, statistics.median(gaps) * 0.65))
     for ln in ordered:
         text = ln.text.strip()
         if _norm_label(text) in label_keys:
@@ -3486,7 +3503,7 @@ def _right_column_buckets(lines, labels) -> dict:
             continue  # 左列 / 居中内容（页眉、页脚）不是字段值
         oy = _line_center_y(ln.box)
         best_k = None
-        best_d = 81.0
+        best_d = radius + 1.0
         for k, lbl in label_lines:
             d = abs(oy - _line_center_y(lbl.box))
             if d < best_d:
@@ -3515,7 +3532,7 @@ def _right_column_buckets(lines, labels) -> dict:
 
 
 def _build_ipay_fields(lines) -> dict:
-    buckets = _right_column_buckets(lines, _IPAY_LABELS)
+    buckets = _right_column_buckets(lines, _IPAY_LABELS, adaptive=True)
     fields = {k: " ".join(v) for k, v in buckets.items() if v}
     # Status 只保留成功/失败词，丢掉 logo 碎片 "pay" 等
     if "Status" in fields:
@@ -3525,9 +3542,11 @@ def _build_ipay_fields(lines) -> dict:
     # Amount 常无标签，仅 "Rs.7,575.00" 独立行
     if not any("amount" in k.lower() for k in fields):
         for ln in _sorted_by_y(lines):
-            m = re.search(r"(?i)\bRs\.?\s*([\d,]+(?:\.\d{2})?)", ln.text)
-            if m:
-                fields["Amount"] = f"Rs.{m.group(1)}"
+            if re.fullmatch(r"(?i)\s*Rs\.?\s*\d[\d,. ]*[.,]\d{2}\s*", ln.text):
+                value = _parse_money(ln.text)
+                if value is None or not 0 < value < 50_000_000:
+                    continue
+                fields["Amount"] = f"Rs.{value:,.2f}"
                 break
     return fields
 
@@ -4691,7 +4710,7 @@ def _build_nsb_fields(lines) -> dict:
 
 
 def _extract_ipay_parties(lines) -> tuple:
-    buckets = _right_column_buckets(lines, _IPAY_LABELS)
+    buckets = _right_column_buckets(lines, _IPAY_LABELS, adaptive=True)
     payer = PartyOut()
     payee = PartyOut()
 
@@ -5247,14 +5266,28 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
         return _extract_ndb_receipt(lines, include_lines)
     if _is_sampath_cash_deposit(lines):
         return _extract_sampath_cash_deposit(lines, include_lines)
-    # 先剔除旋转文本框（截图上的斜向水印/批注），避免其大范围 box 抢占字段值
-    lines = [ln for ln in lines if not _is_rotated_box(ln.box)]
+    # iPay 屏幕照片存在整体轻微倾斜，按宽度比例保留接近水平的文字。
+    if _is_ipay_receipt(lines):
+        def usable_ipay_line(line):
+            box = line.box
+            width = max(point[0] for point in box) - min(point[0] for point in box)
+            return not _is_rotated_box(box) or (
+                abs(box[0][1] - box[1][1]) <= max(25.0, width * 0.07)
+                and abs(box[2][1] - box[3][1]) <= max(25.0, width * 0.07)
+                and abs(box[0][0] - box[3][0]) <= 25
+                and abs(box[1][0] - box[2][0]) <= 25
+            )
+        lines = [ln for ln in lines if usable_ipay_line(ln)]
+    else:
+        lines = [ln for ln in lines if not _is_rotated_box(ln.box)]
 
     full_text = " ".join(ln.text for ln in lines)
 
     doc_type = _detect_doc_type(full_text)
     status = _detect_status(full_text)
     bank = _detect_bank(lines)
+    if bank == "ipay" and doc_type == "unknown":
+        doc_type = "fund_transfer_receipt"
     # 现金存款凭条版式固定为 Commercial Bank，即使 OCR 把标题读坏，
     # 只要面额表 / CDM 表头检测命中就设为 commercial_bank。
     if (_is_cash_credit_slip(lines) or _is_cash_deposit(lines)) and not bank:
@@ -5370,6 +5403,10 @@ def extract(lines, include_lines: bool = False) -> RepaymentResult:
 
     if bank == "ipay":
         fields = _build_ipay_fields(lines)
+        transaction_date = _parse_datetime(fields.get("Transaction Date", ""))
+        if transaction_date:
+            fields["Transaction Date"] = transaction_date.replace("T", " ")
+            fields["Date & Time"] = fields["Transaction Date"]
     elif bank == "union_bank":
         fields = _build_union_ubgo_fields(lines)
         if amount is None and fields.get("Amount"):

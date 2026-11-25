@@ -3223,6 +3223,46 @@ def test_hnb_fund_transfer_lak_cash_nickname():
     assert r.fields["Payment Reference"] == "1233928/158560281"
 
 
+def test_ipay_skewed_screen_with_partially_read_footer_and_dotted_amount():
+    from repayment_slip_ocr.extractor import _is_ipay_receipt
+
+    lines = [
+        _lr("Rs.7.900.00", 1270, 450, 1770, 580),
+        _lr("Transaction Date", 160, 920, 750, 1000),
+        _lr("2026-11-2315:23:14", 1500, 920, 2250, 1000),
+        _lr("Transaction ID", 160, 1170, 700, 1240),
+        _lr("2026112309531300001", 1500, 1180, 2300, 1250),
+        _lr("Type", 160, 1390, 360, 1460),
+        _lr("Fund Transier", 1500, 1390, 2000, 1460),
+        _lr("From", 160, 1635, 360, 1705),
+        _lr("Sudarshana", 1500, 1590, 1900, 1660),
+        _lr("Commercial Bank PLC1033", 1500, 1740, 2500, 1820),
+        _lr("To", 160, 1940, 300, 2010),
+        _lr("Commercial Bank PLC", 1500, 1900, 2250, 1980),
+        _lr("1001096962", 1500, 2040, 1910, 2130),
+        _lr("Recipient", 160, 2220, 550, 2290),
+        _lr("LAK ARTHA PVT LTD", 1490, 2192, 2240, 2300),
+        _lr("Remarks", 160, 2470, 500, 2540),
+        _lr("833134280V", 1500, 2510, 1850, 2580),
+        _lr("Status", 160, 2710, 450, 2780),
+        _lr("SUCCESS", 1500, 2750, 1800, 2820),
+        _lr("This transaction was performed using", 845, 2955, 2100, 3045),
+        _lr("For more niormation vist www pay", 220, 3380, 1150, 3460),
+    ]
+    # A wide line tilted by 28px must not be discarded as a watermark.
+    recipient = next(line for line in lines if line.text == "LAK ARTHA PVT LTD")
+    recipient.box[1][1] += 28
+    recipient.box[2][1] += 28
+    result = extract(lines)
+    assert result.bank == "ipay"
+    assert result.fields["Amount"] == "Rs.7,900.00"
+    assert result.fields["Date & Time"] == "2026-11-23 15:23:14"
+    assert result.payee.account == "1001096962"
+    assert result.fields["Recipient"] == "LAK ARTHA PVT LTD"
+    assert result.fields["Transaction Reference"] == "2026112309531300001"
+    assert not _is_ipay_receipt([line for line in lines if "www pay" not in line.text])
+
+
 def test_ipay_fund_transfer():
     """iPay 转账回执：左列标签 / 右列值两栏，From 下姓名+银行、To 下银行+账号，
     头部 "Rs.5,512.00" 为交易金额。"""

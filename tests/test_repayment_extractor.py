@@ -9,6 +9,159 @@ from __future__ import annotations
 from app.ocr_engine import OcrLine
 from repayment_slip_ocr.extractor import extract
 
+def test_cdb_self_receipt_ignores_watermark_and_preserves_masked_account():
+    lines = [
+        _lr("Self", 100, 195, 260, 240),
+        _lr(":: CDB", 125, 250, 300, 295),
+        _lr("Fund Transfer Confirmation", 100, 300, 750, 340),
+        _lr("Originator", 200, 400, 430, 430),
+        _lr("ATHAPATHTHU ARACHCHILAGE", 700, 400, 1200, 430),
+        _lr("UPAMALIKA KUMARI", 700, 435, 1050, 460),
+        _lr("Reference Number", 200, 470, 550, 500),
+        _lr("CEFT/6966265018151929", 700, 470, 1100, 500),
+        _lr("Transfer Date and Time", 200, 515, 600, 545),
+        _lr("2026-11-23 15:19:29", 700, 515, 1050, 545),
+        _lr("From Account", 200, 555, 500, 585),
+        _lr("**0401", 700, 555, 850, 585),
+        _lr("To Account", 200, 595, 450, 625),
+        _lr("1001096962", 700, 595, 900, 625),
+        _lr("Beneficiary Name", 200, 635, 530, 665),
+        _lr("Lak Artha", 700, 635, 850, 665, 0.95),
+        _lr("R", 1500, 635, 1530, 665, 1.0),
+        _lr("Beneficiary Bank Name", 200, 675, 600, 705),
+        _lr("Commercial Bank Of Ceyton PLC", 700, 675, 1200, 705, 0.99),
+        _lr("Commercial Bank Of Ceylon PLC", 700, 675, 1200, 705, 0.95),
+        _lr("Remarks", 200, 715, 400, 745),
+        _lr("865661029V", 700, 715, 900, 745),
+        _lr("Amount", 200, 755, 400, 785),
+        _lr("1,000.00 LKR", 700, 755, 900, 785),
+        _lr("Service fee", 200, 795, 450, 825),
+        _lr("Lak-M1-lffath (480)", 500, 795, 850, 825),
+        _lr("CEFT fee", 200, 835, 400, 865),
+        _lr("25.00 LKR", 700, 835, 900, 865),
+        _lr("Status", 200, 875, 380, 905),
+        _lr("Transaction Success", 700, 875, 1050, 905),
+    ]
+    result = extract(lines)
+    assert result.bank == "cdb"
+    assert result.fields["Originator"] == "ATHAPATHTHU ARACHCHILAGE UPAMALIKA KUMARI"
+    assert result.fields["From Account"] == "**0401"
+    assert result.fields["To Account"] == "1001096962"
+    assert result.fields["Beneficiary Name"] == "Lak Artha"
+    assert result.fields["Beneficiary Bank Name"] == "Commercial Bank Of Ceylon PLC"
+    assert result.fields["Amount"] == "1,000.00"
+    assert result.fields["CEFT fee"] == "25.00"
+    assert "Service fee" not in result.fields
+    assert result.fields["Date & Time"] == "2026-11-23 15:19:29"
+    assert result.fields["Transaction Reference"] == "CEFT/6966265018151929"
+    assert result.fee == 25.0
+
+def test_combank_qplus_reads_table_and_preserves_both_masked_accounts():
+    lines = [
+        _lr("ComBank Q+ Digital Receipt", 350, 390, 850, 440),
+        _lr("Reference ID", 120, 480, 330, 510),
+        _lr("632312337069", 680, 480, 850, 510),
+        _lr("Date", 120, 515, 220, 545),
+        _lr("1hu Nov 19 2U26 1/:43", 680, 515, 950, 545, 0.99),
+        _lr("Thu Nov 19 2026 17:43", 680, 515, 950, 545, 0.95),
+        _lr("Recipient's Bank", 120, 550, 370, 580),
+        _lr("Commercial Bank", 680, 550, 900, 580),
+        _lr("Account No", 120, 585, 300, 615),
+        _lr("XXXXXX6962", 680, 585, 850, 615),
+        _lr("Recipient's Name", 120, 620, 380, 650),
+        _lr("LAK ARTHA SERVICES", 680, 620, 950, 650),
+        _lr("Bill Amount", 120, 655, 300, 685),
+        _lr("500.00LKR", 680, 655, 840, 685),
+        _lr("Transaction Fee", 120, 690, 350, 720),
+        _lr("25.00LKR", 680, 690, 820, 720),
+        _lr("Transaction Status", 120, 725, 400, 755),
+        _lr("Success", 680, 725, 800, 755),
+        _lr("Purpose", 120, 760, 270, 790),
+        _lr("Miscellaneous Payments", 680, 760, 1000, 790),
+        _lr("Transferred From", 120, 795, 370, 825),
+        _lr("421689XXXXXX2561", 680, 795, 950, 825),
+    ]
+    result = extract(lines)
+    assert result.bank == "commercial_bank"
+    assert result.fields["Date & Time"] == "2026-11-19 17:43:00"
+    assert result.fields["Bill Amount"] == "500.00"
+    assert result.fields["Transaction Fee"] == "25.00"
+    assert result.fields["Account No"] == "XXXXXX6962"
+    assert result.fields["Transferred From"] == "421689XXXXXX2561"
+    assert result.fields["Transaction Reference"] == "632312337069"
+    assert result.amount == 500.0 and result.fee == 25.0
+    no_valid_date = [line for line in lines if line.text != "Thu Nov 19 2026 17:43"]
+    assert "Date & Time" not in extract(no_valid_date).fields
+
+def test_nations_split_bank_logo_and_reversed_masked_account_ocr():
+    lines = [
+        _lr("Nations", 500, 620, 750, 675),
+        _lr("TrustBank", 500, 680, 750, 715),
+        _lr("Transaction summary", 400, 750, 800, 810),
+        _lr("Amount", 500, 860, 700, 910),
+        _lr("LKR 3,000.00", 450, 925, 750, 965),
+        _lr("From account", 60, 1085, 280, 1125),
+        _lr("8080XXXXXXXX", 890, 1085, 1140, 1125, 0.80),
+        _lr("XXXXXXXX0808", 890, 1085, 1140, 1125, 0.76),
+        _lr("To account", 60, 1150, 280, 1190),
+        _lr("1001096962", 950, 1150, 1140, 1190),
+        _lr("To account name", 60, 1215, 360, 1255),
+        _lr("lak artha services pvt Itd", 780, 1215, 1140, 1255),
+        _lr("Bank", 60, 1280, 160, 1320),
+        _lr("Commercial Bank PLC", 780, 1280, 1140, 1320),
+        _lr("Service charge", 60, 1345, 310, 1385),
+        _lr("LKR 25.00", 980, 1345, 1140, 1385),
+        _lr("Date", 60, 1410, 160, 1450),
+        _lr("24-Nov-2026", 940, 1410, 1140, 1450),
+        _lr("Time", 60, 1475, 160, 1515),
+        _lr("12:31", 1050, 1475, 1140, 1515),
+        _lr("Reference number", 60, 1540, 380, 1580),
+        _lr("2632812112004990", 850, 1540, 1140, 1580),
+        _lr("Status", 60, 1600, 170, 1640),
+        _lr("Success", 1020, 1600, 1140, 1640),
+        _lr("Description", 60, 1665, 260, 1705),
+        _lr("re payment", 950, 1665, 1140, 1705),
+    ]
+    result = extract(lines)
+    assert result.bank == "ntb"
+    assert result.fields["Amount"] == "3,000.00"
+    assert result.fields["From account"] == "XXXXXXXX0808"
+    assert result.fields["To account"] == "1001096962"
+    assert result.fields["Date & Time"] == "2026-11-24 12:31:00"
+    assert result.fields["Remarks"] == "re payment"
+    assert result.fields["Reference number"] == "2632812112004990"
+
+
+def test_flash_receipt_parses_redundant_pm_and_account():
+    from repayment_slip_ocr.extractor import _parse_datetime
+
+    lines = [
+        _lr("flash", 480, 60, 720, 130),
+        _lr("You just sent money to 1001096962", 200, 400, 1000, 445),
+        _lr("LKR 5,000.00", 350, 500, 850, 550),
+        _lr("Reference Number:", 80, 670, 460, 710),
+        _lr("WT33848753", 820, 670, 1100, 710),
+        _lr("Date:", 80, 795, 200, 835),
+        _lr("25/11/2026 13:38 PM", 720, 795, 1100, 835),
+        _lr("Bank Charges:", 80, 920, 380, 960),
+        _lr("LKR 0.00", 920, 920, 1100, 960),
+        _lr("Status:", 80, 1045, 240, 1085),
+        _lr("Successful", 920, 1045, 1100, 1085),
+        _lr("Type:", 80, 1170, 220, 1210),
+        _lr("Account Transfer", 800, 1170, 1100, 1210),
+        _lr("Description:", 80, 1295, 330, 1335),
+        _lr("PQ25UC 936592490V", 750, 1295, 1100, 1335),
+    ]
+    result = extract(lines)
+    assert result.bank == "flash"
+    assert result.fields["Amount"] == "5,000.00"
+    assert result.fields["Account Number"] == "1001096962"
+    assert result.fields["Date & Time"] == "2026-11-25 13:38:00"
+    assert result.fields["Bank Charges"] == "LKR 0.00"
+    assert result.fields["Reference Number"] == "WT33848753"
+    assert result.fields["Description"] == "PQ25UC 936592490V"
+    assert _parse_datetime("25/11/2026 13:38 AM") is None
+
 def test_dfcc_receipt_parses_english_month_and_section_values():
     from repayment_slip_ocr.extractor import _is_dfcc_transfer_receipt, _parse_datetime
 

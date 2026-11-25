@@ -1409,6 +1409,7 @@ def _parse_datetime(s: str) -> Optional[str]:
     # "10.08.2026 , 06:45 PM" / "10.08.202606:45PM" 这类带逗号或无空格写法。
     s = s.replace(".", "/")
     s = re.sub(r"\s*,\s*", " ", s)
+    s = re.sub(r"(?i)^(?:mon|tue|wed|thu|fri|sat|sun)\s+", "", s)
     s = re.sub(r"(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)(?=\d)", r"\1 ", s)
     s = re.sub(r"(\d{4}[-/]\d{1,2}[-/]\d{2})(\d{1,2}:\d{2})", r"\1 \2", s)
     s = re.sub(r"(?i)(\d{2,4})(\d{1,2}:\d{2})", r"\1 \2", s)
@@ -1416,6 +1417,8 @@ def _parse_datetime(s: str) -> Optional[str]:
     # 仅限 AM/PM 后缀，避免误拆 24 小时制 "08:08:32"。
     s = re.sub(r"(?i)(\d{2,4})\s*:\s*(\d{1,2}:\d{2}\s*(?:am|pm))", r"\1 \2", s)
     s = re.sub(r"(?i)(\d{1,2}:\d{2})(am|pm)", r"\1 \2", s)
+    # Some receipts append PM to an already 24-hour time (e.g. 13:38 PM).
+    s = re.sub(r"(?i)\b(1[3-9]|2[0-3]):([0-5]\d)\s*PM\b", r"\1:\2", s)
     s = re.sub(r"\s+", " ", s).strip()
     formats = [
         "%Y/%m/%d %H:%M",
@@ -1431,9 +1434,11 @@ def _parse_datetime(s: str) -> Optional[str]:
         "%d/%m/%Y %I:%M %p",
         "%d-%m-%Y %I:%M %p",
         "%d-%b-%Y %I:%M %p",
+        "%d-%b-%Y %H:%M",
         "%d-%b-%Y %I:%M:%S %p",
         "%d %b %Y %I:%M %p",
         "%b %d %Y %I:%M %p",
+        "%b %d %Y %H:%M",
         "%d %b %Y %H:%M",
         "%d-%b-%Y",
         "%d %b %Y",
@@ -4869,6 +4874,303 @@ def _extract_branch(lines) -> Optional[str]:
     return _match_label_value(lines, ["branch", "branch name"])
 
 
+def _receipt_row_values(lines, labels) -> dict:
+    """Read only values on the same visual row as their label."""
+    fields = {}
+    for label in labels:
+        candidates = []
+        for anchor in lines:
+            if _norm_label(anchor.text) != _norm_label(label):
+                continue
+            right = max(point[0] for point in anchor.box)
+            top = min(point[1] for point in anchor.box)
+            bottom = max(point[1] for point in anchor.box)
+            for line in lines:
+                if min(point[0] for point in line.box) < right - 10:
+                    continue
+                other_top = min(point[1] for point in line.box)
+                other_bottom = max(point[1] for point in line.box)
+                if max(top, other_top) >= min(bottom, other_bottom):
+                    continue
+                if not line.text.strip() or _looks_like_label_text(line.text):
+                    continue
+                candidates.append(line)
+        if candidates:
+            best = max(candidates, key=lambda line: line.confidence)
+            fields[label] = best.text.strip()
+            if label == "From account":
+                # Paddle angle classification can return the same row reversed.
+                # Keep the conventional masked-prefix variant only when an OCR
+                # candidate is exactly the character-reversal of another one.
+                for line in candidates:
+                    value = re.sub(r"\s+", "", line.text).upper()
+                    if re.fullmatch(r"[*X]+\d{2,}", value) and any(
+                        re.sub(r"\s+", "", other.text).upper() == value[::-1]
+                        for other in candidates
+                    ):
+                        fields[label] = line.text.strip()
+                        break
+    return fields
+
+
+def _is_cdb_self_receipt(lines) -> bool:
+    full = " ".join(line.text.lower() for line in lines)
+    labels = {_norm_label(line.text) for line in lines}
+    return (
+        "self" in labels
+        and any(re.search(r"(?i)\bcdb\b", line.text) for line in lines)
+        and "fund transfer confirmation" in full
+        and {"originator", "referencenumber", "ceftfee", "toaccount"}.issubset(labels)
+    )
+
+
+def _extract_cdb_self_receipt(lines, include_lines: bool) -> RepaymentResult:
+    labels = (
+        "Originator", "Reference Number", "Transfer Date and Time", "From Account",
+        "To Account", "Beneficiary Name", "Beneficiary Bank Name", "Remarks",
+        "Amount", "Service fee", "CEFT fee", "Status",
+    )
+    # The value column starts where a recognizable reference or date appears.
+    # This excludes page content and diagonal watermarks behind the receipt.
+    anchors = [
+        line for line in lines
+        if re.fullmatch(r"(?i)CEFT/[A-Z0-9]+", line.text.strip())
+        or _parse_datetime(line.text.strip()) is not None
+    ]
+    value_x = min((min(p[0] for p in line.box) for line in anchors), default=None)
+    fields = {}
+    chosen = {}
+    for label in labels:
+        candidates = []
+        for anchor in lines:
+            if _norm_label(anchor.text) != _norm_label(label):
+                continue
+            top = min(p[1] for p in anchor.box)
+            bottom = max(p[1] for p in anchor.box)
+            right = max(p[0] for p in anchor.box)
+            for line in lines:
+                x = min(p[0] for p in line.box)
+                if x < right or value_x is None or abs(x - value_x) > 180:
+                    continue
+                if max(top, min(p[1] for p in line.box)) >= min(bottom, max(p[1] for p in line.box)):
+                    continue
+                value = line.text.strip()
+                if label in {"Amount", "Service fee", "CEFT fee"}:
+                    valid = bool(re.fullmatch(r"(?i)\s*(?:lkr\s*)?\d[\d,. ]*(?:\s*lkr)?\s*", value))
+                elif label in {"From Account", "To Account"}:
+                    valid = bool(re.fullmatch(r"[\d*xX\s]{4,}", value))
+                elif label in {"Originator", "Beneficiary Name", "Beneficiary Bank Name"}:
+                    valid = bool(re.fullmatch(r"[A-Za-z][A-Za-z .&'()\-]{2,}", value))
+                elif label == "Transfer Date and Time":
+                    valid = _parse_datetime(value) is not None
+                elif label == "Reference Number":
+                    valid = bool(re.fullmatch(r"(?i)CEFT/[A-Z0-9]+", value))
+                elif label == "Status":
+                    valid = bool(re.search(r"(?i)success|failed|pending", value))
+                else:
+                    valid = bool(re.fullmatch(r"[A-Za-z0-9 ._/-]{2,}", value))
+                if valid:
+                    candidates.append(line)
+        if candidates:
+            best = max(candidates, key=lambda line: line.confidence)
+            # Use the recognized 'Ceylon' spelling when another OCR variant
+            # of the same line confuses l and t.
+            if label == "Beneficiary Bank Name" and "ceyton" in best.text.lower():
+                alternatives = [line for line in candidates if "ceylon" in line.text.lower()]
+                if alternatives:
+                    best = max(alternatives, key=lambda line: line.confidence)
+            chosen[label] = best
+            fields[label] = best.text.strip()
+
+    origin = chosen.get("Originator")
+    reference = chosen.get("Reference Number")
+    if origin is not None and reference is not None:
+        existing = {fields["Originator"].casefold()}
+        continuation = []
+        for line in _sorted_by_y(lines):
+            value = line.text.strip()
+            y = _line_center_y(line.box)
+            if not (_line_center_y(origin.box) + 5 < y < _line_center_y(reference.box) - 5):
+                continue
+            if abs(min(p[0] for p in line.box) - value_x) > 180:
+                continue
+            if re.fullmatch(r"[A-Za-z][A-Za-z .&'()\-]{2,}", value) and value.casefold() not in existing:
+                existing.add(value.casefold())
+                continuation.append(value)
+        if continuation:
+            fields["Originator"] += " " + " ".join(continuation)
+
+    for key in ("Amount", "Service fee", "CEFT fee"):
+        if key in fields:
+            value = _parse_money(fields[key])
+            if value is None or not 0 <= value < 50_000_000:
+                fields.pop(key)
+            else:
+                fields[key] = f"{value:,.2f}"
+    amount = _parse_money(fields.get("Amount", ""))
+    fee = _parse_money(fields.get("CEFT fee", ""))
+    dt = _parse_datetime(fields.get("Transfer Date and Time", ""))
+    if dt:
+        fields["Date & Time"] = dt.replace("T", " ")
+    reference_value = fields.get("Reference Number")
+    if reference_value:
+        fields["Payment Reference"] = reference_value
+        fields["Transaction Reference"] = reference_value
+    return RepaymentResult(
+        success=bool(amount is not None or fields.get("To Account")),
+        doc_type="fund_transfer_receipt", bank="cdb",
+        status=_detect_status(fields.get("Status", "")),
+        payer=PartyOut(name=fields.get("Originator"), account=fields.get("From Account")),
+        payee=PartyOut(name=fields.get("Beneficiary Name"), account=fields.get("To Account"), bank=fields.get("Beneficiary Bank Name")),
+        amount=amount, fee=fee, datetime=dt,
+        references=ReferencesOut(transaction_id=reference_value, remarks=fields.get("Remarks")),
+        fields=fields,
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
+def _is_combank_qplus_receipt(lines) -> bool:
+    text = " ".join(line.text.lower() for line in lines)
+    labels = {_norm_label(line.text) for line in lines}
+    return bool(re.search(r"\bcom\s*bank\s*q[+*]?\s*digital\s+receipt\b", text)) and {
+        "referenceid", "billamount", "transactionfee", "transferredfrom"
+    }.issubset(labels)
+
+
+def _extract_combank_qplus_receipt(lines, include_lines: bool) -> RepaymentResult:
+    labels = (
+        "Reference ID", "Date", "Recipient's Bank", "Account No", "Recipient's Name",
+        "Bill Amount", "Transaction Fee", "Transaction Status", "Purpose", "Transferred From",
+    )
+    fields = _receipt_row_values(lines, labels)
+    # OCR variants on the same date row can disagree; choose a parseable value.
+    date_anchors = [line for line in lines if _norm_label(line.text) == "date"]
+    date_candidates = []
+    for anchor in date_anchors:
+        top = min(point[1] for point in anchor.box)
+        bottom = max(point[1] for point in anchor.box)
+        right = max(point[0] for point in anchor.box)
+        for line in lines:
+            if min(point[0] for point in line.box) < right - 10:
+                continue
+            if max(top, min(point[1] for point in line.box)) >= min(bottom, max(point[1] for point in line.box)):
+                continue
+            parsed = _parse_datetime(line.text)
+            if parsed:
+                date_candidates.append((line.confidence, parsed))
+    dt = max(date_candidates)[1] if date_candidates else None
+    if dt:
+        fields["Date"] = dt.replace("T", " ")
+        fields["Date & Time"] = fields["Date"]
+    else:
+        fields.pop("Date", None)
+    for key in ("Bill Amount", "Transaction Fee"):
+        if key in fields:
+            value = _parse_money(fields[key])
+            if value is None or value < 0 or value >= 50_000_000:
+                fields.pop(key)
+            else:
+                fields[key] = f"{value:,.2f}"
+    amount = _parse_money(fields.get("Bill Amount", ""))
+    fee = _parse_money(fields.get("Transaction Fee", ""))
+    reference = fields.get("Reference ID")
+    if reference:
+        fields["Payment Reference"] = reference
+        fields["Transaction Reference"] = reference
+    account = fields.get("Account No")
+    if account:
+        fields["Beneficiary Account Number"] = account
+    return RepaymentResult(
+        success=bool(amount is not None or account),
+        doc_type="fund_transfer_receipt", bank="commercial_bank",
+        status=_detect_status(fields.get("Transaction Status", "")),
+        payer=PartyOut(account=fields.get("Transferred From")),
+        payee=PartyOut(name=fields.get("Recipient's Name"), account=account, bank=fields.get("Recipient's Bank")),
+        amount=amount, fee=fee, datetime=dt,
+        references=ReferencesOut(transaction_id=reference),
+        fields=fields,
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
+def _is_nations_transaction_summary(lines) -> bool:
+    normalized = {_norm_label(line.text) for line in lines}
+    has_bank = "nations" in normalized and "trustbank" in normalized
+    full = " ".join(line.text.lower() for line in lines)
+    has_bank = has_bank or bool(re.search(r"\bnations\s*trust\s*bank\b", full))
+    return has_bank and {"transactionsummary", "fromaccount", "toaccount", "referencenumber"}.issubset(normalized)
+
+
+def _extract_nations_transaction_summary(lines, include_lines: bool) -> RepaymentResult:
+    labels = (
+        "From account", "To account", "To account name", "Bank", "Service charge",
+        "Date", "Time", "Reference number", "Status", "Description",
+    )
+    fields = _receipt_row_values(lines, labels)
+    amount, fee, total = _extract_amounts(lines)
+    if amount is not None:
+        fields["Amount"] = f"{amount:,.2f}"
+    date = fields.get("Date", "")
+    time_value = fields.get("Time", "")
+    dt = _parse_datetime(f"{date} {time_value}") if date and time_value else None
+    if dt:
+        fields["Date & Time"] = dt.replace("T", " ")
+    reference = fields.get("Reference number")
+    if reference:
+        fields["Payment Reference"] = reference
+        fields["Transaction Reference"] = reference
+    if fields.get("Description"):
+        fields["Remarks"] = fields["Description"]
+    return RepaymentResult(
+        success=bool(amount is not None or fields.get("To account")),
+        doc_type="fund_transfer_receipt", bank="ntb", status=_detect_status(" ".join(line.text for line in lines)),
+        payer=PartyOut(account=fields.get("From account")),
+        payee=PartyOut(name=fields.get("To account name"), account=fields.get("To account"), bank=fields.get("Bank")),
+        amount=amount, fee=fee, total_debit=total, datetime=dt,
+        references=ReferencesOut(bank_reference_number=reference, remarks=fields.get("Description")),
+        fields=fields,
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
+def _is_flash_transfer_receipt(lines) -> bool:
+    text = " ".join(line.text.lower() for line in lines)
+    labels = {_norm_label(line.text) for line in lines}
+    return bool(re.search(r"\byou\s+just\s+sent\s+money\s+to\b", text)) and bool(
+        re.search(r"\b(?:flash|fash)\b", text)
+    ) and {"referencenumber", "bankcharges", "status"}.issubset(labels)
+
+
+def _extract_flash_transfer_receipt(lines, include_lines: bool) -> RepaymentResult:
+    fields = _receipt_row_values(lines, ("Reference Number", "Date", "Bank Charges", "Status", "Type", "Description"))
+    amount, fee, total = _extract_amounts(lines)
+    if amount is not None:
+        fields["Amount"] = f"{amount:,.2f}"
+    for line in lines:
+        match = re.search(r"(?i)\byou\s+just\s+sent\s+money\s+to\s+(\d{8,14})\b", line.text)
+        if match:
+            fields["Account Number"] = match.group(1)
+            break
+    dt = _parse_datetime(fields.get("Date", ""))
+    if dt:
+        fields["Date & Time"] = dt.replace("T", " ")
+    reference = fields.get("Reference Number")
+    if reference:
+        fields["Payment Reference"] = reference
+        fields["Transaction Reference"] = reference
+    if fields.get("Description"):
+        fields["Remarks"] = fields["Description"]
+    return RepaymentResult(
+        success=bool(amount is not None or fields.get("Account Number")),
+        doc_type="fund_transfer_receipt", bank="flash", status=_detect_status(" ".join(line.text for line in lines)),
+        payee=PartyOut(account=fields.get("Account Number")),
+        amount=amount, fee=fee, total_debit=total, datetime=dt,
+        references=ReferencesOut(bank_reference_number=reference, remarks=fields.get("Description")),
+        fields=fields,
+        lines=[OcrLineOut(text=l.text, confidence=l.confidence, box=l.box) for l in lines] if include_lines else [],
+    )
+
+
 def _is_dfcc_transfer_receipt(lines) -> bool:
     text = " ".join(line.text.lower() for line in lines)
     labels = {_norm_label(line.text) for line in lines}
@@ -5343,6 +5645,14 @@ def _extract_sampath_cash_deposit(lines, include_lines: bool) -> RepaymentResult
 def extract(lines, include_lines: bool = False) -> RepaymentResult:
     warnings: List[str] = []
 
+    if _is_cdb_self_receipt(lines):
+        return _extract_cdb_self_receipt(lines, include_lines)
+    if _is_combank_qplus_receipt(lines):
+        return _extract_combank_qplus_receipt(lines, include_lines)
+    if _is_nations_transaction_summary(lines):
+        return _extract_nations_transaction_summary(lines, include_lines)
+    if _is_flash_transfer_receipt(lines):
+        return _extract_flash_transfer_receipt(lines, include_lines)
     if _is_dfcc_transfer_receipt(lines):
         return _extract_dfcc_transfer_receipt(lines, include_lines)
     if _is_combank_digital_deposit(lines):

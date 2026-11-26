@@ -1410,6 +1410,13 @@ def _parse_datetime(s: str) -> Optional[str]:
     s = s.replace(".", "/")
     s = re.sub(r"\s*,\s*", " ", s)
     s = re.sub(r"(?i)^(?:mon|tue|wed|thu|fri|sat|sun)\s+", "", s)
+    # OCR may join the day, four-digit year and time: Aug7202617:35.
+    s = re.sub(
+        r"(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s*"
+        r"(\d{1,2})\s*((?:19|20)\d{2})\s*((?:[01]?\d|2[0-3]):[0-5]\d)\b",
+        r"\1 \2 \3 \4",
+        s,
+    )
     s = re.sub(r"(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)(?=\d)", r"\1 ", s)
     s = re.sub(r"(\d{4}[-/]\d{1,2}[-/]\d{2})(\d{1,2}:\d{2})", r"\1 \2", s)
     s = re.sub(r"(?i)(\d{2,4})(\d{1,2}:\d{2})", r"\1 \2", s)

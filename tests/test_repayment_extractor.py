@@ -56,6 +56,37 @@ def test_cdb_self_receipt_ignores_watermark_and_preserves_masked_account():
     assert result.fields["Transaction Reference"] == "CEFT/6966265018151929"
     assert result.fee == 25.0
 
+def test_combank_qplus_date_with_joined_day_year_and_time():
+    from repayment_slip_ocr.extractor import _parse_datetime
+
+    lines = [
+        _lr("ComBank Q+ Digital Receipt", 300, 380, 850, 440),
+        _lr("Reference ID", 100, 480, 330, 510),
+        _lr("621912006988", 680, 480, 870, 510),
+        _lr("Date", 100, 515, 220, 550),
+        _lr("Fri Aug7202617:35", 680, 515, 950, 550, 0.95),
+        _lr("Fri Auq 7 2026 17:35", 680, 515, 950, 550, 0.94),
+        _lr("Account No", 100, 595, 300, 625),
+        _lr("XXXXXX6962", 680, 595, 870, 625),
+        _lr("Bill Amount", 100, 675, 300, 705),
+        _lr("5,000.00LKR", 680, 675, 870, 705),
+        _lr("Transaction Fee", 100, 715, 350, 745),
+        _lr("25.00LKR", 680, 715, 850, 745),
+        _lr("Transferred From", 100, 835, 380, 865),
+        _lr("421689XXXXXX6835", 680, 835, 950, 865),
+    ]
+    result = extract(lines)
+    assert result.fields["Date & Time"] == "2026-08-07 17:35:00"
+    assert result.fields["Bill Amount"] == "5,000.00"
+    assert result.fields["Beneficiary Account Number"] == "XXXXXX6962"
+    assert result.fields["Transferred From"] == "421689XXXXXX6835"
+    assert _parse_datetime("Fri Aug 72026 17:35") == "2026-08-07T17:35:00"
+    assert _parse_datetime("Fri Aug 32 2026 17:35") is None
+    assert _parse_datetime("Fri Aug 7 2026 27:35") is None
+    lines = [line for line in lines if "Fri Aug" not in line.text]
+    assert "Date & Time" not in extract(lines).fields
+
+
 def test_combank_qplus_reads_table_and_preserves_both_masked_accounts():
     lines = [
         _lr("ComBank Q+ Digital Receipt", 350, 390, 850, 440),

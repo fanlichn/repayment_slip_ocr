@@ -1618,6 +1618,61 @@ def _extract_timed(lines: List[OcrLine], *, include_lines: bool, pass_name: str)
         return extract(lines, include_lines=include_lines)
 
 
+def _cdm_conflicting_account_row(lines: List[OcrLine]):
+    """Find distinct full account readings of the same printed account row."""
+    pattern = re.compile(
+        r"(?i)\bacc[o0]unt\s*(?:num(?:ber)?|no\.?)\s*[:：]?\s*(\d{8,14})(?!\d)"
+    )
+    readings = []
+    for line in lines:
+        match = pattern.search(line.text)
+        if not match or line.confidence < 0.8 or _is_tall_box(line.box):
+            continue
+        readings.append((line, match.group(1)))
+    for anchor, first in readings:
+        left = min(point[0] for point in anchor.box)
+        right = max(point[0] for point in anchor.box)
+        height = max(point[1] for point in anchor.box) - min(point[1] for point in anchor.box)
+        candidates = {
+            value for line, value in readings
+            if len(value) == len(first)
+            and abs(_line_center_y(line.box) - _line_center_y(anchor.box)) <= max(12, height * 0.75)
+            and max(left, min(point[0] for point in line.box)) < min(right, max(point[0] for point in line.box))
+        }
+        if len(candidates) > 1:
+            return anchor, candidates
+    return None
+
+
+def _verify_cdm_account_conflict(engine, variants, conflict):
+    """Confirm a conflicting account with two separately preprocessed crops."""
+    anchor, candidates = conflict
+    left = min(point[0] for point in anchor.box)
+    right = max(point[0] for point in anchor.box)
+    top = min(point[1] for point in anchor.box)
+    bottom = max(point[1] for point in anchor.box)
+    width, height = right - left, bottom - top
+    if width <= 0 or height <= 0:
+        return None
+    window = [(left + width * 0.6, top - max(10, height * 0.35), right + 15, bottom + max(10, height * 0.35))]
+    votes = []
+    for name in ("color_raw", "enhanced"):
+        image = next((v["img"] for v in variants if v.get("name") == name), None)
+        if image is None:
+            return None
+        found = _run_cdm_direct_line_windows(engine, image, window, prep_indices=(0,))
+        values = {
+            match.group()
+            for line in found if line.confidence >= 0.85
+            for match in re.finditer(r"(?<!\d)\d{8,14}(?!\d)", line.text)
+            if match.group() in candidates
+        }
+        if len(values) != 1:
+            return None
+        votes.append(values.pop())
+    return votes[0] if votes[0] == votes[1] else None
+
+
 def _recognize_impl(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     settings = get_settings()
     if len(buf) > settings.max_upload_bytes:
@@ -1643,6 +1698,15 @@ def _recognize_impl(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
         unique = dedup_lines(lines)
 
     result = _extract_timed(unique, include_lines=False, pass_name="initial")
+    account_conflict = (
+        _cdm_conflicting_account_row(unique)
+        if result.bank == "commercial_bank" and _is_cdm_result(result)
+        else None
+    )
+    verified_account = None
+    if account_conflict:
+        with stage("ocr_cdm_account_conflict"):
+            verified_account = _verify_cdm_account_conflict(_engine, variants, account_conflict)
     # 快速二值图在极少数低对比大票上会漏 DATE。仅在该强类型字段缺失时，
     # 补跑一次原 NLM 二值 variant；正常图片不支付数秒 NLM 成本。
     if (
@@ -1874,6 +1938,12 @@ def _recognize_impl(buf: bytes, include_lines: bool = False) -> Dict[str, Any]:
     with stage("result_assembly"):
         out: Dict[str, Any] = {"success": result.success}
         out.update(result.fields if result.fields else _structured_fallback(result))
+        if account_conflict:
+            if verified_account:
+                out["ACCOUNT NUMBER"] = verified_account
+            else:
+                out.pop("ACCOUNT NUMBER", None)
+                out.pop("payee_account", None)
         # 对外统一存款总额格式，不受 OCR 是否读到 LKR 前缀影响。
         if out.get("DEPOSIT AMOUNT"):
             deposit_amount = _parse_money(str(out["DEPOSIT AMOUNT"]))
